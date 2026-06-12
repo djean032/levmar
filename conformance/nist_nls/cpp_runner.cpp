@@ -1,4 +1,4 @@
-#include "../../cpp/lm.h"
+#include "../../src/lm.h"
 
 #include <chrono>
 #include <cstdint>
