@@ -1,0 +1,13 @@
+name=Chwirut1
+source=nist_strd_nls
+source_url=https://www.itl.nist.gov/div898/strd/nls/data/chwirut1.shtml
+model_id=chwirut
+model_class=exponential
+difficulty=lower
+m=214
+n=3
+predictor_count=1
+residual_definition=model_value-observed_value
+certified_rss=2.3844771393000001e+03
+labels=start1,start2,certified
+numerical_derivatives_recommended=true

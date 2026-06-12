@@ -1,0 +1,13 @@
+name=ENSO
+source=nist_strd_nls
+source_url=https://www.itl.nist.gov/div898/strd/nls/data/enso.shtml
+model_id=enso
+model_class=miscellaneous
+difficulty=average
+m=168
+n=9
+predictor_count=1
+residual_definition=model_value-observed_value
+certified_rss=7.8853978668000002e+02
+labels=start1,start2,certified
+numerical_derivatives_recommended=true

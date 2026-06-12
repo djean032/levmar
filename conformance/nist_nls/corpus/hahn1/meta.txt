@@ -1,0 +1,13 @@
+name=Hahn1
+source=nist_strd_nls
+source_url=https://www.itl.nist.gov/div898/strd/nls/data/hahn1.shtml
+model_id=rational_cubic
+model_class=rational
+difficulty=average
+m=236
+n=7
+predictor_count=1
+residual_definition=model_value-observed_value
+certified_rss=1.5324382854000000e+00
+labels=start1,start2,certified
+numerical_derivatives_recommended=false

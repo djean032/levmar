@@ -1,0 +1,13 @@
+name=MGH09
+source=nist_strd_nls
+source_url=https://www.itl.nist.gov/div898/strd/nls/data/mgh09.shtml
+model_id=mgh09
+model_class=rational
+difficulty=higher
+m=11
+n=4
+predictor_count=1
+residual_definition=model_value-observed_value
+certified_rss=3.0750560385000002e-04
+labels=start1,start2,certified
+numerical_derivatives_recommended=false

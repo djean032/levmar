@@ -1,0 +1,13 @@
+name=Misra1b
+source=nist_strd_nls
+source_url=https://www.itl.nist.gov/div898/strd/nls/data/misra1b.shtml
+model_id=misra1b
+model_class=miscellaneous
+difficulty=lower
+m=14
+n=2
+predictor_count=1
+residual_definition=model_value-observed_value
+certified_rss=7.5464681532999997e-02
+labels=start1,start2,certified
+numerical_derivatives_recommended=true

@@ -1,0 +1,13 @@
+name=Bennett5
+source=nist_strd_nls
+source_url=https://www.itl.nist.gov/div898/strd/nls/data/bennett5.shtml
+model_id=bennett5
+model_class=miscellaneous
+difficulty=higher
+m=154
+n=3
+predictor_count=1
+residual_definition=model_value-observed_value
+certified_rss=5.2404744073000005e-04
+labels=start1,start2,certified
+numerical_derivatives_recommended=true

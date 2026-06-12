@@ -1,0 +1,13 @@
+name=Eckerle4
+source=nist_strd_nls
+source_url=https://www.itl.nist.gov/div898/strd/nls/data/eckerle4.shtml
+model_id=eckerle4
+model_class=exponential
+difficulty=higher
+m=35
+n=3
+predictor_count=1
+residual_definition=model_value-observed_value
+certified_rss=1.4635887487000000e-03
+labels=start1,start2,certified
+numerical_derivatives_recommended=true

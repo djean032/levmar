@@ -1,0 +1,13 @@
+name=Gauss2
+source=nist_strd_nls
+source_url=https://www.itl.nist.gov/div898/strd/nls/data/gauss2.shtml
+model_id=gauss_mixture
+model_class=exponential
+difficulty=lower
+m=250
+n=8
+predictor_count=1
+residual_definition=model_value-observed_value
+certified_rss=1.2475282092000000e+03
+labels=start1,start2,certified
+numerical_derivatives_recommended=true

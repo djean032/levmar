@@ -1,0 +1,13 @@
+name=Rat42
+source=nist_strd_nls
+source_url=https://www.itl.nist.gov/div898/strd/nls/data/ratkowsky2.shtml
+model_id=rat42
+model_class=exponential
+difficulty=higher
+m=9
+n=3
+predictor_count=1
+residual_definition=model_value-observed_value
+certified_rss=8.0565229338000002e+00
+labels=start1,start2,certified
+numerical_derivatives_recommended=true

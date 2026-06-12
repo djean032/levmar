@@ -1,0 +1,13 @@
+name=Kirby2
+source=nist_strd_nls
+source_url=https://www.itl.nist.gov/div898/strd/nls/data/kirby2.shtml
+model_id=rational_quadratic
+model_class=rational
+difficulty=average
+m=151
+n=5
+predictor_count=1
+residual_definition=model_value-observed_value
+certified_rss=3.9050739623999999e+00
+labels=start1,start2,certified
+numerical_derivatives_recommended=false

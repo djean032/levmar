@@ -1,0 +1,13 @@
+name=Nelson
+source=nist_strd_nls
+source_url=https://www.itl.nist.gov/div898/strd/nls/data/nelson.shtml
+model_id=nelson_log
+model_class=exponential
+difficulty=average
+m=128
+n=3
+predictor_count=2
+residual_definition=model_value-observed_value
+certified_rss=3.7976833176000002e+00
+labels=start1,start2,certified
+numerical_derivatives_recommended=true

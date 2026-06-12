@@ -1,0 +1,13 @@
+name=MGH17
+source=nist_strd_nls
+source_url=https://www.itl.nist.gov/div898/strd/nls/data/mgh17.shtml
+model_id=mgh17
+model_class=exponential
+difficulty=average
+m=33
+n=5
+predictor_count=1
+residual_definition=model_value-observed_value
+certified_rss=5.4648946974999998e-05
+labels=start1,start2,certified
+numerical_derivatives_recommended=true
