@@ -1,6 +1,7 @@
 #pragma once
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstddef>
 #include <functional>
@@ -9,17 +10,221 @@
 #include <span>
 #include <string>
 #include <string_view>
+#include <type_traits>
 #include <vector>
 
 using Index = std::size_t;
 
-using VectorView = std::span<double>;
-using ConstVectorView = std::span<const double>;
+struct NoJacobian {};
 
+// Views for vectors and matrices using span and mdspan
+template <Index N> using VectorView = std::span<double, N>;
+
+template <Index N> using ConstVectorView = std::span<const double, N>;
+
+template <Index M, Index N>
 using MatrixView =
-    std::mdspan<double, std::dextents<Index, 2>, std::layout_left>;
+    std::mdspan<double, std::extents<Index, M, N>, std::layout_left>;
+
+template <Index M, Index N>
 using ConstMatrixView =
-    std::mdspan<const double, std::dextents<Index, 2>, std::layout_left>;
+    std::mdspan<const double, std::extents<Index, M, N>, std::layout_left>;
+
+// Vector storage: both dynamic and static
+/*
+template <class Storage> struct vector_storage_traits {
+  static constexpr Index extent = Storage::extent;
+  static constexpr bool dynamic_extent = extent == std::dynamic_extent;
+  static constexpr bool static_extent = !dynamic_extent;
+};
+*/
+
+template <Index Extent> struct VectorStorage {
+  std::array<double, Extent> storage{};
+
+  static constexpr Index extent = Extent;
+  constexpr Index size() const { return Extent; }
+  double *data() { return storage.data(); }
+  const double *data() const { return storage.data(); }
+
+  VectorView<Extent> view() {
+    return VectorView<Extent>(storage.data(), Extent);
+  }
+  ConstVectorView<Extent> view() const {
+    return ConstVectorView<Extent>(storage.data(), Extent);
+  }
+
+  void fill(double value) { storage.fill(value); }
+};
+
+template <> struct VectorStorage<std::dynamic_extent> {
+  std::vector<double> storage;
+
+  static constexpr Index extent = std::dynamic_extent;
+  Index size() const { return storage.size(); }
+
+  double *data() { return storage.data(); }
+  const double *data() const { return storage.data(); }
+
+  VectorView<std::dynamic_extent> view() {
+    return VectorView<std::dynamic_extent>(storage.data(), storage.size());
+  }
+  ConstVectorView<std::dynamic_extent> view() const {
+    return ConstVectorView<std::dynamic_extent>(storage.data(), storage.size());
+  }
+
+  void resize(Index n) { storage.resize(n); }
+  void assign(Index n, double value) { storage.assign(n, value); }
+  void fill(double value) { std::ranges::fill(storage, value); }
+};
+
+// Matrix storage: both dynamic and static
+/*
+template <class Storage> struct matrix_storage_traits {
+  static constexpr Index rows_extent = Storage::rows_extent;
+  static constexpr Index cols_extent = Storage::cols_extent;
+
+  static constexpr bool dynamic_rows = rows_extent == std::dynamic_extent;
+  static constexpr bool dynamic_cols = cols_extent == std::dynamic_extent;
+
+  static constexpr bool fully_static = !dynamic_rows && !dynamic_cols;
+  static constexpr bool fully_dynamic = dynamic_rows && dynamic_cols;
+  static constexpr bool mixed = dynamic_rows != dynamic_cols;
+};
+*/
+
+template <Index Rows, Index Cols> struct MatrixStorage {
+  std::array<double, Rows * Cols> storage{};
+
+  static constexpr Index rows_extent = Rows;
+  static constexpr Index cols_extent = Cols;
+
+  constexpr Index rows() const { return Rows; }
+  constexpr Index cols() const { return Cols; }
+  constexpr Index leading_dim() const { return Rows; }
+
+  double *data() { return storage.data(); }
+  const double *data() const { return storage.data(); }
+
+  MatrixView<Rows, Cols> view() {
+    return MatrixView<Rows, Cols>(storage.data());
+  }
+  ConstMatrixView<Rows, Cols> view() const {
+    return ConstMatrixView<Rows, Cols>(storage.data());
+  }
+
+  double &operator()(Index i, Index j) { return view()[i, j]; }
+
+  double operator()(Index i, Index j) const { return view()[i, j]; }
+
+  void fill(double value) { storage.fill(value); }
+};
+
+template <Index Cols> struct MatrixStorage<std::dynamic_extent, Cols> {
+  Index rows_ = 0;
+  std::vector<double> storage;
+
+  static constexpr Index rows_extent = std::dynamic_extent;
+  static constexpr Index cols_extent = Cols;
+
+  Index rows() const { return rows_; }
+  constexpr Index cols() const { return Cols; }
+  Index leading_dim() const { return rows_; }
+
+  double *data() { return storage.data(); }
+  const double *data() const { return storage.data(); }
+
+  MatrixView<std::dynamic_extent, Cols> view() {
+    return MatrixView<std::dynamic_extent, Cols>(storage.data(), rows_);
+  }
+
+  ConstMatrixView<std::dynamic_extent, Cols> view() const {
+    return ConstMatrixView<std::dynamic_extent, Cols>(storage.data(), rows_);
+  }
+
+  double &operator()(Index i, Index j) { return view()[i, j]; }
+
+  double operator()(Index i, Index j) const { return view()[i, j]; }
+
+  void resize(Index rows) {
+    rows_ = rows;
+    storage.assign(rows_ * Cols, 0.0);
+  }
+
+  void fill(double value) { std::ranges::fill(storage, value); }
+};
+
+template <Index Rows> struct MatrixStorage<Rows, std::dynamic_extent> {
+  Index cols_ = 0;
+  std::vector<double> storage;
+
+  static constexpr Index rows_extent = Rows;
+  static constexpr Index cols_extent = std::dynamic_extent;
+
+  constexpr Index rows() const { return Rows; }
+  Index cols() const { return cols_; }
+  constexpr Index leading_dim() const { return Rows; }
+
+  double *data() { return storage.data(); }
+  const double *data() const { return storage.data(); }
+
+  MatrixView<Rows, std::dynamic_extent> view() {
+    return MatrixView<Rows, std::dynamic_extent>(storage.data(), cols_);
+  }
+
+  ConstMatrixView<Rows, std::dynamic_extent> view() const {
+    return ConstMatrixView<Rows, std::dynamic_extent>(storage.data(), cols_);
+  }
+
+  double &operator()(Index i, Index j) { return view()[i, j]; }
+
+  double operator()(Index i, Index j) const { return view()[i, j]; }
+
+  void resize(Index cols) {
+    cols_ = cols;
+    storage.assign(Rows * cols_, 0.0);
+  }
+
+  void fill(double value) { std::ranges::fill(storage, value); }
+};
+
+template <> struct MatrixStorage<std::dynamic_extent, std::dynamic_extent> {
+  Index rows_ = 0;
+  Index cols_ = 0;
+  std::vector<double> storage{};
+
+  static constexpr Index rows_extent = std::dynamic_extent;
+  static constexpr Index cols_extent = std::dynamic_extent;
+
+  Index rows() const { return rows_; }
+  Index cols() const { return cols_; }
+  Index leading_dim() const { return rows_; }
+
+  double *data() { return storage.data(); }
+  const double *data() const { return storage.data(); }
+
+  MatrixView<std::dynamic_extent, std::dynamic_extent> view() {
+    return MatrixView<std::dynamic_extent, std::dynamic_extent>(storage.data(),
+                                                                rows_, cols_);
+  }
+
+  ConstMatrixView<std::dynamic_extent, std::dynamic_extent> view() const {
+    return ConstMatrixView<std::dynamic_extent, std::dynamic_extent>(
+        storage.data(), rows_, cols_);
+  }
+
+  double &operator()(Index i, Index j) { return view()[i, j]; }
+
+  double operator()(Index i, Index j) const { return view()[i, j]; }
+
+  void resize(Index rows, Index cols) {
+    cols_ = cols;
+    rows_ = rows;
+    storage.assign(rows_ * cols_, 0.0);
+  }
+
+  void fill(double value) { std::ranges::fill(storage, value); }
+};
 
 enum class Status {
   Success,
@@ -42,18 +247,69 @@ enum class LossKind { Squared, Huber, Cauchy, SoftL1, User };
 
 enum class ScalingMode { None, JacobianColumnNorm, User };
 
+// TODO: CHANGE THIS
+/*
 using ResidualFunction = std::function<bool(ConstVectorView x, VectorView r)>;
 using JacobianFunction = std::function<bool(ConstVectorView x, MatrixView J)>;
+*/
 
+template <Index M, Index N, class Residual, class Jacobian = NoJacobian>
 struct Problem {
-  Index num_residuals = 0;
-  Index num_parameters = 0;
+  static constexpr Index residual_extent = M;
+  static constexpr Index parameter_extent = N;
 
-  ResidualFunction residual;
-  JacobianFunction jacobian;
+  Index num_residuals = (M == std::dynamic_extent ? 0 : M);
+  Index num_parameters = (N == std::dynamic_extent ? 0 : N);
 
-  bool has_user_jacobian() const { return static_cast<bool>(jacobian); }
+  Residual residual;
+  Jacobian jacobian;
+
+  Problem(Residual residual_, Jacobian jacobian_ = {})
+    requires(M != std::dynamic_extent && N != std::dynamic_extent)
+      : residual(residual_), jacobian(jacobian_) {}
+
+  Problem(Index m, Index n, Residual residual_, Jacobian jacobian_ = {})
+    requires(M == std::dynamic_extent || N == std::dynamic_extent)
+      : num_residuals(M == std::dynamic_extent ? m : M),
+        num_parameters(N == std::dynamic_extent ? n : N), residual(residual_),
+        jacobian(jacobian_) {}
+
+  bool has_user_jacobian() const {
+    if constexpr (std::is_same_v<Jacobian, NoJacobian>) {
+      return false;
+    } else {
+      return true;
+    }
+  }
 };
+
+template <Index M, Index N, class Residual, class Jacobian = NoJacobian>
+auto make_problem(Residual residual, Jacobian jacobian = {}) {
+  static_assert(M != std::dynamic_extent && N != std::dynamic_extent,
+                "make_problem requires static residual and parameter extents");
+  return Problem<M, N, Residual, Jacobian>(residual, jacobian);
+}
+
+template <class Residual, class Jacobian = NoJacobian>
+auto make_dynamic_problem(Index m, Index n, Residual residual,
+                          Jacobian jacobian = {}) {
+  return Problem<std::dynamic_extent, std::dynamic_extent, Residual, Jacobian>(
+      m, n, residual, jacobian);
+}
+
+template <Index N, class Residual, class Jacobian = NoJacobian>
+auto make_problem_dynamic_residuals(Index m, Residual residual,
+                                    Jacobian jacobian = {}) {
+  return Problem<std::dynamic_extent, N, Residual, Jacobian>(m, N, residual,
+                                                             jacobian);
+}
+
+template <Index M, class Residual, class Jacobian = NoJacobian>
+auto make_problem_dynamic_parameters(Index n, Residual residual,
+                                     Jacobian jacobian = {}) {
+  return Problem<M, std::dynamic_extent, Residual, Jacobian>(M, n, residual,
+                                                             jacobian);
+}
 
 struct LossOptions {
   LossKind kind = LossKind::Squared;
@@ -155,6 +411,7 @@ struct Result {
   std::string message;
 };
 
+/*
 struct DenseMatrix {
   Index rows = 0;
   Index cols = 0;
@@ -187,64 +444,108 @@ struct DenseMatrix {
 
   double operator()(Index i, Index j) const { return view()[i, j]; }
 };
+*/
 
-struct LMWorkspace {
-  Index m = 0;
-  Index n = 0;
+template <Index M, Index N> struct LMWorkspace {
+  static constexpr Index residual_extent = M;
+  static constexpr Index parameter_extent = N;
 
-  std::vector<double> x_trial;
+  Index m = (M == std::dynamic_extent ? 0 : M);
+  Index n = (N == std::dynamic_extent ? 0 : N);
 
-  std::vector<double> r_trial;
-  std::vector<double> r_trial_minus;
-  std::vector<double> r;
+  VectorStorage<N> x_current;
+  VectorStorage<N> x_trial;
 
-  DenseMatrix J;
-  DenseMatrix JTJ;
+  VectorStorage<M> r_trial;
+  VectorStorage<M> r_trial_minus;
+  VectorStorage<M> r;
 
-  std::vector<double> g;
-  std::vector<double> step;
+  MatrixStorage<M, N> J;
+  MatrixStorage<N, N> JTJ;
 
-  std::vector<double> scale;
-  std::vector<double> weights;
+  VectorStorage<N> g;
+  VectorStorage<N> step;
+
+  VectorStorage<N> scale;
+  VectorStorage<M> weights;
 
   LMWorkspace() = default;
 
-  LMWorkspace(Index m_, Index n_) { resize(m_, n_); }
-
-  void resize(Index m_, Index n_) {
-    m = m_;
-    n = n_;
-
-    x_trial.assign(n, 0.0);
-
-    r.assign(m, 0.0);
-    r_trial.assign(m, 0.0);
-    r_trial_minus.assign(m, 0.0);
-
-    J.resize(m, n);
-    JTJ.resize(n, n);
-
-    g.assign(n, 0.0);
-    step.assign(n, 0.0);
-
-    scale.assign(n, 1.0);
-    weights.assign(m, 1.0);
+  LMWorkspace(Index m_runtime, Index n_runtime) {
+    resize(m_runtime, n_runtime);
   }
 
-  VectorView x_trial_view() { return VectorView(x_trial); }
-  VectorView r_view() { return VectorView(r); }
-  VectorView r_trial_view() { return VectorView(r_trial); }
-  VectorView r_trial_minus_view() { return VectorView(r_trial_minus); }
-  VectorView g_view() { return VectorView(g); }
-  VectorView step_view() { return VectorView(step); }
+  void resize(Index m_runtime, Index n_runtime) {
+    if constexpr (M == std::dynamic_extent && N == std::dynamic_extent) {
+      m = m_runtime;
+      n = n_runtime;
+      J.resize(m, n);
+      JTJ.resize(n, n);
+      r.resize(m);
+      r_trial.resize(m);
+      r_trial_minus.resize(m);
+      weights.resize(m);
+      x_current.resize(n);
+      x_trial.resize(n);
+      g.resize(n);
+      step.resize(n);
+      scale.resize(n);
+    } else if constexpr (M == std::dynamic_extent) {
+      m = m_runtime;
+      n = N;
+      J.resize(m);
+      r.resize(m);
+      r_trial.resize(m);
+      r_trial_minus.resize(m);
+      weights.resize(m);
+    } else if constexpr (N == std::dynamic_extent) {
+      n = n_runtime;
+      m = M;
+      J.resize(n);
+      JTJ.resize(n, n);
+      x_current.resize(n);
+      x_trial.resize(n);
+      g.resize(n);
+      step.resize(n);
+      scale.resize(n);
+    } else {
+      n = N;
+      m = M;
+    }
+
+    scale.fill(1.0);
+    weights.fill(1.0);
+  }
 };
 
-struct LMSolveContext {
-  const Problem *problem = nullptr;
-  const Options *options = nullptr;
-  Result *result = nullptr;
-  LMWorkspace *work = nullptr;
-  ConstVectorView x;
+template <class ProblemT> struct LMSolveContext {
+  using Workspace =
+      LMWorkspace<ProblemT::residual_extent, ProblemT::parameter_extent>;
+  const ProblemT &problem;
+  const Options &options;
+  Result &result;
+  Workspace &work;
+  ConstVectorView<ProblemT::parameter_extent> x;
+
+  LMSolveContext(const ProblemT &problem_, const Options &options_,
+                 Result &result_, Workspace &work_,
+                 ConstVectorView<ProblemT::parameter_extent> x_)
+      : problem(problem_), options(options_), result(result_), work(work_),
+        x(x_) {}
+
+  LMSolveContext(const ProblemT &problem_, const Options &options_,
+                 Result &result_, Workspace &work_,
+                 const std::array<double, ProblemT::parameter_extent> &x_)
+    requires(ProblemT::parameter_extent != std::dynamic_extent)
+      : problem(problem_), options(options_), result(result_), work(work_),
+        x(x_.data(), x_.size()) {}
+
+  LMSolveContext(const ProblemT &problem_, const Options &options_,
+                 Result &result_, Workspace &work_,
+                 const std::vector<double> &x_)
+    requires(ProblemT::parameter_extent == std::dynamic_extent)
+      : problem(problem_), options(options_), result(result_), work(work_),
+        x(x_.data(), x_.size()) {}
 };
 
 inline bool
@@ -284,8 +585,8 @@ inline bool evaluate_forward_difference_jacobian(
     const double xj = context.x[j];
     const double h = finite_difference_perturbation(xj, rel_step);
     work.x_trial[j] = xj + h;
-    if (!evaluate_residual_at(context, work.x_trial_view(),
-                              work.r_trial_view(), what)) {
+    if (!evaluate_residual_at(context, work.x_trial_view(), work.r_trial_view(),
+                              what)) {
       return false;
     }
     for (Index i = 0; i < row; ++i) {
@@ -314,8 +615,8 @@ inline bool evaluate_central_difference_jacobian(
     const double xj = context.x[j];
     const double h = finite_difference_perturbation(xj, rel_step);
     work.x_trial[j] = xj + h;
-    if (!evaluate_residual_at(context, work.x_trial_view(),
-                              work.r_trial_view(), what)) {
+    if (!evaluate_residual_at(context, work.x_trial_view(), work.r_trial_view(),
+                              what)) {
       return false;
     }
     work.x_trial[j] = xj - h;
@@ -324,8 +625,7 @@ inline bool evaluate_central_difference_jacobian(
       return false;
     }
     for (Index i = 0; i < row; ++i) {
-      work.J(i, j) =
-          (work.r_trial[i] - work.r_trial_minus[i]) / (2.0 * h);
+      work.J(i, j) = (work.r_trial[i] - work.r_trial_minus[i]) / (2.0 * h);
     }
     work.x_trial[j] = xj;
   }
