@@ -30,15 +30,6 @@ template <Index M, Index N>
 using ConstMatrixView =
     std::mdspan<const double, std::extents<Index, M, N>, std::layout_left>;
 
-// Vector storage: both dynamic and static
-/*
-template <class Storage> struct vector_storage_traits {
-  static constexpr Index extent = Storage::extent;
-  static constexpr bool dynamic_extent = extent == std::dynamic_extent;
-  static constexpr bool static_extent = !dynamic_extent;
-};
-*/
-
 template <Index Extent> struct VectorStorage {
   std::array<double, Extent> storage{};
 
@@ -77,21 +68,6 @@ template <> struct VectorStorage<std::dynamic_extent> {
   void assign(Index n, double value) { storage.assign(n, value); }
   void fill(double value) { std::ranges::fill(storage, value); }
 };
-
-// Matrix storage: both dynamic and static
-/*
-template <class Storage> struct matrix_storage_traits {
-  static constexpr Index rows_extent = Storage::rows_extent;
-  static constexpr Index cols_extent = Storage::cols_extent;
-
-  static constexpr bool dynamic_rows = rows_extent == std::dynamic_extent;
-  static constexpr bool dynamic_cols = cols_extent == std::dynamic_extent;
-
-  static constexpr bool fully_static = !dynamic_rows && !dynamic_cols;
-  static constexpr bool fully_dynamic = dynamic_rows && dynamic_cols;
-  static constexpr bool mixed = dynamic_rows != dynamic_cols;
-};
-*/
 
 template <Index Rows, Index Cols> struct MatrixStorage {
   std::array<double, Rows * Cols> storage{};
@@ -268,12 +244,6 @@ enum class LinearSolver { NormalEquationsCholesky, QR, SVD };
 enum class LossKind { Squared, Huber, Cauchy, SoftL1, User };
 
 enum class ScalingMode { None, JacobianColumnNorm, User };
-
-// TODO: CHANGE THIS
-/*
-using ResidualFunction = std::function<bool(ConstVectorView x, VectorView r)>;
-using JacobianFunction = std::function<bool(ConstVectorView x, MatrixView J)>;
-*/
 
 template <Index M, Index N, ResidualCallable<M, N> Residual,
           class Jacobian = NoJacobian>
@@ -456,41 +426,6 @@ struct Result {
   std::string message;
 };
 
-/*
-struct DenseMatrix {
-  Index rows = 0;
-  Index cols = 0;
-  std::vector<double> storage;
-
-  DenseMatrix() = default;
-
-  DenseMatrix(Index rows_, Index cols_)
-      : rows(rows_), cols(cols_), storage(rows_ * cols_, 0.0) {}
-
-  void resize(Index rows_, Index cols_) {
-    rows = rows_;
-    cols = cols_;
-    storage.assign(rows * cols, 0.0);
-  }
-
-  MatrixView view() { return MatrixView(storage.data(), rows, cols); }
-
-  ConstMatrixView view() const {
-    return ConstMatrixView(storage.data(), rows, cols);
-  }
-
-  double *data() { return storage.data(); }
-
-  const double *data() const { return storage.data(); }
-
-  Index leading_dim() const { return rows; }
-
-  double &operator()(Index i, Index j) { return view()[i, j]; }
-
-  double operator()(Index i, Index j) const { return view()[i, j]; }
-};
-*/
-
 template <Index M, Index N> struct LMWorkspace {
   static constexpr Index residual_extent = M;
   static constexpr Index parameter_extent = N;
@@ -576,22 +511,44 @@ struct LMSolveContext {
 
   LMSolveContext(const ProblemType &problem_, const Options &options_,
                  Result &result_, Workspace &work_, ConstVectorView<N> x_)
+    requires(N != std::dynamic_extent)
       : problem(problem_), options(options_), result(result_), work(work_),
-        x(x_) {}
+        x(x_) {
+    ensure_workspace_shape();
+  }
+
+  LMSolveContext(const ProblemType &problem_, const Options &options_,
+                 Result &result_, Workspace &work_, ConstVectorView<N> x_)
+    requires(N == std::dynamic_extent)
+      : problem(problem_), options(options_), result(result_), work(work_), x() {
+    ensure_workspace_shape();
+    x = x_;
+  }
 
   LMSolveContext(const ProblemType &problem_, const Options &options_,
                  Result &result_, Workspace &work_,
-                 const std::array<double, N> &x_)
+                  const std::array<double, N> &x_)
     requires(N != std::dynamic_extent)
       : problem(problem_), options(options_), result(result_), work(work_),
-        x(x_.data(), x_.size()) {}
+        x(x_.data(), x_.size()) {
+    ensure_workspace_shape();
+  }
 
   LMSolveContext(const ProblemType &problem_, const Options &options_,
                  Result &result_, Workspace &work_,
                  const std::vector<double> &x_)
     requires(N == std::dynamic_extent)
-      : problem(problem_), options(options_), result(result_), work(work_),
-        x(x_.data(), x_.size()) {}
+      : problem(problem_), options(options_), result(result_), work(work_) {
+    ensure_workspace_shape();
+    x = ConstVectorView<std::dynamic_extent>(x_.data(), x_.size());
+  }
+
+private:
+  void ensure_workspace_shape() {
+    if constexpr (N == std::dynamic_extent || M == std::dynamic_extent) {
+      work.resize(problem.num_residuals, problem.num_parameters);
+    }
+  }
 };
 
 template <Index M, Index N, ResidualCallable<M, N> Residual, class Jacobian>
@@ -646,8 +603,8 @@ inline bool
 evaluate_residual_at(LMSolveContext<M, N, Residual, Jacobian> &context,
                      VectorView<N> x, VectorView<M> r,
                      std::string_view what = "Residual Evaluation") {
-  return evaluate_residual_at(
-      context, ConstVectorView<N>(x.data(), x.size()), r, what);
+  return evaluate_residual_at(context, ConstVectorView<N>(x.data(), x.size()),
+                              r, what);
 }
 
 template <Index M, Index N, ResidualCallable<M, N> Residual, class Jacobian>

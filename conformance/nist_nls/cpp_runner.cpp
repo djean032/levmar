@@ -338,7 +338,6 @@ void run_kernel_variant(const CorpusProblem &corpus,
   Options options;
   Result result;
   LMWorkspace<M, N> workspace;
-  workspace.resize(corpus.m, corpus.n);
   ContextType context(problem, options, result, workspace, beta);
 
   std::ranges::copy(context.x, workspace.x_current.view().begin());
@@ -2237,8 +2236,10 @@ void write_csv_report(const std::filesystem::path &path,
 
 void print_timing_moment_line(const std::string &label, const ScalarMoments &dynamic,
                               const ScalarMoments &statik) {
-  std::cout << "  " << label << ": dynamic_mean=" << milliseconds(dynamic.mean())
+  std::cout << "  " << label << ": dynamic_total=" << milliseconds(dynamic.sum)
+            << "ms dynamic_mean=" << milliseconds(dynamic.mean())
             << "ms dynamic_stddev=" << milliseconds(dynamic.stddev())
+            << "ms static_total=" << milliseconds(statik.sum)
             << "ms static_mean=" << milliseconds(statik.mean())
             << "ms static_stddev=" << milliseconds(statik.stddev()) << "ms\n";
 }

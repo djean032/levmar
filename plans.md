@@ -1,488 +1,283 @@
 # Plans
 
-## Chem Intensity Propagation
+## Solving Architecture
 
-For the Z-scan chemistry model, the intensity propagation step does not need a second ODE solve.
+Current direction:
+1. Stabilize the core solve loop first.
+2. Stabilize `GaussNewton` and `LevenbergMarquardt` with one working
+   linear backend first.
+3. Defer user-extensible solver backends and larger abstraction refactors
+   until the algorithms and data flow feel stable.
 
-Current intensity equation:
+The immediate implementation target is:
+1. `Strategy::GaussNewton`
+2. `Strategy::LevenbergMarquardt`
+3. `LinearSolver::NormalEquationsCholesky`
+
+For now:
+1. `LinearSolver::QR` and `LinearSolver::SVD` should fail cleanly with
+   `Status::InvalidProblem` and a clear message.
+2. `Strategy::TrustRegionLM` and `Strategy::DogLeg` should also fail
+   cleanly with `Status::InvalidProblem` and a clear message.
+
+## Core Solver Structure
+
+Recommended top-level split:
 
 ```text
-dI/dz = -(k1*N2 + k2*N3 + k3*N5) * I
+solve(context)
+  validate_context(...)
+  initialize result
+  copy context.x -> work.x_current
+  evaluate initial residual
+  dispatch on strategy
 ```
 
-Within each spatial slice, the populations are treated as fixed after the chemistry solve, so the coefficient is constant over that slice:
+Strategy dispatch should stay runtime-based for now:
 
 ```text
-alpha(t) = k1*N2(t) + k2*N3(t) + k3*N5(t)
+switch (context.options.strategy) {
+  case GaussNewton:
+    solve_gauss_newton(context)
+  case LevenbergMarquardt:
+    solve_levenberg_marquardt(context)
+  case TrustRegionLM:
+    fail unsupported
+  case DogLeg:
+    fail unsupported
+}
 ```
 
-This gives the exact per-slice update:
+This keeps control flow explicit while the algorithm is still moving.
+
+## Shared Iteration Pieces
+
+Both `GaussNewton` and `LevenbergMarquardt` share these steps:
+1. Evaluate the Jacobian at `work.x_current`.
+2. Form `g = J^T r`.
+3. Form `JTJ = J^T J`.
+4. Check gradient-based convergence.
+5. Compute a step.
+6. Build `work.x_trial = work.x_current + work.step`.
+7. Evaluate trial residuals and trial cost.
+8. Either accept the trial or reject it.
+
+The main difference is:
+1. `GaussNewton` computes an undamped step.
+2. `LevenbergMarquardt` computes a damped step and updates `lambda` based
+   on acceptance or rejection.
+3. `GaussNewton` takes one full trial step per outer iteration.
+4. `LevenbergMarquardt` may retry multiple damped trial steps against the
+   same accepted iterate before consuming the next outer iteration.
+
+## Step Computation
+
+Use one shared step entry point with a damping parameter:
 
 ```text
-I_out(t) = I_in(t) * exp(-alpha(t) * dz)
+compute_step(context, damping_lambda)
 ```
 
-Planned improvement:
-1. Remove the separate scalar intensity ODE solve.
-2. Replace `solve_intensity(...)` with the closed-form exponential update.
-3. Keep the chemistry system as the only true ODE integration.
-4. Avoid restarting the chemistry solver at every tiny time step in future refactors; prefer one initialized solve per sample/slice marched across the full time grid.
-
-Expected benefits:
-1. Less solver overhead
-2. Simpler implementation
-3. Cleaner sensitivity/Jacobian path later
-4. Better fit performance
-
-## Normal Equations Pseudocode
+Then dispatch on the selected linear solver inside that helper:
 
 ```text
-# Inputs:
-# J: m x n
-# r: length m
-# Outputs:
-# A: n x n   = J^T J
-# g: length n = J^T r
+switch (context.options.linear_solver) {
+  case NormalEquationsCholesky:
+    compute_step_normal_equations_cholesky(context, damping_lambda)
+  case QR:
+    fail unsupported
+  case SVD:
+    fail unsupported
+}
+```
 
-# zero A and g
-for j = 0 .. n-1
-  g[j] = 0
-  for k = 0 .. n-1
-    A[j,k] = 0
+For the first implementation:
+1. `GaussNewton` passes `damping_lambda = 0.0`.
+2. `LevenbergMarquardt` passes its current `lambda`.
 
-# build g = J^T r
-for j = 0 .. n-1
-  sum = 0
-  for i = 0 .. m-1
-    sum += J[i,j] * r[i]
-  g[j] = sum
+This keeps the linear solve backend shared between strategies while still
+leaving strategy-specific acceptance logic separate.
 
-# build A = J^T J
-for j = 0 .. n-1
-  for k = j .. n-1
-    sum = 0
-    for i = 0 .. m-1
-      sum += J[i,j] * J[i,k]
-    A[j,k] = sum
-    A[k,j] = sum
+For LM retries within one outer iteration:
+1. Keep the accepted iterate fixed in `work.x_current`.
+2. Keep the accepted residual and Jacobian fixed for that iterate.
+3. Retry step computation with larger `lambda` after rejection.
+4. Do not reevaluate the Jacobian until a step is accepted or the solve
+   terminates.
+
+## Normal Equations / Cholesky Path
+
+Shared normal-equations build:
+
+```text
+g   = J^T r
+JTJ = J^T J
 ```
 
 For LM damping:
 
 ```text
-for j = 0 .. n-1
-  A[j,j] += lambda * D[j]
+JTJ(j,j) += lambda * D[j]
 ```
 
-Then Cholesky:
+Initial damping policy can stay simple:
+1. Use diagonal damping only.
+2. A reasonable starting point is `D[j] = max(JTJ(j,j), 1.0)`.
+3. Revisit scaling policy only after the base algorithm is stable.
+
+The backend responsibilities are:
+1. Build the damped system.
+2. Factor it with in-place Cholesky.
+3. Solve the triangular systems.
+4. Write the step into `work.step`.
+
+Storage policy for the first implementation:
+1. Rebuild `g` and `JTJ` from `J` for each LM retry.
+2. Do not try to preserve a pristine undamped copy yet.
+3. This is simpler and avoids extra scratch-state design during the initial
+   refactor.
+
+Pseudocode:
 
 ```text
-# factor A = L L^T in-place into lower triangle
-
-for j = 0 .. n-1
-  sum = A[j,j]
-  for k = 0 .. j-1
-    sum -= A[j,k] * A[j,k]
-
-  if sum <= 0
-    fail
-
-  A[j,j] = sqrt(sum)
-
-  for i = j+1 .. n-1
-    sum = A[i,j]
-    for k = 0 .. j-1
-      sum -= A[i,k] * A[j,k]
-    A[i,j] = sum / A[j,j]
+form g = J^T r
+form JTJ = J^T J
+apply damping to JTJ diagonal if lambda > 0
+factor JTJ = L L^T
+solve L y = -g
+solve L^T step = y
 ```
 
-Forward solve `L y = -g`:
+## Strategy Behavior
+
+### Gauss-Newton
+
+Step equation:
 
 ```text
-for i = 0 .. n-1
-  sum = -g[i]
-  for k = 0 .. i-1
-    sum -= A[i,k] * y[k]
-  y[i] = sum / A[i,i]
+(J^T J) step = -J^T r
 ```
 
-Backward solve `L^T p = y`:
+Policy:
+1. No damping.
+2. Evaluate the trial point.
+3. Accept the step if cost decreases.
+4. If cost does not decrease, terminate cleanly rather than adding an LM-style
+   retry path.
+5. Map this stagnation case to `Status::SmallCostReduction`.
+
+### Levenberg-Marquardt
+
+Step equation:
 
 ```text
-for i = n-1 down to 0
-  sum = y[i]
-  for k = i+1 .. n-1
-    sum -= A[k,i] * p[k]
-  p[i] = sum / A[i,i]
+(J^T J + lambda D) step = -J^T r
 ```
 
-Update:
+Policy:
+1. Evaluate the trial point.
+2. If cost decreases, accept the step and decrease `lambda`.
+3. If cost does not decrease, reject the step and increase `lambda`.
+4. Retry with the larger `lambda` inside the same outer iteration.
+5. Keep the first implementation simple before refining the lambda update rule.
 
-```text
-for j = 0 .. n-1
-  x_new[j] = x[j] + p[j]
-```
+## Workspace And Context
 
-## LM Solver Backend Plan
+`LMSolveContext` should remain a lightweight bundle of references.
 
-Use a custom small-matrix implementation for the `NormalEquationsCholesky` path.
+Current policy:
+1. It owns no storage.
+2. It stores immutable input `x` as a view.
+3. It auto-sizes `LMWorkspace` when either extent is dynamic.
+4. It does not run validation itself.
+
+`solve(context)` is responsible for:
+1. Validation.
+2. Copying `context.x` into `work.x_current` at solve start.
+3. Driving all iteration state transitions.
+
+For the first implementation, existing option surface area is intentionally
+limited:
+1. `LossKind::Squared` only.
+2. `ScalingMode::None` only.
+3. `weights` remain unused until robust loss/scaling work is added.
+4. Unsupported modes should fail cleanly with `Status::InvalidProblem` and a
+   clear message rather than being silently ignored.
+
+Use:
+1. `work.x_current` for the accepted iterate.
+2. `work.x_trial` for the proposed step.
+3. `work.r` for residuals at `x_current`.
+4. `work.r_trial` for residuals at `x_trial`.
+
+## Result And Termination Policy
+
+Normal termination statuses should include:
+1. `Status::SmallGradient`
+2. `Status::SmallStep`
+3. `Status::SmallCostReduction`
+4. `Status::MaxIterations`
+
+Hard-failure statuses remain:
+1. `Status::InvalidProblem`
+2. `Status::UserFunctionError`
+3. `Status::NumericalFailure`
+
+Recommended `solve(...)` return convention:
+1. Return `true` for normal solver termination, including `MaxIterations`.
+2. Return `false` only for hard failures.
+
+Iteration accounting policy:
+1. Count one outer iteration per accepted iterate attempt.
+2. LM rejection retries do not advance the Jacobian to a new iterate.
+3. LM rejection retries still consume residual evaluations.
+4. `max_iterations` limits outer iterations.
+5. `max_function_evaluations` limits total residual evaluations, including LM
+   retries.
+
+## Runtime Dispatch First
+
+For now, keep `Strategy` and `LinearSolver` runtime-dispatched.
 
 Rationale:
-1. Small LM problems often have modest parameter counts, so hand-written `J^T r`, `J^T J`, damping, Cholesky, and triangular solves are simple and can be competitive or faster than BLAS/LAPACK at small sizes.
-2. Residual and Jacobian evaluation may dominate total runtime, so BLAS/LAPACK overhead is not guaranteed to help for the normal-equations path.
-
-Use LAPACK-backed implementations for `QR` and `SVD`.
-
-Rationale:
-1. QR is more code and easier to get subtly wrong than Cholesky.
-2. SVD is not a good hand-written target for this project.
-3. QR/SVD are selected mainly for numerical robustness and maintainability, not just raw speed.
-
-Build/configuration plan:
-1. Add a build option such as `LEVMAR_USE_LAPACK`.
-2. When enabled and LAPACK is found, enable LAPACK-backed `QR` and `SVD`.
-3. Keep `NormalEquationsCholesky` available in all builds via the internal implementation.
-4. Keep the public `LinearSolver` enum stable regardless of build configuration.
-5. In non-LAPACK builds, selecting `QR` or `SVD` should fail cleanly with `Status::InvalidProblem` and a clear message that the solver requires a LAPACK-enabled build.
-
-Initial policy:
-1. `NormalEquationsCholesky`: internal implementation.
-2. `QR`: LAPACK only.
-3. `SVD`: LAPACK only.
-4. Only revisit a size-based dispatch policy after benchmarking shows the linear algebra path is a real bottleneck.
-
-## QR Solver Pseudocode
-
-Solve the damped LM step through the augmented least-squares system:
-
-```text
-[ J              ] p ~= [ -r ]
-[ sqrt(lambda D) ]      [  0 ]
-```
-
-where `sqrt(lambda D)` is the `n x n` diagonal matrix with entries
-`sqrt(lambda * D[j])`.
-
-Assume column-major storage throughout, matching BLAS/LAPACK conventions.
-For an `(m+n) x n` augmented matrix, element `(i, j)` is stored at
-`A_aug[i + j * lda]` with `lda = m + n`.
-
-```text
-# Inputs:
-# J: m x n
-# r: length m
-# D: length n
-# lambda: scalar
-# Output:
-# p: length n
-
-rows_aug = m + n
-cols_aug = n
-lda = rows_aug
-
-# build augmented matrix A_aug of size (m+n) x n
-for i = 0 .. m-1
-  for j = 0 .. n-1
-    A_aug[i + j * lda] = J[i,j]
-
-for i = 0 .. n-1
-  for j = 0 .. n-1
-    A_aug[(m + i) + j * lda] = 0
-
-for j = 0 .. n-1
-  A_aug[(m + j) + j * lda] = sqrt(lambda * D[j])
-
-# build augmented rhs b_aug of length (m+n)
-for i = 0 .. m-1
-  b_aug[i] = -r[i]
-
-for i = 0 .. n-1
-  b_aug[m + i] = 0
-
-# factor A_aug = Q R in-place
-qr_factor(A_aug, tau)
-
-# apply Q^T to rhs
-apply_qt(A_aug, tau, b_aug)
-
-# solve R p = first n entries of b_aug, where R is stored in the
-# upper triangle of A_aug in column-major layout
-for i = n-1 down to 0
-  sum = b_aug[i]
-  for k = i+1 .. n-1
-    sum -= A_aug[i + k * lda] * p[k]
-  p[i] = sum / A_aug[i + i * lda]
-```
-
-Relevant LAPACK calls:
-1. `dgeqrf` or `LAPACKE_dgeqrf` for QR factorization.
-2. `dormqr` or `LAPACKE_dormqr` for applying `Q^T` to the right-hand side.
-3. `dtrtrs` or `LAPACKE_dtrtrs` for the upper-triangular solve.
-
-LAPACK-style dimensions:
-1. `A_aug` is `rows_aug x n` with `lda = rows_aug`.
-2. `b_aug` can be treated as a `rows_aug x 1` dense column with leading dimension `ldb = rows_aug`.
-3. `R` is the upper triangle of the first `n` rows of `A_aug` after `dgeqrf`.
-
-Relevant BLAS calls:
-1. None are required for the basic QR path.
-2. `dcopy` may be useful for vector copies.
-
-## SVD Solver Pseudocode
-
-Solve the same augmented least-squares system through the SVD of the
-augmented matrix:
-
-```text
-A_aug = U Sigma V^T
-```
-
-Then solve:
-
-```text
-min ||A_aug p - b_aug||^2
-```
-
-with `b_aug = [-r; 0]`.
-
-Assume column-major storage throughout, matching BLAS/LAPACK conventions.
-For an `(m+n) x n` augmented matrix, element `(i, j)` is stored at
-`A_aug[i + j * lda]` with `lda = m + n`.
-
-```text
-# Inputs:
-# J: m x n
-# r: length m
-# D: length n
-# lambda: scalar
-# Output:
-# p: length n
-
-rows_aug = m + n
-cols_aug = n
-lda = rows_aug
-
-# build augmented matrix A_aug of size (m+n) x n
-for i = 0 .. m-1
-  for j = 0 .. n-1
-    A_aug[i + j * lda] = J[i,j]
-
-for i = 0 .. n-1
-  for j = 0 .. n-1
-    A_aug[(m + i) + j * lda] = 0
-
-for j = 0 .. n-1
-  A_aug[(m + j) + j * lda] = sqrt(lambda * D[j])
-
-# build augmented rhs b_aug of length (m+n)
-for i = 0 .. m-1
-  b_aug[i] = -r[i]
-
-for i = 0 .. n-1
-  b_aug[m + i] = 0
-
-# compute A_aug = U Sigma V^T
-svd(A_aug, U, sigma, VT)
-
-# tmp = U^T b_aug
-for i = 0 .. n-1
-  sum = 0
-  for k = 0 .. rows_aug-1
-    sum += U[k,i] * b_aug[k]
-  tmp[i] = sum
-
-# divide by singular values
-for i = 0 .. n-1
-  if sigma[i] is small
-    tmp[i] = 0
-  else
-    tmp[i] = tmp[i] / sigma[i]
-
-# p = V tmp
-for i = 0 .. n-1
-  sum = 0
-  for k = 0 .. n-1
-    sum += VT[k,i] * tmp[k]
-  p[i] = sum
-```
-
-Relevant LAPACK calls:
-1. `dgesdd` or `LAPACKE_dgesdd` for SVD.
-2. `dgesvd` or `LAPACKE_dgesvd` as an alternative SVD routine.
-
-LAPACK-style dimensions:
-1. `A_aug` is `rows_aug x n` with `lda = rows_aug`.
-2. For economy-size SVD, `U` is `rows_aug x n` and `VT` is `n x n`.
-3. `U` uses `ldu = rows_aug` and `VT` uses `ldvt = n`.
-
-Relevant BLAS calls:
-1. `dgemv` for `tmp = U^T b_aug`.
-2. `dgemv` for `p = V tmp`.
-
-Notes:
-1. `dgesdd` is likely the better default SVD routine.
-2. Use a singular value tolerance so very small `sigma[i]` values are treated as zero.
-3. The augmented-system formulation handles general diagonal damping `D` cleanly.
-
-## Single LMWorkspace Design
-
-Use one overall `LMWorkspace` with:
-1. Shared LM state used by all solver paths.
-2. Shared augmented-system buffers used by both `QR` and `SVD`.
-3. Solver-specific scratch buffers for the selected linear solver.
-
-Shared LM state:
-
-```text
-m, n
-x_current       length n
-x_trial         length n
-r               length m
-r_trial         length m
-r_trial_minus   length m
-J               m x n
-step            length n
-scale           length n
-weights         length m
-```
-
-Normal-equations / Cholesky buffers:
-
-```text
-JTJ             n x n
-g               length n
-```
-
-Shared augmented-system buffers for QR/SVD:
-
-```text
-aug_matrix      (m+n) x n
-aug_rhs         length (m+n)
-```
-
-QR-specific scratch:
-
-```text
-qr_tau          length n
-```
-
-SVD-specific scratch:
-
-```text
-svd_sigma       length n
-svd_U           (m+n) x n     # economy-size U
-svd_VT          n x n
-svd_tmp         length n
-```
-
-Notes:
-1. `aug_matrix` and `aug_rhs` should be shared between `QR` and `SVD` rather than duplicated.
-2. LAPACK routines overwrite their input matrices, so `aug_matrix` is solver scratch, not a persistent representation of `J`.
-3. Since solver choice is fixed for a solve, allocate solver-specific scratch for the selected solver during workspace setup.
-4. If needed, store prevalidated `lapack_int` dimensions in the workspace as well so LAPACKE call sites do not repeat casts.
-
-## Solve API And Control Flow
-
-Use `LMSolveContext<ProblemT>` as a lightweight non-owning bundle of
-already-initialized solver state.
-
-Recommended sequence:
-1. Initialize `Problem`, `Options`, `Result`, `LMWorkspace`, and immutable parameter storage.
-2. Resize `LMWorkspace` before solve.
-3. Bundle them into `LMSolveContext<ProblemT>`.
-4. Call `solve(context)`.
-5. Report from `context.result` and final parameter storage in workspace.
-
-Recommended API shape:
-
-```text
-template <class ProblemT>
-bool solve(LMSolveContext<ProblemT>& context)
-```
-
-Responsibilities:
-1. Setup stays outside the solver.
-2. `solve(context)` owns validation, iteration control flow, and solver dispatch.
-3. Reporting stays outside the solver.
-
-Recommended `LMSolveContext` role:
-1. Hold references to `Problem`, `Options`, `Result`, `LMWorkspace`, and immutable input `x`.
-2. Remain non-owning.
-3. Provide a core constructor taking `ConstVectorView<...>`.
-4. Provide constrained convenience constructors for `std::array` and `std::vector`.
-
-Avoid making `LMSolveContext` a heavy initialization object. It should not allocate workspace, construct result objects, or implicitly run validation beyond simple bundling.
-
-Validation policy:
-1. Constructors do not throw and do not validate.
-2. `validate_problem<ProblemT>(...)` handles problem/options checks.
-3. `validate_context<ProblemT>(...)` handles context-specific checks.
-4. `validate_context(...)` should always verify:
-5. `problem.num_residuals > 0`
-6. `problem.num_parameters > 0`
-7. `context.x.size() == problem.num_parameters`
-8. If `JacobianMode::User`, `problem.has_user_jacobian()`
-9. `work.m == problem.num_residuals`
-10. `work.n == problem.num_parameters`
-
-Internal solver dispatch should remain centralized inside the solver implementation:
-
-```text
-switch (context.options.linear_solver) {
-  case NormalEquationsCholesky:
-    compute_step_normal_equations_cholesky(context)
-  case QR:
-    compute_step_qr(context)
-  case SVD:
-    compute_step_svd(context)
-}
-```
-
-Recommended internal split:
-1. `solve(context)` runs the overall LM algorithm.
-2. `compute_step_normal_equations_cholesky(context)` computes the LM step for the custom normal-equations path.
-3. `compute_step_qr(context)` computes the LM step for the LAPACK QR path.
-4. `compute_step_svd(context)` computes the LM step for the LAPACK SVD path.
-
-## Problem API
-
-Use a single templated `Problem` type:
-
-```text
-template <Index M, Index N, class Residual, class Jacobian = NoJacobian>
-struct Problem
-```
-
-Design:
-1. Store residual and jacobian as concrete callable types.
-2. Expose `residual_extent` and `parameter_extent` as compile-time metadata.
-3. Store `num_residuals` and `num_parameters` for runtime validation.
-4. Use `NoJacobian` as the marker for residual-only problems.
-
-Construction policy:
-1. Static/static problems use `make_problem<M, N>(...)`.
-2. Dynamic/dynamic problems use `make_dynamic_problem(m, n, ...)`.
-3. Dynamic residual-count problems use `make_problem_dynamic_residuals<N>(m, ...)`.
-4. Dynamic parameter-count problems use `make_problem_dynamic_parameters<M>(n, ...)`.
-
-Rationale:
-1. Factories make the public API unambiguous.
-2. Direct callable storage avoids `std::function` type erasure.
-3. Mixed dynamic/static problem shapes remain readable at the call site.
-
-## Current Refactor Checklist
-
-1. Finish `LMSolveContext<ProblemT>`.
-2. Template `validate_problem<ProblemT>(...)`.
-3. Add `validate_context<ProblemT>(...)`.
-4. Template `evaluate_residual_at<ProblemT>(...)`.
-5. Template `evaluate_residual<ProblemT>(...)`.
-6. Template finite-difference Jacobian helpers.
-7. Template `evaluate_jacobian<ProblemT>(...)`.
-8. Update helper call sites to use `VectorStorage` and `MatrixStorage` directly.
-9. Initialize `work.x_current` from `context.x` at solve start.
-10. Use `work.x_trial` for trial steps and `work.x_current` for accepted iterates.
-11. Add templated `solve(LMSolveContext<ProblemT>&)`.
-12. Remove old non-templated `Problem`, `LMSolveContext`, `ResidualFunction`, and `JacobianFunction` leftovers.
-13. Restore the normal-equations path first.
-14. Revisit QR/SVD and LAPACK integration after the templated core compiles cleanly.
+1. They are already runtime options.
+2. Switch overhead is negligible relative to residual/Jacobian evaluation and
+   factorization.
+3. Runtime dispatch keeps the control flow easy to inspect while the
+   implementation is still changing.
+
+Do not refactor to user-pluggable solver backend templates yet.
+
+That refactor can happen later, after:
+1. `GaussNewton` works.
+2. `LevenbergMarquardt` works.
+3. The normal-equations backend contract feels stable.
+
+## Near-Term Checklist
+
+1. Add `solve(context)`.
+2. Reset and populate `Result` inside `solve(context)`.
+3. Copy `context.x` into `work.x_current` at solve start.
+4. Add residual-cost evaluation helper.
+5. Add normal-equations formation helper.
+6. Add Cholesky factor and triangular solve helpers.
+7. Add `compute_step_normal_equations_cholesky(context, damping_lambda)`.
+8. Add `compute_step(context, damping_lambda)` with runtime linear-solver
+   dispatch.
+9. Add `solve_gauss_newton(context)`.
+10. Add `solve_levenberg_marquardt(context)`.
+11. Return clear unsupported messages for `QR`, `SVD`, `TrustRegionLM`, and
+    `DogLeg`.
+12. Validate the new path with the existing conformance runner.
+
+## Later Refactors
+
+Only after the above is stable:
+1. Revisit QR and SVD integration.
+2. Revisit workspace scratch for augmented-system solvers.
+3. Revisit trust-region and dogleg strategies.
+4. Revisit whether users should be able to inject custom linear solver
+   backends from their own code.
+5. If that extensibility is still desirable, make the enum-based built-in
+   solver selection a convenience wrapper over a more general backend
+   interface.

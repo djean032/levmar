@@ -72,7 +72,6 @@ int main() {
   Options options;
   Result result;
   LMWorkspace<std::dynamic_extent, std::dynamic_extent> work;
-  work.resize(problem.num_residuals, problem.num_parameters);
 
   const std::vector<double> beta0{0.9, 1.5};
   LMSolveContext<std::dynamic_extent,
@@ -136,7 +135,6 @@ int main() {
   Options options;
   Result result;
   LMWorkspace<6, 2> work;
-  work.resize(problem.num_residuals, problem.num_parameters);
 
   const std::array<double, 2> beta0{0.9, 1.5};
   LMSolveContext<6, 2, decltype(residual), decltype(jacobian)> context(
