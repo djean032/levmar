@@ -1,0 +1,7 @@
+name=exp_sum_m512_n32
+model_id=exp_sum
+model_class=synthetic_benchmark
+m=512
+n=32
+predictor_count=1
+numerical_derivatives_recommended=true

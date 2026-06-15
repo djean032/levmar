@@ -1,0 +1,7 @@
+name=linear_dense_m1000_n4
+model_id=linear_dense
+model_class=synthetic_benchmark
+m=1000
+n=4
+predictor_count=4
+numerical_derivatives_recommended=true

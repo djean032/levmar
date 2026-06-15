@@ -1,0 +1,7 @@
+name=rational_dense_m64_n64
+model_id=rational_dense
+model_class=synthetic_benchmark
+m=64
+n=64
+predictor_count=1
+numerical_derivatives_recommended=true
