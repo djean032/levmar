@@ -16,9 +16,9 @@ The immediate implementation target is:
 
 For now:
 1. `LinearSolver::QR` and `LinearSolver::SVD` should fail cleanly with
-   `Status::InvalidProblem` and a clear message.
+   `ErrorCode::InvalidProblem` and a clear message.
 2. `Strategy::TrustRegionLM` and `Strategy::DogLeg` should also fail
-   cleanly with `Status::InvalidProblem` and a clear message.
+   cleanly with `ErrorCode::InvalidProblem` and a clear message.
 
 ## Core Solver Structure
 
@@ -26,7 +26,8 @@ Recommended top-level split:
 
 ```text
 solve(context)
-  validate_context(...)
+  if !validate_context(...)
+    return unexpected(error)
   initialize result
   copy context.x -> work.x_current
   evaluate initial residual
@@ -164,7 +165,7 @@ Policy:
 3. Accept the step if cost decreases.
 4. If cost does not decrease, terminate cleanly rather than adding an LM-style
    retry path.
-5. Map this stagnation case to `Status::SmallCostReduction`.
+5. Map this stagnation case to `TerminationReason::SmallCostReduction`.
 
 ### Levenberg-Marquardt
 
@@ -188,7 +189,7 @@ Policy:
 Current policy:
 1. It owns no storage.
 2. It stores immutable input `x` as a view.
-3. It auto-sizes `LMWorkspace` when either extent is dynamic.
+3. Callers size `LMWorkspace` before constructing or using the context.
 4. It does not run validation itself.
 
 `solve(context)` is responsible for:
@@ -196,12 +197,18 @@ Current policy:
 2. Copying `context.x` into `work.x_current` at solve start.
 3. Driving all iteration state transitions.
 
+Current baseline helpers already exist for:
+1. `validate_problem(...)`
+2. `validate_context(...)`
+3. `evaluate_residual(...)`
+4. `evaluate_jacobian(...)`, including finite-difference modes
+
 For the first implementation, existing option surface area is intentionally
 limited:
 1. `LossKind::Squared` only.
 2. `ScalingMode::None` only.
 3. `weights` remain unused until robust loss/scaling work is added.
-4. Unsupported modes should fail cleanly with `Status::InvalidProblem` and a
+4. Unsupported modes should fail cleanly with `ErrorCode::InvalidProblem` and a
    clear message rather than being silently ignored.
 
 Use:
@@ -212,20 +219,22 @@ Use:
 
 ## Result And Termination Policy
 
-Normal termination statuses should include:
-1. `Status::SmallGradient`
-2. `Status::SmallStep`
-3. `Status::SmallCostReduction`
-4. `Status::MaxIterations`
+Normal termination reasons should include:
+1. `TerminationReason::SmallGradient`
+2. `TerminationReason::SmallStep`
+3. `TerminationReason::SmallCostReduction`
+4. `TerminationReason::MaxIterations`
 
-Hard-failure statuses remain:
-1. `Status::InvalidProblem`
-2. `Status::UserFunctionError`
-3. `Status::NumericalFailure`
+Hard failures remain:
+1. `ErrorCode::InvalidProblem`
+2. `ErrorCode::UserFunctionError`
+3. `ErrorCode::NumericalFailure`
 
 Recommended `solve(...)` return convention:
-1. Return `true` for normal solver termination, including `MaxIterations`.
-2. Return `false` only for hard failures.
+1. Return `ErrorOr<Result>`.
+2. Use `Result::termination` to report normal solver termination, including
+   `MaxIterations`.
+3. Return `std::unexpected(Error{...})` only for hard failures.
 
 Iteration accounting policy:
 1. Count one outer iteration per accepted iterate attempt.
@@ -255,7 +264,7 @@ That refactor can happen later, after:
 
 ## Near-Term Checklist
 
-1. Add `solve(context)`.
+1. Add `solve(context) -> ErrorOr<Result>`.
 2. Reset and populate `Result` inside `solve(context)`.
 3. Copy `context.x` into `work.x_current` at solve start.
 4. Add residual-cost evaluation helper.

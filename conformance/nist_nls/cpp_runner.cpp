@@ -1,4 +1,4 @@
-#include "../../src/lm.h"
+#include <levmar/lm.h>
 
 #include <chrono>
 #include <cstdint>
@@ -343,8 +343,10 @@ void run_kernel_variant(const CorpusProblem &corpus,
   std::ranges::copy(context.x, workspace.x_current.view().begin());
   timing.residual_seconds += measure_average_seconds(kKernelTimingRepeats, [&] {
     std::ranges::copy(context.x, workspace.x_current.view().begin());
-    if (!evaluate_residual(context, what_prefix + " residual")) {
-      throw std::runtime_error(result.message);
+    if (auto residual_result =
+            evaluate_residual(context, what_prefix + " residual");
+        !residual_result) {
+      throw std::runtime_error(residual_result.error().message);
     }
   });
   for (Index i = 0; i < corpus.m; ++i) {
@@ -359,8 +361,10 @@ void run_kernel_variant(const CorpusProblem &corpus,
   timing.analytic_jacobian_seconds += measure_average_seconds(
       kKernelTimingRepeats, [&] {
         std::ranges::copy(context.x, workspace.x_current.view().begin());
-        if (!evaluate_jacobian(context, what_prefix + " analytic jacobian")) {
-          throw std::runtime_error(result.message);
+        if (auto jacobian_result =
+                evaluate_jacobian(context, what_prefix + " analytic jacobian");
+            !jacobian_result) {
+          throw std::runtime_error(jacobian_result.error().message);
         }
       });
   for (Index j = 0; j < corpus.n; ++j) {
@@ -384,8 +388,10 @@ void run_kernel_variant(const CorpusProblem &corpus,
   timing.forward_difference_seconds += measure_average_seconds(
       kKernelTimingRepeats, [&] {
         std::ranges::copy(context.x, workspace.x_current.view().begin());
-        if (!evaluate_jacobian(context, what_prefix + " fd jacobian")) {
-          throw std::runtime_error(result.message);
+        if (auto jacobian_result =
+                evaluate_jacobian(context, what_prefix + " fd jacobian");
+            !jacobian_result) {
+          throw std::runtime_error(jacobian_result.error().message);
         }
       });
   for (Index j = 0; j < corpus.n; ++j) {
@@ -403,8 +409,10 @@ void run_kernel_variant(const CorpusProblem &corpus,
   timing.central_difference_seconds += measure_average_seconds(
       kKernelTimingRepeats, [&] {
         std::ranges::copy(context.x, workspace.x_current.view().begin());
-        if (!evaluate_jacobian(context, what_prefix + " central jacobian")) {
-          throw std::runtime_error(result.message);
+        if (auto jacobian_result =
+                evaluate_jacobian(context, what_prefix + " central jacobian");
+            !jacobian_result) {
+          throw std::runtime_error(jacobian_result.error().message);
         }
       });
   for (Index j = 0; j < corpus.n; ++j) {
@@ -495,16 +503,16 @@ ProblemReport run_problem(const std::filesystem::path &problem_dir) {
 
     if (corpus.model_id == "bennett5") {
       auto residual_dynamic = [&](ConstVectorView<std::dynamic_extent> x,
-                                  VectorView<std::dynamic_extent> r) -> bool {
+                                  VectorView<std::dynamic_extent> r) -> ErrorOrVoid {
         for (Index i = 0; i < corpus.m; ++i) {
           const auto &row = corpus.data[i];
           const double xv = row[0];
           r[i] = x[0] * std::pow(x[1] + xv, -1.0 / x[2]) - row.back();
         }
-        return true;
+        return {};
       };
       auto jacobian_dynamic = [&](ConstVectorView<std::dynamic_extent> x,
-                                  MatrixView<std::dynamic_extent, std::dynamic_extent> J) -> bool {
+                                  MatrixView<std::dynamic_extent, std::dynamic_extent> J) -> ErrorOrVoid {
         for (Index i = 0; i < corpus.m; ++i) {
           const auto &row = corpus.data[i];
           const double xv = row[0];
@@ -514,17 +522,17 @@ ProblemReport run_problem(const std::filesystem::path &problem_dir) {
           J[i, 1] = -x[0] * p / (x[2] * t);
           J[i, 2] = x[0] * p * std::log(t) / (x[2] * x[2]);
         }
-        return true;
+        return {};
       };
-      auto residual_static = [&](ConstVectorView<3> x, VectorView<154> r) -> bool {
+      auto residual_static = [&](ConstVectorView<3> x, VectorView<154> r) -> ErrorOrVoid {
         for (Index i = 0; i < 154; ++i) {
           const auto &row = corpus.data[i];
           const double xv = row[0];
           r[i] = x[0] * std::pow(x[1] + xv, -1.0 / x[2]) - row.back();
         }
-        return true;
+        return {};
       };
-      auto jacobian_static = [&](ConstVectorView<3> x, MatrixView<154, 3> J) -> bool {
+      auto jacobian_static = [&](ConstVectorView<3> x, MatrixView<154, 3> J) -> ErrorOrVoid {
         for (Index i = 0; i < 154; ++i) {
           const auto &row = corpus.data[i];
           const double xv = row[0];
@@ -534,23 +542,23 @@ ProblemReport run_problem(const std::filesystem::path &problem_dir) {
           J[i, 1] = -x[0] * p / (x[2] * t);
           J[i, 2] = x[0] * p * std::log(t) / (x[2] * x[2]);
         }
-        return true;
+        return {};
       };
       run_pair.template operator()<154, 3>(residual_dynamic, jacobian_dynamic,
                                            residual_static, jacobian_static);
     } else if (corpus.model_id == "monomolecular" && corpus.m == 6) {
       auto residual_dynamic = [&](ConstVectorView<std::dynamic_extent> x,
-                                  VectorView<std::dynamic_extent> r) -> bool {
+                                  VectorView<std::dynamic_extent> r) -> ErrorOrVoid {
         for (Index i = 0; i < corpus.m; ++i) {
           const auto &row = corpus.data[i];
           const double xv = row[0];
           const double e = std::exp(-x[1] * xv);
           r[i] = x[0] * (1.0 - e) - row.back();
         }
-        return true;
+        return {};
       };
       auto jacobian_dynamic = [&](ConstVectorView<std::dynamic_extent> x,
-                                  MatrixView<std::dynamic_extent, std::dynamic_extent> J) -> bool {
+                                  MatrixView<std::dynamic_extent, std::dynamic_extent> J) -> ErrorOrVoid {
         for (Index i = 0; i < corpus.m; ++i) {
           const auto &row = corpus.data[i];
           const double xv = row[0];
@@ -558,18 +566,18 @@ ProblemReport run_problem(const std::filesystem::path &problem_dir) {
           J[i, 0] = 1.0 - e;
           J[i, 1] = x[0] * xv * e;
         }
-        return true;
+        return {};
       };
-      auto residual_static = [&](ConstVectorView<2> x, VectorView<6> r) -> bool {
+      auto residual_static = [&](ConstVectorView<2> x, VectorView<6> r) -> ErrorOrVoid {
         for (Index i = 0; i < 6; ++i) {
           const auto &row = corpus.data[i];
           const double xv = row[0];
           const double e = std::exp(-x[1] * xv);
           r[i] = x[0] * (1.0 - e) - row.back();
         }
-        return true;
+        return {};
       };
-      auto jacobian_static = [&](ConstVectorView<2> x, MatrixView<6, 2> J) -> bool {
+      auto jacobian_static = [&](ConstVectorView<2> x, MatrixView<6, 2> J) -> ErrorOrVoid {
         for (Index i = 0; i < 6; ++i) {
           const auto &row = corpus.data[i];
           const double xv = row[0];
@@ -577,23 +585,23 @@ ProblemReport run_problem(const std::filesystem::path &problem_dir) {
           J[i, 0] = 1.0 - e;
           J[i, 1] = x[0] * xv * e;
         }
-        return true;
+        return {};
       };
       run_pair.template operator()<6, 2>(residual_dynamic, jacobian_dynamic,
                                          residual_static, jacobian_static);
     } else if (corpus.model_id == "monomolecular" && corpus.m == 14) {
       auto residual_dynamic = [&](ConstVectorView<std::dynamic_extent> x,
-                                  VectorView<std::dynamic_extent> r) -> bool {
+                                  VectorView<std::dynamic_extent> r) -> ErrorOrVoid {
         for (Index i = 0; i < corpus.m; ++i) {
           const auto &row = corpus.data[i];
           const double xv = row[0];
           const double e = std::exp(-x[1] * xv);
           r[i] = x[0] * (1.0 - e) - row.back();
         }
-        return true;
+        return {};
       };
       auto jacobian_dynamic = [&](ConstVectorView<std::dynamic_extent> x,
-                                  MatrixView<std::dynamic_extent, std::dynamic_extent> J) -> bool {
+                                  MatrixView<std::dynamic_extent, std::dynamic_extent> J) -> ErrorOrVoid {
         for (Index i = 0; i < corpus.m; ++i) {
           const auto &row = corpus.data[i];
           const double xv = row[0];
@@ -601,18 +609,18 @@ ProblemReport run_problem(const std::filesystem::path &problem_dir) {
           J[i, 0] = 1.0 - e;
           J[i, 1] = x[0] * xv * e;
         }
-        return true;
+        return {};
       };
-      auto residual_static = [&](ConstVectorView<2> x, VectorView<14> r) -> bool {
+      auto residual_static = [&](ConstVectorView<2> x, VectorView<14> r) -> ErrorOrVoid {
         for (Index i = 0; i < 14; ++i) {
           const auto &row = corpus.data[i];
           const double xv = row[0];
           const double e = std::exp(-x[1] * xv);
           r[i] = x[0] * (1.0 - e) - row.back();
         }
-        return true;
+        return {};
       };
-      auto jacobian_static = [&](ConstVectorView<2> x, MatrixView<14, 2> J) -> bool {
+      auto jacobian_static = [&](ConstVectorView<2> x, MatrixView<14, 2> J) -> ErrorOrVoid {
         for (Index i = 0; i < 14; ++i) {
           const auto &row = corpus.data[i];
           const double xv = row[0];
@@ -620,13 +628,13 @@ ProblemReport run_problem(const std::filesystem::path &problem_dir) {
           J[i, 0] = 1.0 - e;
           J[i, 1] = x[0] * xv * e;
         }
-        return true;
+        return {};
       };
       run_pair.template operator()<14, 2>(residual_dynamic, jacobian_dynamic,
                                           residual_static, jacobian_static);
     } else if (corpus.model_id == "chwirut" && corpus.m == 214) {
       auto residual_dynamic = [&](ConstVectorView<std::dynamic_extent> x,
-                                  VectorView<std::dynamic_extent> r) -> bool {
+                                  VectorView<std::dynamic_extent> r) -> ErrorOrVoid {
         for (Index i = 0; i < corpus.m; ++i) {
           const auto &row = corpus.data[i];
           const double xv = row[0];
@@ -634,10 +642,10 @@ ProblemReport run_problem(const std::filesystem::path &problem_dir) {
           const double d = x[1] + x[2] * xv;
           r[i] = e / d - row.back();
         }
-        return true;
+        return {};
       };
       auto jacobian_dynamic = [&](ConstVectorView<std::dynamic_extent> x,
-                                  MatrixView<std::dynamic_extent, std::dynamic_extent> J) -> bool {
+                                  MatrixView<std::dynamic_extent, std::dynamic_extent> J) -> ErrorOrVoid {
         for (Index i = 0; i < corpus.m; ++i) {
           const auto &row = corpus.data[i];
           const double xv = row[0];
@@ -648,9 +656,9 @@ ProblemReport run_problem(const std::filesystem::path &problem_dir) {
           J[i, 1] = -e / d2;
           J[i, 2] = -xv * e / d2;
         }
-        return true;
+        return {};
       };
-      auto residual_static = [&](ConstVectorView<3> x, VectorView<214> r) -> bool {
+      auto residual_static = [&](ConstVectorView<3> x, VectorView<214> r) -> ErrorOrVoid {
         for (Index i = 0; i < 214; ++i) {
           const auto &row = corpus.data[i];
           const double xv = row[0];
@@ -658,9 +666,9 @@ ProblemReport run_problem(const std::filesystem::path &problem_dir) {
           const double d = x[1] + x[2] * xv;
           r[i] = e / d - row.back();
         }
-        return true;
+        return {};
       };
-      auto jacobian_static = [&](ConstVectorView<3> x, MatrixView<214, 3> J) -> bool {
+      auto jacobian_static = [&](ConstVectorView<3> x, MatrixView<214, 3> J) -> ErrorOrVoid {
         for (Index i = 0; i < 214; ++i) {
           const auto &row = corpus.data[i];
           const double xv = row[0];
@@ -671,13 +679,13 @@ ProblemReport run_problem(const std::filesystem::path &problem_dir) {
           J[i, 1] = -e / d2;
           J[i, 2] = -xv * e / d2;
         }
-        return true;
+        return {};
       };
       run_pair.template operator()<214, 3>(residual_dynamic, jacobian_dynamic,
                                            residual_static, jacobian_static);
     } else if (corpus.model_id == "chwirut" && corpus.m == 54) {
       auto residual_dynamic = [&](ConstVectorView<std::dynamic_extent> x,
-                                  VectorView<std::dynamic_extent> r) -> bool {
+                                  VectorView<std::dynamic_extent> r) -> ErrorOrVoid {
         for (Index i = 0; i < corpus.m; ++i) {
           const auto &row = corpus.data[i];
           const double xv = row[0];
@@ -685,10 +693,10 @@ ProblemReport run_problem(const std::filesystem::path &problem_dir) {
           const double d = x[1] + x[2] * xv;
           r[i] = e / d - row.back();
         }
-        return true;
+        return {};
       };
       auto jacobian_dynamic = [&](ConstVectorView<std::dynamic_extent> x,
-                                  MatrixView<std::dynamic_extent, std::dynamic_extent> J) -> bool {
+                                  MatrixView<std::dynamic_extent, std::dynamic_extent> J) -> ErrorOrVoid {
         for (Index i = 0; i < corpus.m; ++i) {
           const auto &row = corpus.data[i];
           const double xv = row[0];
@@ -699,9 +707,9 @@ ProblemReport run_problem(const std::filesystem::path &problem_dir) {
           J[i, 1] = -e / d2;
           J[i, 2] = -xv * e / d2;
         }
-        return true;
+        return {};
       };
-      auto residual_static = [&](ConstVectorView<3> x, VectorView<54> r) -> bool {
+      auto residual_static = [&](ConstVectorView<3> x, VectorView<54> r) -> ErrorOrVoid {
         for (Index i = 0; i < 54; ++i) {
           const auto &row = corpus.data[i];
           const double xv = row[0];
@@ -709,9 +717,9 @@ ProblemReport run_problem(const std::filesystem::path &problem_dir) {
           const double d = x[1] + x[2] * xv;
           r[i] = e / d - row.back();
         }
-        return true;
+        return {};
       };
-      auto jacobian_static = [&](ConstVectorView<3> x, MatrixView<54, 3> J) -> bool {
+      auto jacobian_static = [&](ConstVectorView<3> x, MatrixView<54, 3> J) -> ErrorOrVoid {
         for (Index i = 0; i < 54; ++i) {
           const auto &row = corpus.data[i];
           const double xv = row[0];
@@ -722,13 +730,13 @@ ProblemReport run_problem(const std::filesystem::path &problem_dir) {
           J[i, 1] = -e / d2;
           J[i, 2] = -xv * e / d2;
         }
-        return true;
+        return {};
       };
       run_pair.template operator()<54, 3>(residual_dynamic, jacobian_dynamic,
                                           residual_static, jacobian_static);
     } else if (corpus.model_id == "triple_exponential") {
       auto residual_dynamic = [&](ConstVectorView<std::dynamic_extent> x,
-                                  VectorView<std::dynamic_extent> r) -> bool {
+                                  VectorView<std::dynamic_extent> r) -> ErrorOrVoid {
         for (Index i = 0; i < corpus.m; ++i) {
           const auto &row = corpus.data[i];
           const double xv = row[0];
@@ -738,10 +746,10 @@ ProblemReport run_problem(const std::filesystem::path &problem_dir) {
           }
           r[i] = value - row.back();
         }
-        return true;
+        return {};
       };
       auto jacobian_dynamic = [&](ConstVectorView<std::dynamic_extent> x,
-                                  MatrixView<std::dynamic_extent, std::dynamic_extent> J) -> bool {
+                                  MatrixView<std::dynamic_extent, std::dynamic_extent> J) -> ErrorOrVoid {
         for (Index i = 0; i < corpus.m; ++i) {
           const auto &row = corpus.data[i];
           const double xv = row[0];
@@ -751,9 +759,9 @@ ProblemReport run_problem(const std::filesystem::path &problem_dir) {
             J[i, j + 1] = -x[j] * xv * e;
           }
         }
-        return true;
+        return {};
       };
-      auto residual_static = [&](ConstVectorView<6> x, VectorView<24> r) -> bool {
+      auto residual_static = [&](ConstVectorView<6> x, VectorView<24> r) -> ErrorOrVoid {
         for (Index i = 0; i < 24; ++i) {
           const auto &row = corpus.data[i];
           const double xv = row[0];
@@ -763,9 +771,9 @@ ProblemReport run_problem(const std::filesystem::path &problem_dir) {
           }
           r[i] = value - row.back();
         }
-        return true;
+        return {};
       };
-      auto jacobian_static = [&](ConstVectorView<6> x, MatrixView<24, 6> J) -> bool {
+      auto jacobian_static = [&](ConstVectorView<6> x, MatrixView<24, 6> J) -> ErrorOrVoid {
         for (Index i = 0; i < 24; ++i) {
           const auto &row = corpus.data[i];
           const double xv = row[0];
@@ -775,13 +783,13 @@ ProblemReport run_problem(const std::filesystem::path &problem_dir) {
             J[i, j + 1] = -x[j] * xv * e;
           }
         }
-        return true;
+        return {};
       };
       run_pair.template operator()<24, 6>(residual_dynamic, jacobian_dynamic,
                                           residual_static, jacobian_static);
     } else if (corpus.model_id == "gauss_mixture") {
       auto residual_dynamic = [&](ConstVectorView<std::dynamic_extent> x,
-                                  VectorView<std::dynamic_extent> r) -> bool {
+                                  VectorView<std::dynamic_extent> r) -> ErrorOrVoid {
         for (Index i = 0; i < corpus.m; ++i) {
           const auto &row = corpus.data[i];
           const double xv = row[0];
@@ -791,10 +799,10 @@ ProblemReport run_problem(const std::filesystem::path &problem_dir) {
                  x[2] * std::exp(-(d1 * d1) / (x[4] * x[4])) +
                  x[5] * std::exp(-(d2 * d2) / (x[7] * x[7])) - row.back();
         }
-        return true;
+        return {};
       };
       auto jacobian_dynamic = [&](ConstVectorView<std::dynamic_extent> x,
-                                  MatrixView<std::dynamic_extent, std::dynamic_extent> J) -> bool {
+                                  MatrixView<std::dynamic_extent, std::dynamic_extent> J) -> ErrorOrVoid {
         for (Index i = 0; i < corpus.m; ++i) {
           const auto &row = corpus.data[i];
           const double xv = row[0];
@@ -814,9 +822,9 @@ ProblemReport run_problem(const std::filesystem::path &problem_dir) {
           J[i, 6] = x[5] * e3 * 2.0 * d2 / s2;
           J[i, 7] = x[5] * e3 * 2.0 * d2 * d2 / (x[7] * x[7] * x[7]);
         }
-        return true;
+        return {};
       };
-      auto residual_static = [&](ConstVectorView<8> x, VectorView<250> r) -> bool {
+      auto residual_static = [&](ConstVectorView<8> x, VectorView<250> r) -> ErrorOrVoid {
         for (Index i = 0; i < 250; ++i) {
           const auto &row = corpus.data[i];
           const double xv = row[0];
@@ -826,9 +834,9 @@ ProblemReport run_problem(const std::filesystem::path &problem_dir) {
                  x[2] * std::exp(-(d1 * d1) / (x[4] * x[4])) +
                  x[5] * std::exp(-(d2 * d2) / (x[7] * x[7])) - row.back();
         }
-        return true;
+        return {};
       };
-      auto jacobian_static = [&](ConstVectorView<8> x, MatrixView<250, 8> J) -> bool {
+      auto jacobian_static = [&](ConstVectorView<8> x, MatrixView<250, 8> J) -> ErrorOrVoid {
         for (Index i = 0; i < 250; ++i) {
           const auto &row = corpus.data[i];
           const double xv = row[0];
@@ -848,21 +856,21 @@ ProblemReport run_problem(const std::filesystem::path &problem_dir) {
           J[i, 6] = x[5] * e3 * 2.0 * d2 / s2;
           J[i, 7] = x[5] * e3 * 2.0 * d2 * d2 / (x[7] * x[7] * x[7]);
         }
-        return true;
+        return {};
       };
       run_pair.template operator()<250, 8>(residual_dynamic, jacobian_dynamic,
                                            residual_static, jacobian_static);
     } else if (corpus.model_id == "danwood") {
       auto residual_dynamic = [&](ConstVectorView<std::dynamic_extent> x,
-                                  VectorView<std::dynamic_extent> r) -> bool {
+                                  VectorView<std::dynamic_extent> r) -> ErrorOrVoid {
         for (Index i = 0; i < corpus.m; ++i) {
           const auto &row = corpus.data[i];
           r[i] = x[0] * std::pow(row[0], x[1]) - row.back();
         }
-        return true;
+        return {};
       };
       auto jacobian_dynamic = [&](ConstVectorView<std::dynamic_extent> x,
-                                  MatrixView<std::dynamic_extent, std::dynamic_extent> J) -> bool {
+                                  MatrixView<std::dynamic_extent, std::dynamic_extent> J) -> ErrorOrVoid {
         for (Index i = 0; i < corpus.m; ++i) {
           const auto &row = corpus.data[i];
           const double xv = row[0];
@@ -870,16 +878,16 @@ ProblemReport run_problem(const std::filesystem::path &problem_dir) {
           J[i, 0] = x_pow;
           J[i, 1] = x[0] * x_pow * std::log(xv);
         }
-        return true;
+        return {};
       };
-      auto residual_static = [&](ConstVectorView<2> x, VectorView<6> r) -> bool {
+      auto residual_static = [&](ConstVectorView<2> x, VectorView<6> r) -> ErrorOrVoid {
         for (Index i = 0; i < 6; ++i) {
           const auto &row = corpus.data[i];
           r[i] = x[0] * std::pow(row[0], x[1]) - row.back();
         }
-        return true;
+        return {};
       };
-      auto jacobian_static = [&](ConstVectorView<2> x, MatrixView<6, 2> J) -> bool {
+      auto jacobian_static = [&](ConstVectorView<2> x, MatrixView<6, 2> J) -> ErrorOrVoid {
         for (Index i = 0; i < 6; ++i) {
           const auto &row = corpus.data[i];
           const double xv = row[0];
@@ -887,23 +895,23 @@ ProblemReport run_problem(const std::filesystem::path &problem_dir) {
           J[i, 0] = x_pow;
           J[i, 1] = x[0] * x_pow * std::log(xv);
         }
-        return true;
+        return {};
       };
       run_pair.template operator()<6, 2>(residual_dynamic, jacobian_dynamic,
                                          residual_static, jacobian_static);
     } else if (corpus.model_id == "misra1b") {
       auto residual_dynamic = [&](ConstVectorView<std::dynamic_extent> x,
-                                  VectorView<std::dynamic_extent> r) -> bool {
+                                  VectorView<std::dynamic_extent> r) -> ErrorOrVoid {
         for (Index i = 0; i < corpus.m; ++i) {
           const auto &row = corpus.data[i];
           const double xv = row[0];
           const double t = 1.0 + x[1] * xv / 2.0;
           r[i] = x[0] * (1.0 - std::pow(t, -2.0)) - row.back();
         }
-        return true;
+        return {};
       };
       auto jacobian_dynamic = [&](ConstVectorView<std::dynamic_extent> x,
-                                  MatrixView<std::dynamic_extent, std::dynamic_extent> J) -> bool {
+                                  MatrixView<std::dynamic_extent, std::dynamic_extent> J) -> ErrorOrVoid {
         for (Index i = 0; i < corpus.m; ++i) {
           const auto &row = corpus.data[i];
           const double xv = row[0];
@@ -911,18 +919,18 @@ ProblemReport run_problem(const std::filesystem::path &problem_dir) {
           J[i, 0] = 1.0 - std::pow(t, -2.0);
           J[i, 1] = x[0] * xv * std::pow(t, -3.0);
         }
-        return true;
+        return {};
       };
-      auto residual_static = [&](ConstVectorView<2> x, VectorView<14> r) -> bool {
+      auto residual_static = [&](ConstVectorView<2> x, VectorView<14> r) -> ErrorOrVoid {
         for (Index i = 0; i < 14; ++i) {
           const auto &row = corpus.data[i];
           const double xv = row[0];
           const double t = 1.0 + x[1] * xv / 2.0;
           r[i] = x[0] * (1.0 - std::pow(t, -2.0)) - row.back();
         }
-        return true;
+        return {};
       };
-      auto jacobian_static = [&](ConstVectorView<2> x, MatrixView<14, 2> J) -> bool {
+      auto jacobian_static = [&](ConstVectorView<2> x, MatrixView<14, 2> J) -> ErrorOrVoid {
         for (Index i = 0; i < 14; ++i) {
           const auto &row = corpus.data[i];
           const double xv = row[0];
@@ -930,13 +938,13 @@ ProblemReport run_problem(const std::filesystem::path &problem_dir) {
           J[i, 0] = 1.0 - std::pow(t, -2.0);
           J[i, 1] = x[0] * xv * std::pow(t, -3.0);
         }
-        return true;
+        return {};
       };
       run_pair.template operator()<14, 2>(residual_dynamic, jacobian_dynamic,
                                           residual_static, jacobian_static);
     } else if (corpus.model_id == "rational_quadratic") {
       auto residual_dynamic = [&](ConstVectorView<std::dynamic_extent> x,
-                                  VectorView<std::dynamic_extent> r) -> bool {
+                                  VectorView<std::dynamic_extent> r) -> ErrorOrVoid {
         for (Index i = 0; i < corpus.m; ++i) {
           const auto &row = corpus.data[i];
           const double xv = row[0];
@@ -945,10 +953,10 @@ ProblemReport run_problem(const std::filesystem::path &problem_dir) {
           const double d = 1.0 + x[3] * xv + x[4] * x2;
           r[i] = n / d - row.back();
         }
-        return true;
+        return {};
       };
       auto jacobian_dynamic = [&](ConstVectorView<std::dynamic_extent> x,
-                                  MatrixView<std::dynamic_extent, std::dynamic_extent> J) -> bool {
+                                  MatrixView<std::dynamic_extent, std::dynamic_extent> J) -> ErrorOrVoid {
         for (Index i = 0; i < corpus.m; ++i) {
           const auto &row = corpus.data[i];
           const double xv = row[0];
@@ -962,9 +970,9 @@ ProblemReport run_problem(const std::filesystem::path &problem_dir) {
           J[i, 3] = -n * xv / d2;
           J[i, 4] = -n * x2 / d2;
         }
-        return true;
+        return {};
       };
-      auto residual_static = [&](ConstVectorView<5> x, VectorView<151> r) -> bool {
+      auto residual_static = [&](ConstVectorView<5> x, VectorView<151> r) -> ErrorOrVoid {
         for (Index i = 0; i < 151; ++i) {
           const auto &row = corpus.data[i];
           const double xv = row[0];
@@ -973,9 +981,9 @@ ProblemReport run_problem(const std::filesystem::path &problem_dir) {
           const double d = 1.0 + x[3] * xv + x[4] * x2;
           r[i] = n / d - row.back();
         }
-        return true;
+        return {};
       };
-      auto jacobian_static = [&](ConstVectorView<5> x, MatrixView<151, 5> J) -> bool {
+      auto jacobian_static = [&](ConstVectorView<5> x, MatrixView<151, 5> J) -> ErrorOrVoid {
         for (Index i = 0; i < 151; ++i) {
           const auto &row = corpus.data[i];
           const double xv = row[0];
@@ -989,13 +997,13 @@ ProblemReport run_problem(const std::filesystem::path &problem_dir) {
           J[i, 3] = -n * xv / d2;
           J[i, 4] = -n * x2 / d2;
         }
-        return true;
+        return {};
       };
       run_pair.template operator()<151, 5>(residual_dynamic, jacobian_dynamic,
                                            residual_static, jacobian_static);
     } else if (corpus.model_id == "rational_cubic" && corpus.m == 236) {
       auto residual_dynamic = [&](ConstVectorView<std::dynamic_extent> x,
-                                  VectorView<std::dynamic_extent> r) -> bool {
+                                  VectorView<std::dynamic_extent> r) -> ErrorOrVoid {
         for (Index i = 0; i < corpus.m; ++i) {
           const auto &row = corpus.data[i];
           const double xv = row[0];
@@ -1005,10 +1013,10 @@ ProblemReport run_problem(const std::filesystem::path &problem_dir) {
           const double d = 1.0 + x[4] * xv + x[5] * x2 + x[6] * x3;
           r[i] = n / d - row.back();
         }
-        return true;
+        return {};
       };
       auto jacobian_dynamic = [&](ConstVectorView<std::dynamic_extent> x,
-                                  MatrixView<std::dynamic_extent, std::dynamic_extent> J) -> bool {
+                                  MatrixView<std::dynamic_extent, std::dynamic_extent> J) -> ErrorOrVoid {
         for (Index i = 0; i < corpus.m; ++i) {
           const auto &row = corpus.data[i];
           const double xv = row[0];
@@ -1025,9 +1033,9 @@ ProblemReport run_problem(const std::filesystem::path &problem_dir) {
           J[i, 5] = -n * x2 / d2;
           J[i, 6] = -n * x3 / d2;
         }
-        return true;
+        return {};
       };
-      auto residual_static = [&](ConstVectorView<7> x, VectorView<236> r) -> bool {
+      auto residual_static = [&](ConstVectorView<7> x, VectorView<236> r) -> ErrorOrVoid {
         for (Index i = 0; i < 236; ++i) {
           const auto &row = corpus.data[i];
           const double xv = row[0];
@@ -1037,9 +1045,9 @@ ProblemReport run_problem(const std::filesystem::path &problem_dir) {
           const double d = 1.0 + x[4] * xv + x[5] * x2 + x[6] * x3;
           r[i] = n / d - row.back();
         }
-        return true;
+        return {};
       };
-      auto jacobian_static = [&](ConstVectorView<7> x, MatrixView<236, 7> J) -> bool {
+      auto jacobian_static = [&](ConstVectorView<7> x, MatrixView<236, 7> J) -> ErrorOrVoid {
         for (Index i = 0; i < 236; ++i) {
           const auto &row = corpus.data[i];
           const double xv = row[0];
@@ -1056,13 +1064,13 @@ ProblemReport run_problem(const std::filesystem::path &problem_dir) {
           J[i, 5] = -n * x2 / d2;
           J[i, 6] = -n * x3 / d2;
         }
-        return true;
+        return {};
       };
       run_pair.template operator()<236, 7>(residual_dynamic, jacobian_dynamic,
                                            residual_static, jacobian_static);
     } else if (corpus.model_id == "rational_cubic" && corpus.m == 37) {
       auto residual_dynamic = [&](ConstVectorView<std::dynamic_extent> x,
-                                  VectorView<std::dynamic_extent> r) -> bool {
+                                  VectorView<std::dynamic_extent> r) -> ErrorOrVoid {
         for (Index i = 0; i < corpus.m; ++i) {
           const auto &row = corpus.data[i];
           const double xv = row[0];
@@ -1072,10 +1080,10 @@ ProblemReport run_problem(const std::filesystem::path &problem_dir) {
           const double d = 1.0 + x[4] * xv + x[5] * x2 + x[6] * x3;
           r[i] = n / d - row.back();
         }
-        return true;
+        return {};
       };
       auto jacobian_dynamic = [&](ConstVectorView<std::dynamic_extent> x,
-                                  MatrixView<std::dynamic_extent, std::dynamic_extent> J) -> bool {
+                                  MatrixView<std::dynamic_extent, std::dynamic_extent> J) -> ErrorOrVoid {
         for (Index i = 0; i < corpus.m; ++i) {
           const auto &row = corpus.data[i];
           const double xv = row[0];
@@ -1092,9 +1100,9 @@ ProblemReport run_problem(const std::filesystem::path &problem_dir) {
           J[i, 5] = -n * x2 / d2;
           J[i, 6] = -n * x3 / d2;
         }
-        return true;
+        return {};
       };
-      auto residual_static = [&](ConstVectorView<7> x, VectorView<37> r) -> bool {
+      auto residual_static = [&](ConstVectorView<7> x, VectorView<37> r) -> ErrorOrVoid {
         for (Index i = 0; i < 37; ++i) {
           const auto &row = corpus.data[i];
           const double xv = row[0];
@@ -1104,9 +1112,9 @@ ProblemReport run_problem(const std::filesystem::path &problem_dir) {
           const double d = 1.0 + x[4] * xv + x[5] * x2 + x[6] * x3;
           r[i] = n / d - row.back();
         }
-        return true;
+        return {};
       };
-      auto jacobian_static = [&](ConstVectorView<7> x, MatrixView<37, 7> J) -> bool {
+      auto jacobian_static = [&](ConstVectorView<7> x, MatrixView<37, 7> J) -> ErrorOrVoid {
         for (Index i = 0; i < 37; ++i) {
           const auto &row = corpus.data[i];
           const double xv = row[0];
@@ -1123,23 +1131,23 @@ ProblemReport run_problem(const std::filesystem::path &problem_dir) {
           J[i, 5] = -n * x2 / d2;
           J[i, 6] = -n * x3 / d2;
         }
-        return true;
+        return {};
       };
       run_pair.template operator()<37, 7>(residual_dynamic, jacobian_dynamic,
                                           residual_static, jacobian_static);
     } else if (corpus.model_id == "nelson_log") {
       auto residual_dynamic = [&](ConstVectorView<std::dynamic_extent> x,
-                                  VectorView<std::dynamic_extent> r) -> bool {
+                                  VectorView<std::dynamic_extent> r) -> ErrorOrVoid {
         for (Index i = 0; i < corpus.m; ++i) {
           const auto &row = corpus.data[i];
           const double x1 = row[0];
           const double x2 = row[1];
           r[i] = x[0] - x[1] * x1 * std::exp(-x[2] * x2) - std::log(row.back());
         }
-        return true;
+        return {};
       };
       auto jacobian_dynamic = [&](ConstVectorView<std::dynamic_extent> x,
-                                  MatrixView<std::dynamic_extent, std::dynamic_extent> J) -> bool {
+                                  MatrixView<std::dynamic_extent, std::dynamic_extent> J) -> ErrorOrVoid {
         for (Index i = 0; i < corpus.m; ++i) {
           const auto &row = corpus.data[i];
           const double x1 = row[0];
@@ -1149,18 +1157,18 @@ ProblemReport run_problem(const std::filesystem::path &problem_dir) {
           J[i, 1] = -x1 * e;
           J[i, 2] = x[1] * x1 * x2 * e;
         }
-        return true;
+        return {};
       };
-      auto residual_static = [&](ConstVectorView<3> x, VectorView<128> r) -> bool {
+      auto residual_static = [&](ConstVectorView<3> x, VectorView<128> r) -> ErrorOrVoid {
         for (Index i = 0; i < 128; ++i) {
           const auto &row = corpus.data[i];
           const double x1 = row[0];
           const double x2 = row[1];
           r[i] = x[0] - x[1] * x1 * std::exp(-x[2] * x2) - std::log(row.back());
         }
-        return true;
+        return {};
       };
-      auto jacobian_static = [&](ConstVectorView<3> x, MatrixView<128, 3> J) -> bool {
+      auto jacobian_static = [&](ConstVectorView<3> x, MatrixView<128, 3> J) -> ErrorOrVoid {
         for (Index i = 0; i < 128; ++i) {
           const auto &row = corpus.data[i];
           const double x1 = row[0];
@@ -1170,23 +1178,23 @@ ProblemReport run_problem(const std::filesystem::path &problem_dir) {
           J[i, 1] = -x1 * e;
           J[i, 2] = x[1] * x1 * x2 * e;
         }
-        return true;
+        return {};
       };
       run_pair.template operator()<128, 3>(residual_dynamic, jacobian_dynamic,
                                            residual_static, jacobian_static);
     } else if (corpus.model_id == "mgh17") {
       auto residual_dynamic = [&](ConstVectorView<std::dynamic_extent> x,
-                                  VectorView<std::dynamic_extent> r) -> bool {
+                                  VectorView<std::dynamic_extent> r) -> ErrorOrVoid {
         for (Index i = 0; i < corpus.m; ++i) {
           const auto &row = corpus.data[i];
           const double xv = row[0];
           r[i] = x[0] + x[1] * std::exp(-x[3] * xv) +
                  x[2] * std::exp(-x[4] * xv) - row.back();
         }
-        return true;
+        return {};
       };
       auto jacobian_dynamic = [&](ConstVectorView<std::dynamic_extent> x,
-                                  MatrixView<std::dynamic_extent, std::dynamic_extent> J) -> bool {
+                                  MatrixView<std::dynamic_extent, std::dynamic_extent> J) -> ErrorOrVoid {
         for (Index i = 0; i < corpus.m; ++i) {
           const auto &row = corpus.data[i];
           const double xv = row[0];
@@ -1198,18 +1206,18 @@ ProblemReport run_problem(const std::filesystem::path &problem_dir) {
           J[i, 3] = -x[1] * xv * e1;
           J[i, 4] = -x[2] * xv * e2;
         }
-        return true;
+        return {};
       };
-      auto residual_static = [&](ConstVectorView<5> x, VectorView<33> r) -> bool {
+      auto residual_static = [&](ConstVectorView<5> x, VectorView<33> r) -> ErrorOrVoid {
         for (Index i = 0; i < 33; ++i) {
           const auto &row = corpus.data[i];
           const double xv = row[0];
           r[i] = x[0] + x[1] * std::exp(-x[3] * xv) +
                  x[2] * std::exp(-x[4] * xv) - row.back();
         }
-        return true;
+        return {};
       };
-      auto jacobian_static = [&](ConstVectorView<5> x, MatrixView<33, 5> J) -> bool {
+      auto jacobian_static = [&](ConstVectorView<5> x, MatrixView<33, 5> J) -> ErrorOrVoid {
         for (Index i = 0; i < 33; ++i) {
           const auto &row = corpus.data[i];
           const double xv = row[0];
@@ -1221,23 +1229,23 @@ ProblemReport run_problem(const std::filesystem::path &problem_dir) {
           J[i, 3] = -x[1] * xv * e1;
           J[i, 4] = -x[2] * xv * e2;
         }
-        return true;
+        return {};
       };
       run_pair.template operator()<33, 5>(residual_dynamic, jacobian_dynamic,
                                           residual_static, jacobian_static);
     } else if (corpus.model_id == "misra1c") {
       auto residual_dynamic = [&](ConstVectorView<std::dynamic_extent> x,
-                                  VectorView<std::dynamic_extent> r) -> bool {
+                                  VectorView<std::dynamic_extent> r) -> ErrorOrVoid {
         for (Index i = 0; i < corpus.m; ++i) {
           const auto &row = corpus.data[i];
           const double xv = row[0];
           const double t = 1.0 + 2.0 * x[1] * xv;
           r[i] = x[0] * (1.0 - 1.0 / std::sqrt(t)) - row.back();
         }
-        return true;
+        return {};
       };
       auto jacobian_dynamic = [&](ConstVectorView<std::dynamic_extent> x,
-                                  MatrixView<std::dynamic_extent, std::dynamic_extent> J) -> bool {
+                                  MatrixView<std::dynamic_extent, std::dynamic_extent> J) -> ErrorOrVoid {
         for (Index i = 0; i < corpus.m; ++i) {
           const auto &row = corpus.data[i];
           const double xv = row[0];
@@ -1245,18 +1253,18 @@ ProblemReport run_problem(const std::filesystem::path &problem_dir) {
           J[i, 0] = 1.0 - 1.0 / std::sqrt(t);
           J[i, 1] = x[0] * xv * std::pow(t, -1.5);
         }
-        return true;
+        return {};
       };
-      auto residual_static = [&](ConstVectorView<2> x, VectorView<14> r) -> bool {
+      auto residual_static = [&](ConstVectorView<2> x, VectorView<14> r) -> ErrorOrVoid {
         for (Index i = 0; i < 14; ++i) {
           const auto &row = corpus.data[i];
           const double xv = row[0];
           const double t = 1.0 + 2.0 * x[1] * xv;
           r[i] = x[0] * (1.0 - 1.0 / std::sqrt(t)) - row.back();
         }
-        return true;
+        return {};
       };
-      auto jacobian_static = [&](ConstVectorView<2> x, MatrixView<14, 2> J) -> bool {
+      auto jacobian_static = [&](ConstVectorView<2> x, MatrixView<14, 2> J) -> ErrorOrVoid {
         for (Index i = 0; i < 14; ++i) {
           const auto &row = corpus.data[i];
           const double xv = row[0];
@@ -1264,23 +1272,23 @@ ProblemReport run_problem(const std::filesystem::path &problem_dir) {
           J[i, 0] = 1.0 - 1.0 / std::sqrt(t);
           J[i, 1] = x[0] * xv * std::pow(t, -1.5);
         }
-        return true;
+        return {};
       };
       run_pair.template operator()<14, 2>(residual_dynamic, jacobian_dynamic,
                                           residual_static, jacobian_static);
     } else if (corpus.model_id == "misra1d") {
       auto residual_dynamic = [&](ConstVectorView<std::dynamic_extent> x,
-                                  VectorView<std::dynamic_extent> r) -> bool {
+                                  VectorView<std::dynamic_extent> r) -> ErrorOrVoid {
         for (Index i = 0; i < corpus.m; ++i) {
           const auto &row = corpus.data[i];
           const double xv = row[0];
           const double d = 1.0 + x[1] * xv;
           r[i] = (x[0] * x[1] * xv) / d - row.back();
         }
-        return true;
+        return {};
       };
       auto jacobian_dynamic = [&](ConstVectorView<std::dynamic_extent> x,
-                                  MatrixView<std::dynamic_extent, std::dynamic_extent> J) -> bool {
+                                  MatrixView<std::dynamic_extent, std::dynamic_extent> J) -> ErrorOrVoid {
         for (Index i = 0; i < corpus.m; ++i) {
           const auto &row = corpus.data[i];
           const double xv = row[0];
@@ -1289,18 +1297,18 @@ ProblemReport run_problem(const std::filesystem::path &problem_dir) {
           J[i, 0] = x[1] * xv / d;
           J[i, 1] = x[0] * xv / d2;
         }
-        return true;
+        return {};
       };
-      auto residual_static = [&](ConstVectorView<2> x, VectorView<14> r) -> bool {
+      auto residual_static = [&](ConstVectorView<2> x, VectorView<14> r) -> ErrorOrVoid {
         for (Index i = 0; i < 14; ++i) {
           const auto &row = corpus.data[i];
           const double xv = row[0];
           const double d = 1.0 + x[1] * xv;
           r[i] = (x[0] * x[1] * xv) / d - row.back();
         }
-        return true;
+        return {};
       };
-      auto jacobian_static = [&](ConstVectorView<2> x, MatrixView<14, 2> J) -> bool {
+      auto jacobian_static = [&](ConstVectorView<2> x, MatrixView<14, 2> J) -> ErrorOrVoid {
         for (Index i = 0; i < 14; ++i) {
           const auto &row = corpus.data[i];
           const double xv = row[0];
@@ -1309,23 +1317,23 @@ ProblemReport run_problem(const std::filesystem::path &problem_dir) {
           J[i, 0] = x[1] * xv / d;
           J[i, 1] = x[0] * xv / d2;
         }
-        return true;
+        return {};
       };
       run_pair.template operator()<14, 2>(residual_dynamic, jacobian_dynamic,
                                           residual_static, jacobian_static);
     } else if (corpus.model_id == "roszman1") {
       auto residual_dynamic = [&](ConstVectorView<std::dynamic_extent> x,
-                                  VectorView<std::dynamic_extent> r) -> bool {
+                                  VectorView<std::dynamic_extent> r) -> ErrorOrVoid {
         for (Index i = 0; i < corpus.m; ++i) {
           const auto &row = corpus.data[i];
           const double xv = row[0];
           r[i] = x[0] - x[1] * xv -
                  std::atan(x[2] / (xv - x[3])) / std::numbers::pi - row.back();
         }
-        return true;
+        return {};
       };
       auto jacobian_dynamic = [&](ConstVectorView<std::dynamic_extent> x,
-                                  MatrixView<std::dynamic_extent, std::dynamic_extent> J) -> bool {
+                                  MatrixView<std::dynamic_extent, std::dynamic_extent> J) -> ErrorOrVoid {
         for (Index i = 0; i < corpus.m; ++i) {
           const auto &row = corpus.data[i];
           const double xv = row[0];
@@ -1336,18 +1344,18 @@ ProblemReport run_problem(const std::filesystem::path &problem_dir) {
           J[i, 2] = common / (xv - x[3]);
           J[i, 3] = common * x[2] / ((xv - x[3]) * (xv - x[3]));
         }
-        return true;
+        return {};
       };
-      auto residual_static = [&](ConstVectorView<4> x, VectorView<25> r) -> bool {
+      auto residual_static = [&](ConstVectorView<4> x, VectorView<25> r) -> ErrorOrVoid {
         for (Index i = 0; i < 25; ++i) {
           const auto &row = corpus.data[i];
           const double xv = row[0];
           r[i] = x[0] - x[1] * xv -
                  std::atan(x[2] / (xv - x[3])) / std::numbers::pi - row.back();
         }
-        return true;
+        return {};
       };
-      auto jacobian_static = [&](ConstVectorView<4> x, MatrixView<25, 4> J) -> bool {
+      auto jacobian_static = [&](ConstVectorView<4> x, MatrixView<25, 4> J) -> ErrorOrVoid {
         for (Index i = 0; i < 25; ++i) {
           const auto &row = corpus.data[i];
           const double xv = row[0];
@@ -1358,13 +1366,13 @@ ProblemReport run_problem(const std::filesystem::path &problem_dir) {
           J[i, 2] = common / (xv - x[3]);
           J[i, 3] = common * x[2] / ((xv - x[3]) * (xv - x[3]));
         }
-        return true;
+        return {};
       };
       run_pair.template operator()<25, 4>(residual_dynamic, jacobian_dynamic,
                                           residual_static, jacobian_static);
     } else if (corpus.model_id == "enso") {
       auto residual_dynamic = [&](ConstVectorView<std::dynamic_extent> x,
-                                  VectorView<std::dynamic_extent> r) -> bool {
+                                  VectorView<std::dynamic_extent> r) -> ErrorOrVoid {
         for (Index i = 0; i < corpus.m; ++i) {
           const auto &row = corpus.data[i];
           const double xv = row[0];
@@ -1376,10 +1384,10 @@ ProblemReport run_problem(const std::filesystem::path &problem_dir) {
                                x[7] * std::cos(p7) + x[8] * std::sin(p7);
           r[i] = value - row.back();
         }
-        return true;
+        return {};
       };
       auto jacobian_dynamic = [&](ConstVectorView<std::dynamic_extent> x,
-                                  MatrixView<std::dynamic_extent, std::dynamic_extent> J) -> bool {
+                                  MatrixView<std::dynamic_extent, std::dynamic_extent> J) -> ErrorOrVoid {
         for (Index i = 0; i < corpus.m; ++i) {
           const auto &row = corpus.data[i];
           const double xv = row[0];
@@ -1398,9 +1406,9 @@ ProblemReport run_problem(const std::filesystem::path &problem_dir) {
           J[i, 7] = std::cos(p7);
           J[i, 8] = std::sin(p7);
         }
-        return true;
+        return {};
       };
-      auto residual_static = [&](ConstVectorView<9> x, VectorView<168> r) -> bool {
+      auto residual_static = [&](ConstVectorView<9> x, VectorView<168> r) -> ErrorOrVoid {
         for (Index i = 0; i < 168; ++i) {
           const auto &row = corpus.data[i];
           const double xv = row[0];
@@ -1412,9 +1420,9 @@ ProblemReport run_problem(const std::filesystem::path &problem_dir) {
                                x[7] * std::cos(p7) + x[8] * std::sin(p7);
           r[i] = value - row.back();
         }
-        return true;
+        return {};
       };
-      auto jacobian_static = [&](ConstVectorView<9> x, MatrixView<168, 9> J) -> bool {
+      auto jacobian_static = [&](ConstVectorView<9> x, MatrixView<168, 9> J) -> ErrorOrVoid {
         for (Index i = 0; i < 168; ++i) {
           const auto &row = corpus.data[i];
           const double xv = row[0];
@@ -1433,13 +1441,13 @@ ProblemReport run_problem(const std::filesystem::path &problem_dir) {
           J[i, 7] = std::cos(p7);
           J[i, 8] = std::sin(p7);
         }
-        return true;
+        return {};
       };
       run_pair.template operator()<168, 9>(residual_dynamic, jacobian_dynamic,
                                            residual_static, jacobian_static);
     } else if (corpus.model_id == "mgh09") {
       auto residual_dynamic = [&](ConstVectorView<std::dynamic_extent> x,
-                                  VectorView<std::dynamic_extent> r) -> bool {
+                                  VectorView<std::dynamic_extent> r) -> ErrorOrVoid {
         for (Index i = 0; i < corpus.m; ++i) {
           const auto &row = corpus.data[i];
           const double xv = row[0];
@@ -1447,10 +1455,10 @@ ProblemReport run_problem(const std::filesystem::path &problem_dir) {
           const double den = xv * xv + x[2] * xv + x[3];
           r[i] = x[0] * num / den - row.back();
         }
-        return true;
+        return {};
       };
       auto jacobian_dynamic = [&](ConstVectorView<std::dynamic_extent> x,
-                                  MatrixView<std::dynamic_extent, std::dynamic_extent> J) -> bool {
+                                  MatrixView<std::dynamic_extent, std::dynamic_extent> J) -> ErrorOrVoid {
         for (Index i = 0; i < corpus.m; ++i) {
           const auto &row = corpus.data[i];
           const double xv = row[0];
@@ -1462,9 +1470,9 @@ ProblemReport run_problem(const std::filesystem::path &problem_dir) {
           J[i, 2] = -x[0] * num * xv / den2;
           J[i, 3] = -x[0] * num / den2;
         }
-        return true;
+        return {};
       };
-      auto residual_static = [&](ConstVectorView<4> x, VectorView<11> r) -> bool {
+      auto residual_static = [&](ConstVectorView<4> x, VectorView<11> r) -> ErrorOrVoid {
         for (Index i = 0; i < 11; ++i) {
           const auto &row = corpus.data[i];
           const double xv = row[0];
@@ -1472,9 +1480,9 @@ ProblemReport run_problem(const std::filesystem::path &problem_dir) {
           const double den = xv * xv + x[2] * xv + x[3];
           r[i] = x[0] * num / den - row.back();
         }
-        return true;
+        return {};
       };
-      auto jacobian_static = [&](ConstVectorView<4> x, MatrixView<11, 4> J) -> bool {
+      auto jacobian_static = [&](ConstVectorView<4> x, MatrixView<11, 4> J) -> ErrorOrVoid {
         for (Index i = 0; i < 11; ++i) {
           const auto &row = corpus.data[i];
           const double xv = row[0];
@@ -1486,23 +1494,23 @@ ProblemReport run_problem(const std::filesystem::path &problem_dir) {
           J[i, 2] = -x[0] * num * xv / den2;
           J[i, 3] = -x[0] * num / den2;
         }
-        return true;
+        return {};
       };
       run_pair.template operator()<11, 4>(residual_dynamic, jacobian_dynamic,
                                           residual_static, jacobian_static);
     } else if (corpus.model_id == "rat42") {
       auto residual_dynamic = [&](ConstVectorView<std::dynamic_extent> x,
-                                  VectorView<std::dynamic_extent> r) -> bool {
+                                  VectorView<std::dynamic_extent> r) -> ErrorOrVoid {
         for (Index i = 0; i < corpus.m; ++i) {
           const auto &row = corpus.data[i];
           const double xv = row[0];
           const double e = std::exp(x[1] - x[2] * xv);
           r[i] = x[0] / (1.0 + e) - row.back();
         }
-        return true;
+        return {};
       };
       auto jacobian_dynamic = [&](ConstVectorView<std::dynamic_extent> x,
-                                  MatrixView<std::dynamic_extent, std::dynamic_extent> J) -> bool {
+                                  MatrixView<std::dynamic_extent, std::dynamic_extent> J) -> ErrorOrVoid {
         for (Index i = 0; i < corpus.m; ++i) {
           const auto &row = corpus.data[i];
           const double xv = row[0];
@@ -1513,18 +1521,18 @@ ProblemReport run_problem(const std::filesystem::path &problem_dir) {
           J[i, 1] = -x[0] * e / d2;
           J[i, 2] = x[0] * xv * e / d2;
         }
-        return true;
+        return {};
       };
-      auto residual_static = [&](ConstVectorView<3> x, VectorView<9> r) -> bool {
+      auto residual_static = [&](ConstVectorView<3> x, VectorView<9> r) -> ErrorOrVoid {
         for (Index i = 0; i < 9; ++i) {
           const auto &row = corpus.data[i];
           const double xv = row[0];
           const double e = std::exp(x[1] - x[2] * xv);
           r[i] = x[0] / (1.0 + e) - row.back();
         }
-        return true;
+        return {};
       };
-      auto jacobian_static = [&](ConstVectorView<3> x, MatrixView<9, 3> J) -> bool {
+      auto jacobian_static = [&](ConstVectorView<3> x, MatrixView<9, 3> J) -> ErrorOrVoid {
         for (Index i = 0; i < 9; ++i) {
           const auto &row = corpus.data[i];
           const double xv = row[0];
@@ -1535,23 +1543,23 @@ ProblemReport run_problem(const std::filesystem::path &problem_dir) {
           J[i, 1] = -x[0] * e / d2;
           J[i, 2] = x[0] * xv * e / d2;
         }
-        return true;
+        return {};
       };
       run_pair.template operator()<9, 3>(residual_dynamic, jacobian_dynamic,
                                          residual_static, jacobian_static);
     } else if (corpus.model_id == "mgh10") {
       auto residual_dynamic = [&](ConstVectorView<std::dynamic_extent> x,
-                                  VectorView<std::dynamic_extent> r) -> bool {
+                                  VectorView<std::dynamic_extent> r) -> ErrorOrVoid {
         for (Index i = 0; i < corpus.m; ++i) {
           const auto &row = corpus.data[i];
           const double xv = row[0];
           const double e = std::exp(x[1] / (xv + x[2]));
           r[i] = x[0] * e - row.back();
         }
-        return true;
+        return {};
       };
       auto jacobian_dynamic = [&](ConstVectorView<std::dynamic_extent> x,
-                                  MatrixView<std::dynamic_extent, std::dynamic_extent> J) -> bool {
+                                  MatrixView<std::dynamic_extent, std::dynamic_extent> J) -> ErrorOrVoid {
         for (Index i = 0; i < corpus.m; ++i) {
           const auto &row = corpus.data[i];
           const double xv = row[0];
@@ -1561,18 +1569,18 @@ ProblemReport run_problem(const std::filesystem::path &problem_dir) {
           J[i, 1] = x[0] * e / q;
           J[i, 2] = -x[0] * e * x[1] / (q * q);
         }
-        return true;
+        return {};
       };
-      auto residual_static = [&](ConstVectorView<3> x, VectorView<16> r) -> bool {
+      auto residual_static = [&](ConstVectorView<3> x, VectorView<16> r) -> ErrorOrVoid {
         for (Index i = 0; i < 16; ++i) {
           const auto &row = corpus.data[i];
           const double xv = row[0];
           const double e = std::exp(x[1] / (xv + x[2]));
           r[i] = x[0] * e - row.back();
         }
-        return true;
+        return {};
       };
-      auto jacobian_static = [&](ConstVectorView<3> x, MatrixView<16, 3> J) -> bool {
+      auto jacobian_static = [&](ConstVectorView<3> x, MatrixView<16, 3> J) -> ErrorOrVoid {
         for (Index i = 0; i < 16; ++i) {
           const auto &row = corpus.data[i];
           const double xv = row[0];
@@ -1582,13 +1590,13 @@ ProblemReport run_problem(const std::filesystem::path &problem_dir) {
           J[i, 1] = x[0] * e / q;
           J[i, 2] = -x[0] * e * x[1] / (q * q);
         }
-        return true;
+        return {};
       };
       run_pair.template operator()<16, 3>(residual_dynamic, jacobian_dynamic,
                                           residual_static, jacobian_static);
     } else if (corpus.model_id == "eckerle4") {
       auto residual_dynamic = [&](ConstVectorView<std::dynamic_extent> x,
-                                  VectorView<std::dynamic_extent> r) -> bool {
+                                  VectorView<std::dynamic_extent> r) -> ErrorOrVoid {
         for (Index i = 0; i < corpus.m; ++i) {
           const auto &row = corpus.data[i];
           const double xv = row[0];
@@ -1596,10 +1604,10 @@ ProblemReport run_problem(const std::filesystem::path &problem_dir) {
           const double e = std::exp(-(delta * delta) / (2.0 * x[1] * x[1]));
           r[i] = (x[0] / x[1]) * e - row.back();
         }
-        return true;
+        return {};
       };
       auto jacobian_dynamic = [&](ConstVectorView<std::dynamic_extent> x,
-                                  MatrixView<std::dynamic_extent, std::dynamic_extent> J) -> bool {
+                                  MatrixView<std::dynamic_extent, std::dynamic_extent> J) -> ErrorOrVoid {
         for (Index i = 0; i < corpus.m; ++i) {
           const auto &row = corpus.data[i];
           const double xv = row[0];
@@ -1612,9 +1620,9 @@ ProblemReport run_problem(const std::filesystem::path &problem_dir) {
           J[i, 1] = b1 * e * (delta * delta / (b2 * b2 * b2 * b2) - 1.0 / (b2 * b2));
           J[i, 2] = b1 * e * delta / (b2 * b2 * b2);
         }
-        return true;
+        return {};
       };
-      auto residual_static = [&](ConstVectorView<3> x, VectorView<35> r) -> bool {
+      auto residual_static = [&](ConstVectorView<3> x, VectorView<35> r) -> ErrorOrVoid {
         for (Index i = 0; i < 35; ++i) {
           const auto &row = corpus.data[i];
           const double xv = row[0];
@@ -1622,9 +1630,9 @@ ProblemReport run_problem(const std::filesystem::path &problem_dir) {
           const double e = std::exp(-(delta * delta) / (2.0 * x[1] * x[1]));
           r[i] = (x[0] / x[1]) * e - row.back();
         }
-        return true;
+        return {};
       };
-      auto jacobian_static = [&](ConstVectorView<3> x, MatrixView<35, 3> J) -> bool {
+      auto jacobian_static = [&](ConstVectorView<3> x, MatrixView<35, 3> J) -> ErrorOrVoid {
         for (Index i = 0; i < 35; ++i) {
           const auto &row = corpus.data[i];
           const double xv = row[0];
@@ -1637,13 +1645,13 @@ ProblemReport run_problem(const std::filesystem::path &problem_dir) {
           J[i, 1] = b1 * e * (delta * delta / (b2 * b2 * b2 * b2) - 1.0 / (b2 * b2));
           J[i, 2] = b1 * e * delta / (b2 * b2 * b2);
         }
-        return true;
+        return {};
       };
       run_pair.template operator()<35, 3>(residual_dynamic, jacobian_dynamic,
                                           residual_static, jacobian_static);
     } else if (corpus.model_id == "rat43") {
       auto residual_dynamic = [&](ConstVectorView<std::dynamic_extent> x,
-                                  VectorView<std::dynamic_extent> r) -> bool {
+                                  VectorView<std::dynamic_extent> r) -> ErrorOrVoid {
         for (Index i = 0; i < corpus.m; ++i) {
           const auto &row = corpus.data[i];
           const double xv = row[0];
@@ -1652,10 +1660,10 @@ ProblemReport run_problem(const std::filesystem::path &problem_dir) {
           const double p = std::pow(t, -1.0 / x[3]);
           r[i] = x[0] * p - row.back();
         }
-        return true;
+        return {};
       };
       auto jacobian_dynamic = [&](ConstVectorView<std::dynamic_extent> x,
-                                  MatrixView<std::dynamic_extent, std::dynamic_extent> J) -> bool {
+                                  MatrixView<std::dynamic_extent, std::dynamic_extent> J) -> ErrorOrVoid {
         for (Index i = 0; i < corpus.m; ++i) {
           const auto &row = corpus.data[i];
           const double xv = row[0];
@@ -1672,9 +1680,9 @@ ProblemReport run_problem(const std::filesystem::path &problem_dir) {
           J[i, 2] = yhat * xv * e / (b4 * t);
           J[i, 3] = yhat * std::log(t) / (b4 * b4);
         }
-        return true;
+        return {};
       };
-      auto residual_static = [&](ConstVectorView<4> x, VectorView<15> r) -> bool {
+      auto residual_static = [&](ConstVectorView<4> x, VectorView<15> r) -> ErrorOrVoid {
         for (Index i = 0; i < 15; ++i) {
           const auto &row = corpus.data[i];
           const double xv = row[0];
@@ -1683,9 +1691,9 @@ ProblemReport run_problem(const std::filesystem::path &problem_dir) {
           const double p = std::pow(t, -1.0 / x[3]);
           r[i] = x[0] * p - row.back();
         }
-        return true;
+        return {};
       };
-      auto jacobian_static = [&](ConstVectorView<4> x, MatrixView<15, 4> J) -> bool {
+      auto jacobian_static = [&](ConstVectorView<4> x, MatrixView<15, 4> J) -> ErrorOrVoid {
         for (Index i = 0; i < 15; ++i) {
           const auto &row = corpus.data[i];
           const double xv = row[0];
@@ -1702,13 +1710,13 @@ ProblemReport run_problem(const std::filesystem::path &problem_dir) {
           J[i, 2] = yhat * xv * e / (b4 * t);
           J[i, 3] = yhat * std::log(t) / (b4 * b4);
         }
-        return true;
+        return {};
       };
       run_pair.template operator()<15, 4>(residual_dynamic, jacobian_dynamic,
                                           residual_static, jacobian_static);
     } else if (corpus.model_id == "linear_dense" && corpus.m == 1000 && corpus.n == 4) {
       auto residual_dynamic = [&](ConstVectorView<std::dynamic_extent> x,
-                                  VectorView<std::dynamic_extent> r) -> bool {
+                                  VectorView<std::dynamic_extent> r) -> ErrorOrVoid {
         for (Index i = 0; i < corpus.m; ++i) {
           const auto &row = corpus.data[i];
           double value = 0.0;
@@ -1717,19 +1725,19 @@ ProblemReport run_problem(const std::filesystem::path &problem_dir) {
           }
           r[i] = value - row.back();
         }
-        return true;
+        return {};
       };
       auto jacobian_dynamic = [&](ConstVectorView<std::dynamic_extent>,
-                                  MatrixView<std::dynamic_extent, std::dynamic_extent> J) -> bool {
+                                  MatrixView<std::dynamic_extent, std::dynamic_extent> J) -> ErrorOrVoid {
         for (Index i = 0; i < corpus.m; ++i) {
           const auto &row = corpus.data[i];
           for (Index j = 0; j < 4; ++j) {
             J[i, j] = row[j];
           }
         }
-        return true;
+        return {};
       };
-      auto residual_static = [&](ConstVectorView<4> x, VectorView<1000> r) -> bool {
+      auto residual_static = [&](ConstVectorView<4> x, VectorView<1000> r) -> ErrorOrVoid {
         for (Index i = 0; i < 1000; ++i) {
           const auto &row = corpus.data[i];
           double value = 0.0;
@@ -1738,22 +1746,22 @@ ProblemReport run_problem(const std::filesystem::path &problem_dir) {
           }
           r[i] = value - row.back();
         }
-        return true;
+        return {};
       };
-      auto jacobian_static = [&](ConstVectorView<4>, MatrixView<1000, 4> J) -> bool {
+      auto jacobian_static = [&](ConstVectorView<4>, MatrixView<1000, 4> J) -> ErrorOrVoid {
         for (Index i = 0; i < 1000; ++i) {
           const auto &row = corpus.data[i];
           for (Index j = 0; j < 4; ++j) {
             J[i, j] = row[j];
           }
         }
-        return true;
+        return {};
       };
       run_pair.template operator()<1000, 4>(residual_dynamic, jacobian_dynamic,
                                             residual_static, jacobian_static);
     } else if (corpus.model_id == "linear_dense" && corpus.m == 10000 && corpus.n == 4) {
       auto residual_dynamic = [&](ConstVectorView<std::dynamic_extent> x,
-                                  VectorView<std::dynamic_extent> r) -> bool {
+                                  VectorView<std::dynamic_extent> r) -> ErrorOrVoid {
         for (Index i = 0; i < corpus.m; ++i) {
           const auto &row = corpus.data[i];
           double value = 0.0;
@@ -1762,19 +1770,19 @@ ProblemReport run_problem(const std::filesystem::path &problem_dir) {
           }
           r[i] = value - row.back();
         }
-        return true;
+        return {};
       };
       auto jacobian_dynamic = [&](ConstVectorView<std::dynamic_extent>,
-                                  MatrixView<std::dynamic_extent, std::dynamic_extent> J) -> bool {
+                                  MatrixView<std::dynamic_extent, std::dynamic_extent> J) -> ErrorOrVoid {
         for (Index i = 0; i < corpus.m; ++i) {
           const auto &row = corpus.data[i];
           for (Index j = 0; j < 4; ++j) {
             J[i, j] = row[j];
           }
         }
-        return true;
+        return {};
       };
-      auto residual_static = [&](ConstVectorView<4> x, VectorView<10000> r) -> bool {
+      auto residual_static = [&](ConstVectorView<4> x, VectorView<10000> r) -> ErrorOrVoid {
         for (Index i = 0; i < 10000; ++i) {
           const auto &row = corpus.data[i];
           double value = 0.0;
@@ -1783,22 +1791,22 @@ ProblemReport run_problem(const std::filesystem::path &problem_dir) {
           }
           r[i] = value - row.back();
         }
-        return true;
+        return {};
       };
-      auto jacobian_static = [&](ConstVectorView<4>, MatrixView<10000, 4> J) -> bool {
+      auto jacobian_static = [&](ConstVectorView<4>, MatrixView<10000, 4> J) -> ErrorOrVoid {
         for (Index i = 0; i < 10000; ++i) {
           const auto &row = corpus.data[i];
           for (Index j = 0; j < 4; ++j) {
             J[i, j] = row[j];
           }
         }
-        return true;
+        return {};
       };
       run_pair.template operator()<10000, 4>(residual_dynamic, jacobian_dynamic,
                                              residual_static, jacobian_static);
     } else if (corpus.model_id == "rational_dense" && corpus.m == 32 && corpus.n == 32) {
       auto residual_dynamic = [&](ConstVectorView<std::dynamic_extent> x,
-                                  VectorView<std::dynamic_extent> r) -> bool {
+                                  VectorView<std::dynamic_extent> r) -> ErrorOrVoid {
         constexpr Index Half = 16;
         for (Index i = 0; i < corpus.m; ++i) {
           const auto &row = corpus.data[i];
@@ -1814,10 +1822,10 @@ ProblemReport run_problem(const std::filesystem::path &problem_dir) {
           }
           r[i] = num / den - row.back();
         }
-        return true;
+        return {};
       };
       auto jacobian_dynamic = [&](ConstVectorView<std::dynamic_extent> x,
-                                  MatrixView<std::dynamic_extent, std::dynamic_extent> J) -> bool {
+                                  MatrixView<std::dynamic_extent, std::dynamic_extent> J) -> ErrorOrVoid {
         constexpr Index Half = 16;
         for (Index i = 0; i < corpus.m; ++i) {
           const auto &row = corpus.data[i];
@@ -1837,9 +1845,9 @@ ProblemReport run_problem(const std::filesystem::path &problem_dir) {
             J[i, Half + j] = -num * powers[j + 1] / den2;
           }
         }
-        return true;
+        return {};
       };
-      auto residual_static = [&](ConstVectorView<32> x, VectorView<32> r) -> bool {
+      auto residual_static = [&](ConstVectorView<32> x, VectorView<32> r) -> ErrorOrVoid {
         constexpr Index Half = 16;
         for (Index i = 0; i < 32; ++i) {
           const auto &row = corpus.data[i];
@@ -1855,9 +1863,9 @@ ProblemReport run_problem(const std::filesystem::path &problem_dir) {
           }
           r[i] = num / den - row.back();
         }
-        return true;
+        return {};
       };
-      auto jacobian_static = [&](ConstVectorView<32> x, MatrixView<32, 32> J) -> bool {
+      auto jacobian_static = [&](ConstVectorView<32> x, MatrixView<32, 32> J) -> ErrorOrVoid {
         constexpr Index Half = 16;
         for (Index i = 0; i < 32; ++i) {
           const auto &row = corpus.data[i];
@@ -1877,13 +1885,13 @@ ProblemReport run_problem(const std::filesystem::path &problem_dir) {
             J[i, Half + j] = -num * powers[j + 1] / den2;
           }
         }
-        return true;
+        return {};
       };
       run_pair.template operator()<32, 32>(residual_dynamic, jacobian_dynamic,
                                            residual_static, jacobian_static);
     } else if (corpus.model_id == "rational_dense" && corpus.m == 64 && corpus.n == 64) {
       auto residual_dynamic = [&](ConstVectorView<std::dynamic_extent> x,
-                                  VectorView<std::dynamic_extent> r) -> bool {
+                                  VectorView<std::dynamic_extent> r) -> ErrorOrVoid {
         constexpr Index Half = 32;
         for (Index i = 0; i < corpus.m; ++i) {
           const auto &row = corpus.data[i];
@@ -1899,10 +1907,10 @@ ProblemReport run_problem(const std::filesystem::path &problem_dir) {
           }
           r[i] = num / den - row.back();
         }
-        return true;
+        return {};
       };
       auto jacobian_dynamic = [&](ConstVectorView<std::dynamic_extent> x,
-                                  MatrixView<std::dynamic_extent, std::dynamic_extent> J) -> bool {
+                                  MatrixView<std::dynamic_extent, std::dynamic_extent> J) -> ErrorOrVoid {
         constexpr Index Half = 32;
         for (Index i = 0; i < corpus.m; ++i) {
           const auto &row = corpus.data[i];
@@ -1922,9 +1930,9 @@ ProblemReport run_problem(const std::filesystem::path &problem_dir) {
             J[i, Half + j] = -num * powers[j + 1] / den2;
           }
         }
-        return true;
+        return {};
       };
-      auto residual_static = [&](ConstVectorView<64> x, VectorView<64> r) -> bool {
+      auto residual_static = [&](ConstVectorView<64> x, VectorView<64> r) -> ErrorOrVoid {
         constexpr Index Half = 32;
         for (Index i = 0; i < 64; ++i) {
           const auto &row = corpus.data[i];
@@ -1940,9 +1948,9 @@ ProblemReport run_problem(const std::filesystem::path &problem_dir) {
           }
           r[i] = num / den - row.back();
         }
-        return true;
+        return {};
       };
-      auto jacobian_static = [&](ConstVectorView<64> x, MatrixView<64, 64> J) -> bool {
+      auto jacobian_static = [&](ConstVectorView<64> x, MatrixView<64, 64> J) -> ErrorOrVoid {
         constexpr Index Half = 32;
         for (Index i = 0; i < 64; ++i) {
           const auto &row = corpus.data[i];
@@ -1962,13 +1970,13 @@ ProblemReport run_problem(const std::filesystem::path &problem_dir) {
             J[i, Half + j] = -num * powers[j + 1] / den2;
           }
         }
-        return true;
+        return {};
       };
       run_pair.template operator()<64, 64>(residual_dynamic, jacobian_dynamic,
                                            residual_static, jacobian_static);
     } else if (corpus.model_id == "exp_sum" && corpus.m == 512 && corpus.n == 32) {
       auto residual_dynamic = [&](ConstVectorView<std::dynamic_extent> x,
-                                  VectorView<std::dynamic_extent> r) -> bool {
+                                  VectorView<std::dynamic_extent> r) -> ErrorOrVoid {
         for (Index i = 0; i < corpus.m; ++i) {
           const auto &row = corpus.data[i];
           const double xv = row[0];
@@ -1978,10 +1986,10 @@ ProblemReport run_problem(const std::filesystem::path &problem_dir) {
           }
           r[i] = value - row.back();
         }
-        return true;
+        return {};
       };
       auto jacobian_dynamic = [&](ConstVectorView<std::dynamic_extent> x,
-                                  MatrixView<std::dynamic_extent, std::dynamic_extent> J) -> bool {
+                                  MatrixView<std::dynamic_extent, std::dynamic_extent> J) -> ErrorOrVoid {
         for (Index i = 0; i < corpus.m; ++i) {
           const auto &row = corpus.data[i];
           const double xv = row[0];
@@ -1991,9 +1999,9 @@ ProblemReport run_problem(const std::filesystem::path &problem_dir) {
             J[i, j + 1] = -x[j] * xv * e;
           }
         }
-        return true;
+        return {};
       };
-      auto residual_static = [&](ConstVectorView<32> x, VectorView<512> r) -> bool {
+      auto residual_static = [&](ConstVectorView<32> x, VectorView<512> r) -> ErrorOrVoid {
         for (Index i = 0; i < 512; ++i) {
           const auto &row = corpus.data[i];
           const double xv = row[0];
@@ -2003,9 +2011,9 @@ ProblemReport run_problem(const std::filesystem::path &problem_dir) {
           }
           r[i] = value - row.back();
         }
-        return true;
+        return {};
       };
-      auto jacobian_static = [&](ConstVectorView<32> x, MatrixView<512, 32> J) -> bool {
+      auto jacobian_static = [&](ConstVectorView<32> x, MatrixView<512, 32> J) -> ErrorOrVoid {
         for (Index i = 0; i < 512; ++i) {
           const auto &row = corpus.data[i];
           const double xv = row[0];
@@ -2015,13 +2023,13 @@ ProblemReport run_problem(const std::filesystem::path &problem_dir) {
             J[i, j + 1] = -x[j] * xv * e;
           }
         }
-        return true;
+        return {};
       };
       run_pair.template operator()<512, 32>(residual_dynamic, jacobian_dynamic,
                                             residual_static, jacobian_static);
     } else if (corpus.model_id == "exp_sum" && corpus.m == 1024 && corpus.n == 64) {
       auto residual_dynamic = [&](ConstVectorView<std::dynamic_extent> x,
-                                  VectorView<std::dynamic_extent> r) -> bool {
+                                  VectorView<std::dynamic_extent> r) -> ErrorOrVoid {
         for (Index i = 0; i < corpus.m; ++i) {
           const auto &row = corpus.data[i];
           const double xv = row[0];
@@ -2031,10 +2039,10 @@ ProblemReport run_problem(const std::filesystem::path &problem_dir) {
           }
           r[i] = value - row.back();
         }
-        return true;
+        return {};
       };
       auto jacobian_dynamic = [&](ConstVectorView<std::dynamic_extent> x,
-                                  MatrixView<std::dynamic_extent, std::dynamic_extent> J) -> bool {
+                                  MatrixView<std::dynamic_extent, std::dynamic_extent> J) -> ErrorOrVoid {
         for (Index i = 0; i < corpus.m; ++i) {
           const auto &row = corpus.data[i];
           const double xv = row[0];
@@ -2044,9 +2052,9 @@ ProblemReport run_problem(const std::filesystem::path &problem_dir) {
             J[i, j + 1] = -x[j] * xv * e;
           }
         }
-        return true;
+        return {};
       };
-      auto residual_static = [&](ConstVectorView<64> x, VectorView<1024> r) -> bool {
+      auto residual_static = [&](ConstVectorView<64> x, VectorView<1024> r) -> ErrorOrVoid {
         for (Index i = 0; i < 1024; ++i) {
           const auto &row = corpus.data[i];
           const double xv = row[0];
@@ -2056,9 +2064,9 @@ ProblemReport run_problem(const std::filesystem::path &problem_dir) {
           }
           r[i] = value - row.back();
         }
-        return true;
+        return {};
       };
-      auto jacobian_static = [&](ConstVectorView<64> x, MatrixView<1024, 64> J) -> bool {
+      auto jacobian_static = [&](ConstVectorView<64> x, MatrixView<1024, 64> J) -> ErrorOrVoid {
         for (Index i = 0; i < 1024; ++i) {
           const auto &row = corpus.data[i];
           const double xv = row[0];
@@ -2068,7 +2076,7 @@ ProblemReport run_problem(const std::filesystem::path &problem_dir) {
             J[i, j + 1] = -x[j] * xv * e;
           }
         }
-        return true;
+        return {};
       };
       run_pair.template operator()<1024, 64>(residual_dynamic, jacobian_dynamic,
                                              residual_static, jacobian_static);

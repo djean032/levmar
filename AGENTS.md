@@ -2,7 +2,7 @@
 
 ## Project Structure & Module Organization
 
-`src/lm.h` contains the header-only C++23 nonlinear least-squares implementation,
+`levmar/lm.h` contains the header-only C++23 nonlinear least-squares implementation,
 including static- and dynamic-extent APIs. `conformance/nist_nls/cpp_runner.cpp`
 is the primary executable test and benchmark harness. Its checked-in
 `corpus/` directories hold NIST inputs and expected residual/Jacobian CSVs;

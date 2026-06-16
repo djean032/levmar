@@ -4,6 +4,7 @@
 #include <array>
 #include <cmath>
 #include <cstddef>
+#include <expected>
 #include <functional>
 #include <limits>
 #include <mdspan>
@@ -16,6 +17,25 @@
 using Index = std::size_t;
 
 struct NoJacobian {};
+
+enum class ErrorCode { InvalidProblem, UserFunctionError, NumericalFailure };
+
+enum class TerminationReason {
+  NotTerminated,
+  SmallStep,
+  SmallGradient,
+  SmallCostReduction,
+  MaxIterations
+};
+
+struct Error {
+  ErrorCode code;
+  std::string message;
+};
+
+template <class T> using ErrorOr = std::expected<T, Error>;
+
+using ErrorOrVoid = ErrorOr<void>;
 
 // Views for vectors and matrices using span and mdspan
 template <Index N> using VectorView = std::span<double, N>;
@@ -203,37 +223,26 @@ template <> struct MatrixStorage<std::dynamic_extent, std::dynamic_extent> {
 };
 
 template <Index M, Index N>
-using ResidualSignature = bool(ConstVectorView<N> x, VectorView<M> r);
+using ResidualSignature = ErrorOrVoid(ConstVectorView<N> x, VectorView<M> r);
 
 template <Index M, Index N>
-using JacobianSignature = bool(ConstVectorView<N> x, MatrixView<M, N> J);
+using JacobianSignature = ErrorOrVoid(ConstVectorView<N> x, MatrixView<M, N> J);
 
 template <class Residual, Index M, Index N>
 concept ResidualCallable =
     requires(Residual residual, ConstVectorView<N> x, VectorView<M> r) {
-      { residual(x, r) } -> std::same_as<bool>;
+      { residual(x, r) } -> std::same_as<ErrorOrVoid>;
     };
 
 template <class Jacobian, Index M, Index N>
 concept JacobianCallable =
     requires(Jacobian jacobian, ConstVectorView<N> x, MatrixView<M, N> J) {
-      { jacobian(x, J) } -> std::same_as<bool>;
+      { jacobian(x, J) } -> std::same_as<ErrorOrVoid>;
     };
 
 template <class Jacobian, Index M, Index N>
 concept OptionalJacobianCallable =
     std::same_as<Jacobian, NoJacobian> || JacobianCallable<Jacobian, M, N>;
-
-enum class Status {
-  Success,
-  MaxIterations,
-  SmallStep,
-  SmallGradient,
-  SmallCostReduction,
-  UserFunctionError,
-  NumericalFailure,
-  InvalidProblem
-};
 
 enum class JacobianMode { User, ForwardDifference, CentralDifference };
 
@@ -350,41 +359,46 @@ struct Options {
 
 template <Index M, Index N, ResidualCallable<M, N> Residual, class Jacobian>
   requires OptionalJacobianCallable<Jacobian, M, N>
-inline Status validate_problem(const Problem<M, N, Residual, Jacobian> &problem,
-                               const Options &options, std::string &message) {
+inline ErrorOrVoid validate_problem(
+    const Problem<M, N, Residual, Jacobian> &problem,
+    const Options &options) {
   if (problem.num_residuals < 1) {
-    message = "Problem must have at least one residual";
-    return Status::InvalidProblem;
+    return std::unexpected(
+        Error{ErrorCode::InvalidProblem,
+              "Problem must have at least one residual"});
   }
 
   if (problem.num_parameters < 1) {
-    message = "Problem must have at least one parameter";
-    return Status::InvalidProblem;
+    return std::unexpected(
+        Error{ErrorCode::InvalidProblem,
+              "Problem must have at least one parameter"});
   }
 
   if constexpr (M != std::dynamic_extent) {
     if (problem.num_residuals != M) {
-      message = "Problem residual count does not match static residual extent";
-      return Status::InvalidProblem;
+      return std::unexpected(
+          Error{ErrorCode::InvalidProblem,
+                "Problem residual count does not match static residual extent"});
     }
   }
 
   if constexpr (N != std::dynamic_extent) {
     if (problem.num_parameters != N) {
-      message = "Problem parameter count does not match static parameter "
-                "extent";
-      return Status::InvalidProblem;
+      return std::unexpected(Error{ErrorCode::InvalidProblem,
+                                   "Problem parameter count does not match "
+                                   "static parameter extent"});
     }
   }
 
   if (options.jacobian_mode == JacobianMode::User) {
     if (!problem.has_user_jacobian()) {
-      message = "JacobianMode::User requires a jacobian function";
-      return Status::InvalidProblem;
+      return std::unexpected(Error{ErrorCode::InvalidProblem,
+                                   "JacobianMode::User requires a jacobian "
+                                   "function"});
     }
   }
 
-  return Status::Success;
+  return {};
 }
 
 inline double resolved_finite_difference_step(const Options &options) {
@@ -408,7 +422,7 @@ inline double finite_difference_perturbation(double xj, double rel_step) {
 }
 
 struct Result {
-  Status status = Status::InvalidProblem;
+  TerminationReason termination = TerminationReason::NotTerminated;
 
   Index iterations = 0;
   Index function_evaluations = 0;
@@ -553,53 +567,56 @@ private:
 
 template <Index M, Index N, ResidualCallable<M, N> Residual, class Jacobian>
   requires OptionalJacobianCallable<Jacobian, M, N>
-inline Status
-validate_context(const LMSolveContext<M, N, Residual, Jacobian> &context,
-                 std::string &message) {
-  Status status = validate_problem(context.problem, context.options, message);
-  if (status != Status::Success) {
-    return status;
+inline ErrorOrVoid
+validate_context(const LMSolveContext<M, N, Residual, Jacobian> &context) {
+  if (auto problem_result = validate_problem(context.problem, context.options);
+      !problem_result) {
+    return problem_result;
   }
 
   if (context.x.size() != context.problem.num_parameters) {
-    message =
-        "Initial parameter vector size does not match problem.num_parameters";
-    return Status::InvalidProblem;
+    return std::unexpected(
+        Error{ErrorCode::InvalidProblem,
+              "Initial parameter vector size does not match "
+              "problem.num_parameters"});
   }
 
   if (context.work.m != context.problem.num_residuals) {
-    message =
-        "Workspace residual dimension does not match problem.num_residuals";
-    return Status::InvalidProblem;
+    return std::unexpected(
+        Error{ErrorCode::InvalidProblem,
+              "Workspace residual dimension does not match "
+              "problem.num_residuals"});
   }
 
   if (context.work.n != context.problem.num_parameters) {
-    message =
-        "Workspace parameters dimension does not match problem.num_parameters";
-    return Status::InvalidProblem;
+    return std::unexpected(
+        Error{ErrorCode::InvalidProblem,
+              "Workspace parameters dimension does not match "
+              "problem.num_parameters"});
   }
 
-  return Status::Success;
+  return {};
 }
 
 template <Index M, Index N, ResidualCallable<M, N> Residual, class Jacobian>
   requires OptionalJacobianCallable<Jacobian, M, N>
-inline bool
+inline ErrorOrVoid
 evaluate_residual_at(LMSolveContext<M, N, Residual, Jacobian> &context,
                      ConstVectorView<N> x, VectorView<M> r,
                      std::string_view what = "Residual Evaluation") {
-  if (!context.problem.residual(x, r)) {
-    context.result.status = Status::UserFunctionError;
-    context.result.message = std::string(what) + " failed";
-    return false;
+  if (auto residual_result = context.problem.residual(x, r);
+      !residual_result) {
+    return std::unexpected(Error{residual_result.error().code,
+                                 std::string(what) + " failed: " +
+                                     residual_result.error().message});
   }
   ++context.result.function_evaluations;
-  return true;
+  return {};
 }
 
 template <Index M, Index N, ResidualCallable<M, N> Residual, class Jacobian>
   requires OptionalJacobianCallable<Jacobian, M, N>
-inline bool
+inline ErrorOrVoid
 evaluate_residual_at(LMSolveContext<M, N, Residual, Jacobian> &context,
                      VectorView<N> x, VectorView<M> r,
                      std::string_view what = "Residual Evaluation") {
@@ -609,15 +626,16 @@ evaluate_residual_at(LMSolveContext<M, N, Residual, Jacobian> &context,
 
 template <Index M, Index N, ResidualCallable<M, N> Residual, class Jacobian>
   requires OptionalJacobianCallable<Jacobian, M, N>
-inline bool evaluate_residual(LMSolveContext<M, N, Residual, Jacobian> &context,
-                              std::string_view what = "Residual Evaluation") {
+inline ErrorOrVoid
+evaluate_residual(LMSolveContext<M, N, Residual, Jacobian> &context,
+                  std::string_view what = "Residual Evaluation") {
   return evaluate_residual_at(context, context.work.x_current.view(),
                               context.work.r.view(), what);
 }
 
 template <Index M, Index N, ResidualCallable<M, N> Residual, class Jacobian>
   requires OptionalJacobianCallable<Jacobian, M, N>
-inline bool evaluate_forward_difference_jacobian(
+inline ErrorOrVoid evaluate_forward_difference_jacobian(
     LMSolveContext<M, N, Residual, Jacobian> &context,
     std::string_view what = "Forward Diff Jacobian") {
   auto &result = context.result;
@@ -633,12 +651,14 @@ inline bool evaluate_forward_difference_jacobian(
   std::ranges::copy(x_current, x_trial.begin());
 
   // RESIDUAL VEC MUST BE FILLED PRIOR TO CALL
-  const auto process_column = [&](Index j) {
+  const auto process_column = [&](Index j) -> ErrorOrVoid {
     const double xj = x_current[j];
     const double h = finite_difference_perturbation(xj, rel_step);
     x_trial[j] = xj + h;
-    if (!evaluate_residual_at(context, x_trial, r_trial, what)) {
-      return false;
+    if (auto residual_result =
+            evaluate_residual_at(context, x_trial, r_trial, what);
+        !residual_result) {
+      return residual_result;
     }
 
     if constexpr (M != std::dynamic_extent) {
@@ -652,30 +672,30 @@ inline bool evaluate_forward_difference_jacobian(
     }
 
     x_trial[j] = xj;
-    return true;
+    return {};
   };
 
   if constexpr (N != std::dynamic_extent) {
     for (Index j = 0; j < N; ++j) {
-      if (!process_column(j)) {
-        return false;
+      if (auto column_result = process_column(j); !column_result) {
+        return column_result;
       }
     }
   } else {
     for (Index j = 0; j < work.n; ++j) {
-      if (!process_column(j)) {
-        return false;
+      if (auto column_result = process_column(j); !column_result) {
+        return column_result;
       }
     }
   }
 
   ++result.jacobian_evaluations;
-  return true;
+  return {};
 }
 
 template <Index M, Index N, ResidualCallable<M, N> Residual, class Jacobian>
   requires OptionalJacobianCallable<Jacobian, M, N>
-inline bool evaluate_central_difference_jacobian(
+inline ErrorOrVoid evaluate_central_difference_jacobian(
     LMSolveContext<M, N, Residual, Jacobian> &context,
     std::string_view what = "Central Diff Jacobian") {
   auto &result = context.result;
@@ -691,16 +711,20 @@ inline bool evaluate_central_difference_jacobian(
   std::ranges::copy(x_current, x_trial.begin());
 
   // RESIDUAL VEC MUST BE FILLED PRIOR TO CALL
-  const auto process_column = [&](Index j) {
+  const auto process_column = [&](Index j) -> ErrorOrVoid {
     const double xj = x_current[j];
     const double h = finite_difference_perturbation(xj, rel_step);
     x_trial[j] = xj + h;
-    if (!evaluate_residual_at(context, x_trial, r_trial, what)) {
-      return false;
+    if (auto residual_result =
+            evaluate_residual_at(context, x_trial, r_trial, what);
+        !residual_result) {
+      return residual_result;
     }
     x_trial[j] = xj - h;
-    if (!evaluate_residual_at(context, x_trial, r_trial_minus, what)) {
-      return false;
+    if (auto residual_result =
+            evaluate_residual_at(context, x_trial, r_trial_minus, what);
+        !residual_result) {
+      return residual_result;
     }
 
     if constexpr (M != std::dynamic_extent) {
@@ -714,52 +738,57 @@ inline bool evaluate_central_difference_jacobian(
     }
 
     x_trial[j] = xj;
-    return true;
+    return {};
   };
 
   if constexpr (N != std::dynamic_extent) {
     for (Index j = 0; j < N; ++j) {
-      if (!process_column(j)) {
-        return false;
+      if (auto column_result = process_column(j); !column_result) {
+        return column_result;
       }
     }
   } else {
     for (Index j = 0; j < work.n; ++j) {
-      if (!process_column(j)) {
-        return false;
+      if (auto column_result = process_column(j); !column_result) {
+        return column_result;
       }
     }
   }
 
   ++result.jacobian_evaluations;
-  return true;
+  return {};
 }
 
 template <Index M, Index N, ResidualCallable<M, N> Residual, class Jacobian>
   requires OptionalJacobianCallable<Jacobian, M, N>
-inline bool evaluate_jacobian(LMSolveContext<M, N, Residual, Jacobian> &context,
-                              std::string_view what = "Jacobian Evaluation") {
+inline ErrorOrVoid
+evaluate_jacobian(LMSolveContext<M, N, Residual, Jacobian> &context,
+                  std::string_view what = "Jacobian Evaluation") {
   const auto &problem = context.problem;
-  auto &result = context.result;
   const auto &options = context.options;
   auto &work = context.work;
   switch (options.jacobian_mode) {
   case JacobianMode::User:
-    if (!problem.has_user_jacobian() ||
-        !problem.jacobian(work.x_current.view(), work.J.view())) {
-      result.status = Status::UserFunctionError;
-      result.message = std::string(what) + " failed";
-      return false;
+    if (!problem.has_user_jacobian()) {
+      return std::unexpected(Error{ErrorCode::InvalidProblem,
+                                   std::string(what) +
+                                       " failed: missing jacobian function"});
     }
-    ++result.jacobian_evaluations;
-    return true;
+    if (auto jacobian_result =
+            problem.jacobian(work.x_current.view(), work.J.view());
+        !jacobian_result) {
+      return std::unexpected(Error{jacobian_result.error().code,
+                                   std::string(what) + " failed: " +
+                                       jacobian_result.error().message});
+    }
+    ++context.result.jacobian_evaluations;
+    return {};
   case JacobianMode::ForwardDifference:
     return evaluate_forward_difference_jacobian(context, what);
   case JacobianMode::CentralDifference:
     return evaluate_central_difference_jacobian(context, what);
   }
 
-  result.status = Status::InvalidProblem;
-  result.message = std::string(what) + " failed.";
-  return false;
+  return std::unexpected(
+      Error{ErrorCode::InvalidProblem, std::string(what) + " failed."});
 }
