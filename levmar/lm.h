@@ -38,188 +38,257 @@ template <class T> using ErrorOr = std::expected<T, Error>;
 using ErrorOrVoid = ErrorOr<void>;
 
 // Views for vectors and matrices using span and mdspan
-template <Index N> using VectorView = std::span<double, N>;
+template <Index N, class Scalar = double>
+using VectorView = std::span<Scalar, N>;
 
-template <Index N> using ConstVectorView = std::span<const double, N>;
+template <Index N, class Scalar = double>
+using ConstVectorView = std::span<const Scalar, N>;
 
-template <Index M, Index N>
+template <Index M, Index N, class Scalar = double>
 using MatrixView =
-    std::mdspan<double, std::extents<Index, M, N>, std::layout_left>;
+    std::mdspan<Scalar, std::extents<Index, M, N>, std::layout_left>;
 
-template <Index M, Index N>
+template <Index M, Index N, class Scalar = double>
 using ConstMatrixView =
-    std::mdspan<const double, std::extents<Index, M, N>, std::layout_left>;
+    std::mdspan<const Scalar, std::extents<Index, M, N>, std::layout_left>;
 
-template <Index Extent> struct VectorStorage {
-  std::array<double, Extent> storage{};
+template <Index Extent, class Scalar = double> struct VectorStorage {
+  std::array<Scalar, Extent> storage{};
 
   static constexpr Index extent = Extent;
-  constexpr Index size() const { return Extent; }
-  double *data() { return storage.data(); }
-  const double *data() const { return storage.data(); }
+  constexpr Index size() const noexcept { return Extent; }
+  constexpr bool empty() const noexcept { return Extent == 0; }
 
-  VectorView<Extent> view() {
-    return VectorView<Extent>(storage.data(), Extent);
+  Scalar *data() { return storage.data(); }
+  const Scalar *data() const { return storage.data(); }
+
+  VectorView<Extent, Scalar> view() {
+    return VectorView<Extent, Scalar>(storage.data(), Extent);
   }
-  ConstVectorView<Extent> view() const {
-    return ConstVectorView<Extent>(storage.data(), Extent);
+  ConstVectorView<Extent, Scalar> view() const {
+    return ConstVectorView<Extent, Scalar>(storage.data(), Extent);
   }
 
-  void fill(double value) { storage.fill(value); }
+  Scalar &operator[](Index i) { return storage[i]; }
+
+  const Scalar &operator[](Index i) const { return storage[i]; }
+
+  void fill(const Scalar &value) { storage.fill(value); }
 };
 
-template <> struct VectorStorage<std::dynamic_extent> {
-  std::vector<double> storage;
+template <class Scalar> struct VectorStorage<std::dynamic_extent, Scalar> {
+  std::vector<Scalar> storage;
 
   static constexpr Index extent = std::dynamic_extent;
-  Index size() const { return storage.size(); }
+  constexpr Index size() const noexcept { return storage.size(); }
+  constexpr bool empty() const noexcept { return storage.empty(); }
 
-  double *data() { return storage.data(); }
-  const double *data() const { return storage.data(); }
+  Scalar *data() { return storage.data(); }
+  const Scalar *data() const { return storage.data(); }
 
-  VectorView<std::dynamic_extent> view() {
-    return VectorView<std::dynamic_extent>(storage.data(), storage.size());
+  VectorView<std::dynamic_extent, Scalar> view() {
+    return VectorView<std::dynamic_extent, Scalar>(storage.data(),
+                                                   storage.size());
   }
-  ConstVectorView<std::dynamic_extent> view() const {
-    return ConstVectorView<std::dynamic_extent>(storage.data(), storage.size());
+  ConstVectorView<std::dynamic_extent, Scalar> view() const {
+    return ConstVectorView<std::dynamic_extent, Scalar>(storage.data(),
+                                                        storage.size());
   }
+
+  Scalar &operator[](Index i) noexcept { return storage[i]; }
+
+  const Scalar &operator[](Index i) const noexcept { return storage[i]; }
 
   void resize(Index n) { storage.resize(n); }
-  void assign(Index n, double value) { storage.assign(n, value); }
-  void fill(double value) { std::ranges::fill(storage, value); }
+  void assign(Index n, const Scalar &value) { storage.assign(n, value); }
+  void fill(const Scalar &value) { std::ranges::fill(storage, value); }
 };
 
-template <Index Rows, Index Cols> struct MatrixStorage {
-  std::array<double, Rows * Cols> storage{};
+template <Index Rows, Index Cols, class Scalar = double> struct MatrixStorage {
+  std::array<Scalar, Rows * Cols> storage{};
 
   static constexpr Index rows_extent = Rows;
   static constexpr Index cols_extent = Cols;
 
-  constexpr Index rows() const { return Rows; }
-  constexpr Index cols() const { return Cols; }
-  constexpr Index leading_dim() const { return Rows; }
+  constexpr Index rows() const noexcept { return Rows; }
+  constexpr Index cols() const noexcept { return Cols; }
+  constexpr Index leading_dim() const noexcept { return Rows; }
+  constexpr Index size() const noexcept { return rows() * cols(); }
+  constexpr bool empty() const noexcept { return size() == 0; }
 
-  double *data() { return storage.data(); }
-  const double *data() const { return storage.data(); }
+  Scalar *data() { return storage.data(); }
+  const Scalar *data() const { return storage.data(); }
 
-  MatrixView<Rows, Cols> view() {
-    return MatrixView<Rows, Cols>(storage.data());
+  MatrixView<Rows, Cols, Scalar> view() {
+    return MatrixView<Rows, Cols, Scalar>(storage.data());
   }
-  ConstMatrixView<Rows, Cols> view() const {
-    return ConstMatrixView<Rows, Cols>(storage.data());
+  ConstMatrixView<Rows, Cols, Scalar> view() const {
+    return ConstMatrixView<Rows, Cols, Scalar>(storage.data());
   }
 
-  double &operator()(Index i, Index j) { return view()[i, j]; }
+  Scalar &operator()(Index i, Index j) noexcept {
+    return storage[i + j * leading_dim()];
+  }
 
-  double operator()(Index i, Index j) const { return view()[i, j]; }
+  const Scalar &operator()(Index i, Index j) const noexcept {
+    return storage[i + j * leading_dim()];
+  }
 
-  void fill(double value) { storage.fill(value); }
+  Scalar &operator[](Index i, Index j) noexcept { return (*this)(i, j); }
+
+  const Scalar &operator[](Index i, Index j) const noexcept {
+    return (*this)(i, j);
+  }
+
+  void fill(const Scalar &value) { storage.fill(value); }
 };
 
-template <Index Cols> struct MatrixStorage<std::dynamic_extent, Cols> {
+template <Index Cols, class Scalar>
+struct MatrixStorage<std::dynamic_extent, Cols, Scalar> {
   Index rows_ = 0;
-  std::vector<double> storage;
+  std::vector<Scalar> storage;
 
   static constexpr Index rows_extent = std::dynamic_extent;
   static constexpr Index cols_extent = Cols;
 
-  Index rows() const { return rows_; }
-  constexpr Index cols() const { return Cols; }
-  Index leading_dim() const { return rows_; }
+  constexpr Index rows() const noexcept { return rows_; }
+  constexpr Index cols() const noexcept { return Cols; }
+  constexpr Index leading_dim() const noexcept { return rows_; }
+  constexpr Index size() const noexcept { return rows() * cols(); }
+  constexpr bool empty() const noexcept { return size() == 0; }
 
-  double *data() { return storage.data(); }
-  const double *data() const { return storage.data(); }
+  Scalar *data() { return storage.data(); }
+  const Scalar *data() const { return storage.data(); }
 
-  MatrixView<std::dynamic_extent, Cols> view() {
-    return MatrixView<std::dynamic_extent, Cols>(storage.data(), rows_);
+  MatrixView<std::dynamic_extent, Cols, Scalar> view() {
+    return MatrixView<std::dynamic_extent, Cols, Scalar>(storage.data(), rows_);
   }
 
-  ConstMatrixView<std::dynamic_extent, Cols> view() const {
-    return ConstMatrixView<std::dynamic_extent, Cols>(storage.data(), rows_);
+  ConstMatrixView<std::dynamic_extent, Cols, Scalar> view() const {
+    return ConstMatrixView<std::dynamic_extent, Cols, Scalar>(storage.data(),
+                                                              rows_);
   }
 
-  double &operator()(Index i, Index j) { return view()[i, j]; }
+  Scalar &operator()(Index i, Index j) noexcept {
+    return storage[i + j * leading_dim()];
+  }
 
-  double operator()(Index i, Index j) const { return view()[i, j]; }
+  const Scalar &operator()(Index i, Index j) const noexcept {
+    return storage[i + j * leading_dim()];
+  }
+
+  Scalar &operator[](Index i, Index j) noexcept { return (*this)(i, j); }
+
+  const Scalar &operator[](Index i, Index j) const noexcept {
+    return (*this)(i, j);
+  }
 
   void resize(Index rows) {
     rows_ = rows;
-    storage.assign(rows_ * Cols, 0.0);
+    storage.assign(rows_ * Cols, Scalar{});
   }
 
-  void fill(double value) { std::ranges::fill(storage, value); }
+  void fill(const Scalar &value) { std::ranges::fill(storage, value); }
 };
 
-template <Index Rows> struct MatrixStorage<Rows, std::dynamic_extent> {
+template <Index Rows, class Scalar>
+struct MatrixStorage<Rows, std::dynamic_extent, Scalar> {
   Index cols_ = 0;
-  std::vector<double> storage;
+  std::vector<Scalar> storage;
 
   static constexpr Index rows_extent = Rows;
   static constexpr Index cols_extent = std::dynamic_extent;
 
-  constexpr Index rows() const { return Rows; }
-  Index cols() const { return cols_; }
-  constexpr Index leading_dim() const { return Rows; }
+  constexpr Index rows() const noexcept { return Rows; }
+  constexpr Index cols() const noexcept { return cols_; }
+  constexpr Index leading_dim() const noexcept { return Rows; }
+  constexpr Index size() const noexcept { return rows() * cols(); }
+  constexpr bool empty() const noexcept { return size() == 0; }
 
-  double *data() { return storage.data(); }
-  const double *data() const { return storage.data(); }
+  Scalar *data() { return storage.data(); }
+  const Scalar *data() const { return storage.data(); }
 
-  MatrixView<Rows, std::dynamic_extent> view() {
-    return MatrixView<Rows, std::dynamic_extent>(storage.data(), cols_);
+  MatrixView<Rows, std::dynamic_extent, Scalar> view() {
+    return MatrixView<Rows, std::dynamic_extent, Scalar>(storage.data(), cols_);
   }
 
-  ConstMatrixView<Rows, std::dynamic_extent> view() const {
-    return ConstMatrixView<Rows, std::dynamic_extent>(storage.data(), cols_);
+  ConstMatrixView<Rows, std::dynamic_extent, Scalar> view() const {
+    return ConstMatrixView<Rows, std::dynamic_extent, Scalar>(storage.data(),
+                                                              cols_);
   }
 
-  double &operator()(Index i, Index j) { return view()[i, j]; }
+  Scalar &operator()(Index i, Index j) noexcept {
+    return storage[i + j * leading_dim()];
+  }
 
-  double operator()(Index i, Index j) const { return view()[i, j]; }
+  const Scalar &operator()(Index i, Index j) const noexcept {
+    return storage[i + j * leading_dim()];
+  }
+
+  Scalar &operator[](Index i, Index j) noexcept { return (*this)(i, j); }
+
+  const Scalar &operator[](Index i, Index j) const noexcept {
+    return (*this)(i, j);
+  }
 
   void resize(Index cols) {
     cols_ = cols;
-    storage.assign(Rows * cols_, 0.0);
+    storage.assign(Rows * cols_, Scalar{});
   }
 
-  void fill(double value) { std::ranges::fill(storage, value); }
+  void fill(const Scalar &value) { std::ranges::fill(storage, value); }
 };
 
-template <> struct MatrixStorage<std::dynamic_extent, std::dynamic_extent> {
+template <class Scalar>
+struct MatrixStorage<std::dynamic_extent, std::dynamic_extent, Scalar> {
   Index rows_ = 0;
   Index cols_ = 0;
-  std::vector<double> storage{};
+  std::vector<Scalar> storage{};
 
   static constexpr Index rows_extent = std::dynamic_extent;
   static constexpr Index cols_extent = std::dynamic_extent;
 
-  Index rows() const { return rows_; }
-  Index cols() const { return cols_; }
-  Index leading_dim() const { return rows_; }
+  constexpr Index rows() const noexcept { return rows_; }
+  constexpr Index cols() const noexcept { return cols_; }
+  constexpr Index leading_dim() const noexcept { return rows_; }
+  constexpr Index size() const noexcept { return rows() * cols(); }
+  constexpr bool empty() const noexcept { return size() == 0; }
 
-  double *data() { return storage.data(); }
-  const double *data() const { return storage.data(); }
+  Scalar *data() { return storage.data(); }
+  const Scalar *data() const { return storage.data(); }
 
-  MatrixView<std::dynamic_extent, std::dynamic_extent> view() {
-    return MatrixView<std::dynamic_extent, std::dynamic_extent>(storage.data(),
-                                                                rows_, cols_);
-  }
-
-  ConstMatrixView<std::dynamic_extent, std::dynamic_extent> view() const {
-    return ConstMatrixView<std::dynamic_extent, std::dynamic_extent>(
+  MatrixView<std::dynamic_extent, std::dynamic_extent, Scalar> view() {
+    return MatrixView<std::dynamic_extent, std::dynamic_extent, Scalar>(
         storage.data(), rows_, cols_);
   }
 
-  double &operator()(Index i, Index j) { return view()[i, j]; }
+  ConstMatrixView<std::dynamic_extent, std::dynamic_extent, Scalar>
+  view() const {
+    return ConstMatrixView<std::dynamic_extent, std::dynamic_extent, Scalar>(
+        storage.data(), rows_, cols_);
+  }
 
-  double operator()(Index i, Index j) const { return view()[i, j]; }
+  Scalar &operator()(Index i, Index j) noexcept {
+    return storage[i + j * leading_dim()];
+  }
+
+  const Scalar &operator()(Index i, Index j) const noexcept {
+    return storage[i + j * leading_dim()];
+  }
+
+  Scalar &operator[](Index i, Index j) noexcept { return (*this)(i, j); }
+
+  const Scalar &operator[](Index i, Index j) const noexcept {
+    return (*this)(i, j);
+  }
 
   void resize(Index rows, Index cols) {
     cols_ = cols;
     rows_ = rows;
-    storage.assign(rows_ * cols_, 0.0);
+    storage.assign(rows_ * cols_, Scalar{});
   }
 
-  void fill(double value) { std::ranges::fill(storage, value); }
+  void fill(const Scalar &value) { std::ranges::fill(storage, value); }
 };
 
 template <Index M, Index N>
@@ -359,26 +428,24 @@ struct Options {
 
 template <Index M, Index N, ResidualCallable<M, N> Residual, class Jacobian>
   requires OptionalJacobianCallable<Jacobian, M, N>
-inline ErrorOrVoid validate_problem(
-    const Problem<M, N, Residual, Jacobian> &problem,
-    const Options &options) {
+inline ErrorOrVoid
+validate_problem(const Problem<M, N, Residual, Jacobian> &problem,
+                 const Options &options) {
   if (problem.num_residuals < 1) {
-    return std::unexpected(
-        Error{ErrorCode::InvalidProblem,
-              "Problem must have at least one residual"});
+    return std::unexpected(Error{ErrorCode::InvalidProblem,
+                                 "Problem must have at least one residual"});
   }
 
   if (problem.num_parameters < 1) {
-    return std::unexpected(
-        Error{ErrorCode::InvalidProblem,
-              "Problem must have at least one parameter"});
+    return std::unexpected(Error{ErrorCode::InvalidProblem,
+                                 "Problem must have at least one parameter"});
   }
 
   if constexpr (M != std::dynamic_extent) {
     if (problem.num_residuals != M) {
-      return std::unexpected(
-          Error{ErrorCode::InvalidProblem,
-                "Problem residual count does not match static residual extent"});
+      return std::unexpected(Error{
+          ErrorCode::InvalidProblem,
+          "Problem residual count does not match static residual extent"});
     }
   }
 
@@ -534,14 +601,15 @@ struct LMSolveContext {
   LMSolveContext(const ProblemType &problem_, const Options &options_,
                  Result &result_, Workspace &work_, ConstVectorView<N> x_)
     requires(N == std::dynamic_extent)
-      : problem(problem_), options(options_), result(result_), work(work_), x() {
+      : problem(problem_), options(options_), result(result_), work(work_),
+        x() {
     ensure_workspace_shape();
     x = x_;
   }
 
   LMSolveContext(const ProblemType &problem_, const Options &options_,
                  Result &result_, Workspace &work_,
-                  const std::array<double, N> &x_)
+                 const std::array<double, N> &x_)
     requires(N != std::dynamic_extent)
       : problem(problem_), options(options_), result(result_), work(work_),
         x(x_.data(), x_.size()) {
@@ -575,17 +643,15 @@ validate_context(const LMSolveContext<M, N, Residual, Jacobian> &context) {
   }
 
   if (context.x.size() != context.problem.num_parameters) {
-    return std::unexpected(
-        Error{ErrorCode::InvalidProblem,
-              "Initial parameter vector size does not match "
-              "problem.num_parameters"});
+    return std::unexpected(Error{ErrorCode::InvalidProblem,
+                                 "Initial parameter vector size does not match "
+                                 "problem.num_parameters"});
   }
 
   if (context.work.m != context.problem.num_residuals) {
-    return std::unexpected(
-        Error{ErrorCode::InvalidProblem,
-              "Workspace residual dimension does not match "
-              "problem.num_residuals"});
+    return std::unexpected(Error{ErrorCode::InvalidProblem,
+                                 "Workspace residual dimension does not match "
+                                 "problem.num_residuals"});
   }
 
   if (context.work.n != context.problem.num_parameters) {
@@ -604,11 +670,10 @@ inline ErrorOrVoid
 evaluate_residual_at(LMSolveContext<M, N, Residual, Jacobian> &context,
                      ConstVectorView<N> x, VectorView<M> r,
                      std::string_view what = "Residual Evaluation") {
-  if (auto residual_result = context.problem.residual(x, r);
-      !residual_result) {
-    return std::unexpected(Error{residual_result.error().code,
-                                 std::string(what) + " failed: " +
-                                     residual_result.error().message});
+  if (auto residual_result = context.problem.residual(x, r); !residual_result) {
+    return std::unexpected(Error{
+        residual_result.error().code,
+        std::string(what) + " failed: " + residual_result.error().message});
   }
   ++context.result.function_evaluations;
   return {};
@@ -770,16 +835,16 @@ evaluate_jacobian(LMSolveContext<M, N, Residual, Jacobian> &context,
   switch (options.jacobian_mode) {
   case JacobianMode::User:
     if (!problem.has_user_jacobian()) {
-      return std::unexpected(Error{ErrorCode::InvalidProblem,
-                                   std::string(what) +
-                                       " failed: missing jacobian function"});
+      return std::unexpected(
+          Error{ErrorCode::InvalidProblem,
+                std::string(what) + " failed: missing jacobian function"});
     }
     if (auto jacobian_result =
             problem.jacobian(work.x_current.view(), work.J.view());
         !jacobian_result) {
-      return std::unexpected(Error{jacobian_result.error().code,
-                                   std::string(what) + " failed: " +
-                                       jacobian_result.error().message});
+      return std::unexpected(Error{
+          jacobian_result.error().code,
+          std::string(what) + " failed: " + jacobian_result.error().message});
     }
     ++context.result.jacobian_evaluations;
     return {};
