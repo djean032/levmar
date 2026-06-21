@@ -291,6 +291,54 @@ struct MatrixStorage<std::dynamic_extent, std::dynamic_extent, Scalar> {
   void fill(const Scalar &value) { std::ranges::fill(storage, value); }
 };
 
+struct ADArena {
+  std::span<double> buffer;
+  Index used = 0;
+  bool overflowed = false;
+
+  void reset() {
+    used = 0;
+    overflowed = false;
+  }
+
+  [[nodiscard]] bool allocate(Index n,
+                              VectorView<std::dynamic_extent> &out) {
+    if (n + used > buffer.size()) {
+      overflowed = true;
+      out = {};
+      return false;
+    }
+
+    double *ptr = buffer.data() + used;
+    used += n;
+    out = {ptr, n};
+    return true;
+  }
+
+  [[nodiscard]] VectorView<std::dynamic_extent> allocate(Index n) {
+    VectorView<std::dynamic_extent> out;
+    if (!allocate(n, out)) {
+      return {};
+    }
+    return out;
+  }
+
+  template <Index N> [[nodiscard]] bool allocate(VectorView<N> &out) {
+    VectorView<std::dynamic_extent> view;
+    if (!allocate(N, view)) {
+      return false;
+    }
+    out = VectorView<N>(view.data(), N);
+    return true;
+  }
+};
+
+template <Index N> struct Dual {
+  double value;
+  VectorView<N> grad;
+  ADArena *arena;
+};
+
 template <Index M, Index N>
 using ResidualSignature = ErrorOrVoid(ConstVectorView<N> x, VectorView<M> r);
 
@@ -326,7 +374,7 @@ enum class ScalingMode { None, JacobianColumnNorm, User };
 template <Index M, Index N, ResidualCallable<M, N> Residual,
           class Jacobian = NoJacobian>
   requires OptionalJacobianCallable<Jacobian, M, N>
-struct Problem {
+struct [[nodiscard]] Problem {
   static constexpr Index residual_extent = M;
   static constexpr Index parameter_extent = N;
 
@@ -359,7 +407,7 @@ template <Index M, Index N, ResidualCallable<M, N> Residual,
           class Jacobian = NoJacobian>
   requires(M != std::dynamic_extent && N != std::dynamic_extent) &&
           OptionalJacobianCallable<Jacobian, M, N>
-auto make_problem(Residual residual, Jacobian jacobian = {}) {
+[[nodiscard]] auto make_problem(Residual residual, Jacobian jacobian = {}) {
   return Problem<M, N, Residual, Jacobian>(residual, jacobian);
 }
 
@@ -367,8 +415,8 @@ template <ResidualCallable<std::dynamic_extent, std::dynamic_extent> Residual,
           class Jacobian = NoJacobian>
   requires OptionalJacobianCallable<Jacobian, std::dynamic_extent,
                                     std::dynamic_extent>
-auto make_dynamic_problem(Index m, Index n, Residual residual,
-                          Jacobian jacobian = {}) {
+[[nodiscard]] auto make_dynamic_problem(Index m, Index n, Residual residual,
+                                        Jacobian jacobian = {}) {
   return Problem<std::dynamic_extent, std::dynamic_extent, Residual, Jacobian>(
       m, n, residual, jacobian);
 }
@@ -376,8 +424,8 @@ auto make_dynamic_problem(Index m, Index n, Residual residual,
 template <Index N, ResidualCallable<std::dynamic_extent, N> Residual,
           class Jacobian = NoJacobian>
   requires OptionalJacobianCallable<Jacobian, std::dynamic_extent, N>
-auto make_problem_dynamic_residuals(Index m, Residual residual,
-                                    Jacobian jacobian = {}) {
+[[nodiscard]] auto make_problem_dynamic_residuals(Index m, Residual residual,
+                                                  Jacobian jacobian = {}) {
   return Problem<std::dynamic_extent, N, Residual, Jacobian>(m, N, residual,
                                                              jacobian);
 }
@@ -385,8 +433,8 @@ auto make_problem_dynamic_residuals(Index m, Residual residual,
 template <Index M, ResidualCallable<M, std::dynamic_extent> Residual,
           class Jacobian = NoJacobian>
   requires OptionalJacobianCallable<Jacobian, M, std::dynamic_extent>
-auto make_problem_dynamic_parameters(Index n, Residual residual,
-                                     Jacobian jacobian = {}) {
+[[nodiscard]] auto make_problem_dynamic_parameters(Index n, Residual residual,
+                                                   Jacobian jacobian = {}) {
   return Problem<M, std::dynamic_extent, Residual, Jacobian>(M, n, residual,
                                                              jacobian);
 }
@@ -428,7 +476,7 @@ struct Options {
 
 template <Index M, Index N, ResidualCallable<M, N> Residual, class Jacobian>
   requires OptionalJacobianCallable<Jacobian, M, N>
-inline ErrorOrVoid
+[[nodiscard]] inline ErrorOrVoid
 validate_problem(const Problem<M, N, Residual, Jacobian> &problem,
                  const Options &options) {
   if (problem.num_residuals < 1) {
@@ -507,6 +555,20 @@ struct Result {
   std::string message;
 };
 
+template <Index N> consteval bool use_static_scratch_ad() {
+  return N != std::dynamic_extent && N <= 32;
+}
+
+template <Index N> consteval Index autodiff_static_scratch() {
+  if constexpr (use_static_scratch_ad<N>()) {
+    return 12 * N * N;
+  } else {
+    return 0;
+  }
+}
+
+inline Index runtime_scratch_size(Index n) { return 12 * n * n; }
+
 template <Index M, Index N> struct LMWorkspace {
   static constexpr Index residual_extent = M;
   static constexpr Index parameter_extent = N;
@@ -530,10 +592,57 @@ template <Index M, Index N> struct LMWorkspace {
   VectorStorage<N> scale;
   VectorStorage<M> weights;
 
+  MatrixStorage<N, N> ad_x_grads;
+  MatrixStorage<N, M> ad_r_grads;
+
+  // Span inside arena is the view for one of these two scratch spaces
+  VectorStorage<autodiff_static_scratch<N>()> ad_scratch_static;
+  VectorStorage<std::dynamic_extent> ad_scratch_dynamic;
+  ADArena ad_arena;
+
+  VectorStorage<std::dynamic_extent, Dual<std::dynamic_extent>> ad_x_dynamic;
+  VectorStorage<std::dynamic_extent, Dual<N>> ad_r_dynamic;
+
   LMWorkspace() = default;
 
   LMWorkspace(Index m_runtime, Index n_runtime) {
     resize(m_runtime, n_runtime);
+  }
+
+  template <Index Rows, Index Cols>
+  static double *column_data(MatrixStorage<Rows, Cols> &matrix, Index col) {
+    return matrix.data() + col * matrix.leading_dim();
+  }
+
+  void bind_autodiff_storage() {
+    if constexpr (use_static_scratch_ad<N>()) {
+      ad_arena.buffer = ad_scratch_static.view();
+    } else {
+      ad_arena.buffer = ad_scratch_dynamic.view();
+    }
+    ad_arena.reset();
+
+    if constexpr (N == std::dynamic_extent) {
+      for (Index j = 0; j < n; ++j) {
+        ad_x_dynamic[j].value = 0.0;
+        ad_x_dynamic[j].grad =
+            VectorView<std::dynamic_extent>(column_data(ad_x_grads, j), n);
+        ad_x_dynamic[j].arena = &ad_arena;
+      }
+    }
+
+    if constexpr (M == std::dynamic_extent) {
+      for (Index i = 0; i < m; ++i) {
+        ad_r_dynamic[i].value = 0.0;
+        if constexpr (N == std::dynamic_extent) {
+          ad_r_dynamic[i].grad =
+              VectorView<std::dynamic_extent>(column_data(ad_r_grads, i), n);
+        } else {
+          ad_r_dynamic[i].grad = VectorView<N>(column_data(ad_r_grads, i), N);
+        }
+        ad_r_dynamic[i].arena = &ad_arena;
+      }
+    }
   }
 
   void resize(Index m_runtime, Index n_runtime) {
@@ -542,6 +651,8 @@ template <Index M, Index N> struct LMWorkspace {
       n = n_runtime;
       J.resize(m, n);
       JTJ.resize(n, n);
+      ad_r_grads.resize(n, m);
+      ad_x_grads.resize(n, n);
       r.resize(m);
       r_trial.resize(m);
       r_trial_minus.resize(m);
@@ -549,31 +660,43 @@ template <Index M, Index N> struct LMWorkspace {
       x_current.resize(n);
       x_trial.resize(n);
       g.resize(n);
+      ad_x_dynamic.resize(n);
+      ad_r_dynamic.resize(m);
       step.resize(n);
       scale.resize(n);
     } else if constexpr (M == std::dynamic_extent) {
       m = m_runtime;
       n = N;
+      ad_r_grads.resize(m);
       J.resize(m);
       r.resize(m);
       r_trial.resize(m);
       r_trial_minus.resize(m);
+      ad_r_dynamic.resize(m);
       weights.resize(m);
     } else if constexpr (N == std::dynamic_extent) {
       n = n_runtime;
       m = M;
       J.resize(n);
       JTJ.resize(n, n);
+      ad_r_grads.resize(n);
+      ad_x_grads.resize(n, n);
       x_current.resize(n);
       x_trial.resize(n);
       g.resize(n);
       step.resize(n);
       scale.resize(n);
+      ad_x_dynamic.resize(n);
     } else {
       n = N;
       m = M;
     }
 
+    if constexpr (!use_static_scratch_ad<N>()) {
+      ad_scratch_dynamic.resize(runtime_scratch_size(n));
+    }
+
+    bind_autodiff_storage();
     scale.fill(1.0);
     weights.fill(1.0);
   }
@@ -635,7 +758,7 @@ private:
 
 template <Index M, Index N, ResidualCallable<M, N> Residual, class Jacobian>
   requires OptionalJacobianCallable<Jacobian, M, N>
-inline ErrorOrVoid
+[[nodiscard]] inline ErrorOrVoid
 validate_context(const LMSolveContext<M, N, Residual, Jacobian> &context) {
   if (auto problem_result = validate_problem(context.problem, context.options);
       !problem_result) {
@@ -666,7 +789,7 @@ validate_context(const LMSolveContext<M, N, Residual, Jacobian> &context) {
 
 template <Index M, Index N, ResidualCallable<M, N> Residual, class Jacobian>
   requires OptionalJacobianCallable<Jacobian, M, N>
-inline ErrorOrVoid
+[[nodiscard]] inline ErrorOrVoid
 evaluate_residual_at(LMSolveContext<M, N, Residual, Jacobian> &context,
                      ConstVectorView<N> x, VectorView<M> r,
                      std::string_view what = "Residual Evaluation") {
@@ -681,7 +804,7 @@ evaluate_residual_at(LMSolveContext<M, N, Residual, Jacobian> &context,
 
 template <Index M, Index N, ResidualCallable<M, N> Residual, class Jacobian>
   requires OptionalJacobianCallable<Jacobian, M, N>
-inline ErrorOrVoid
+[[nodiscard]] inline ErrorOrVoid
 evaluate_residual_at(LMSolveContext<M, N, Residual, Jacobian> &context,
                      VectorView<N> x, VectorView<M> r,
                      std::string_view what = "Residual Evaluation") {
@@ -691,7 +814,7 @@ evaluate_residual_at(LMSolveContext<M, N, Residual, Jacobian> &context,
 
 template <Index M, Index N, ResidualCallable<M, N> Residual, class Jacobian>
   requires OptionalJacobianCallable<Jacobian, M, N>
-inline ErrorOrVoid
+[[nodiscard]] inline ErrorOrVoid
 evaluate_residual(LMSolveContext<M, N, Residual, Jacobian> &context,
                   std::string_view what = "Residual Evaluation") {
   return evaluate_residual_at(context, context.work.x_current.view(),
@@ -700,7 +823,7 @@ evaluate_residual(LMSolveContext<M, N, Residual, Jacobian> &context,
 
 template <Index M, Index N, ResidualCallable<M, N> Residual, class Jacobian>
   requires OptionalJacobianCallable<Jacobian, M, N>
-inline ErrorOrVoid evaluate_forward_difference_jacobian(
+[[nodiscard]] inline ErrorOrVoid evaluate_forward_difference_jacobian(
     LMSolveContext<M, N, Residual, Jacobian> &context,
     std::string_view what = "Forward Diff Jacobian") {
   auto &result = context.result;
@@ -760,7 +883,7 @@ inline ErrorOrVoid evaluate_forward_difference_jacobian(
 
 template <Index M, Index N, ResidualCallable<M, N> Residual, class Jacobian>
   requires OptionalJacobianCallable<Jacobian, M, N>
-inline ErrorOrVoid evaluate_central_difference_jacobian(
+[[nodiscard]] inline ErrorOrVoid evaluate_central_difference_jacobian(
     LMSolveContext<M, N, Residual, Jacobian> &context,
     std::string_view what = "Central Diff Jacobian") {
   auto &result = context.result;
@@ -826,7 +949,7 @@ inline ErrorOrVoid evaluate_central_difference_jacobian(
 
 template <Index M, Index N, ResidualCallable<M, N> Residual, class Jacobian>
   requires OptionalJacobianCallable<Jacobian, M, N>
-inline ErrorOrVoid
+[[nodiscard]] inline ErrorOrVoid
 evaluate_jacobian(LMSolveContext<M, N, Residual, Jacobian> &context,
                   std::string_view what = "Jacobian Evaluation") {
   const auto &problem = context.problem;

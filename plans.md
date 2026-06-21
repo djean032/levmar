@@ -1,292 +1,299 @@
 # Plans
 
-## Solving Architecture
+## Immediate Focus: Autodiff Infrastructure
 
 Current direction:
-1. Stabilize the core solve loop first.
-2. Stabilize `GaussNewton` and `LevenbergMarquardt` with one working
-   linear backend first.
-3. Defer user-extensible solver backends and larger abstraction refactors
-   until the algorithms and data flow feel stable.
+1. Implement the internal autodiff building blocks before wiring autodiff into
+   solver evaluation.
+2. Keep the autodiff surface internal to `levmar/lm.h` for now.
+3. Keep persistent autodiff storage in `LMWorkspace` only for dynamic
+   autodiff paths.
+4. Use two internal autodiff implementations:
+   static inline-owning duals and dynamic arena-backed duals.
+5. Avoid introducing a program-wide arena or allocator policy.
 
 The immediate implementation target is:
-1. `Strategy::GaussNewton`
-2. `Strategy::LevenbergMarquardt`
-3. `LinearSolver::NormalEquationsCholesky`
+1. `Dual<N>`
+2. autodiff workspace storage in `LMWorkspace<M, N>`
+3. internal operator overloads and math helpers for `Dual`
 
-For now:
-1. `LinearSolver::QR` and `LinearSolver::SVD` should fail cleanly with
-   `ErrorCode::InvalidProblem` and a clear message.
-2. `Strategy::TrustRegionLM` and `Strategy::DogLeg` should also fail
-   cleanly with `ErrorCode::InvalidProblem` and a clear message.
+Conflicting older plans about prioritizing the solve loop first are superseded
+by this document.
 
-## Core Solver Structure
+## Dual Type
 
-Recommended top-level split:
+Implement an internal dual number type templated on derivative extent `N`, with
+`double` primal values.
 
-```text
-solve(context)
-  if !validate_context(...)
-    return unexpected(error)
-  initialize result
-  copy context.x -> work.x_current
-  evaluate initial residual
-  dispatch on strategy
-```
-
-Strategy dispatch should stay runtime-based for now:
+Static and dynamic extents use different storage models:
 
 ```text
-switch (context.options.strategy) {
-  case GaussNewton:
-    solve_gauss_newton(context)
-  case LevenbergMarquardt:
-    solve_levenberg_marquardt(context)
-  case TrustRegionLM:
-    fail unsupported
-  case DogLeg:
-    fail unsupported
-}
+Dual<N>
+  value: double
+  grad: owned inline storage
+
+Dual<dynamic>
+  value: double
+  grad:  VectorView<dynamic>
+  arena: ADArena*
 ```
 
-This keeps control flow explicit while the algorithm is still moving.
+Design rules:
+1. `Dual` is internal-only and is not part of the public API yet.
+2. `Dual` is templated on derivative extent `N` only.
+3. `Dual` keeps the primal type fixed as `double` for now.
+4. `Dual<N>` for fixed `N` owns its gradient storage inline.
+5. `Dual<dynamic>` remains non-owning and uses workspace- or arena-backed
+   gradient memory.
+6. `Dual<dynamic>` carries an `ADArena*` so internal operator overloads can
+   allocate temporary gradient vectors naturally.
 
-## Shared Iteration Pieces
+Initial scope:
+1. fixed-extent `Dual<N>` uses inline gradient storage, likely `std::array`
+2. `Dual<dynamic>` uses `VectorView<dynamic>` and `ADArena*`
+3. default construction
+4. no hidden dynamic allocation in constructors
+5. add a dedicated `Dual<std::dynamic_extent>` specialization
 
-Both `GaussNewton` and `LevenbergMarquardt` share these steps:
-1. Evaluate the Jacobian at `work.x_current`.
-2. Form `g = J^T r`.
-3. Form `JTJ = J^T J`.
-4. Check gradient-based convergence.
-5. Compute a step.
-6. Build `work.x_trial = work.x_current + work.step`.
-7. Evaluate trial residuals and trial cost.
-8. Either accept the trial or reject it.
+## Arena Design
 
-The main difference is:
-1. `GaussNewton` computes an undamped step.
-2. `LevenbergMarquardt` computes a damped step and updates `lambda` based
-   on acceptance or rejection.
-3. `GaussNewton` takes one full trial step per outer iteration.
-4. `LevenbergMarquardt` may retry multiple damped trial steps against the
-   same accepted iterate before consuming the next outer iteration.
-
-## Step Computation
-
-Use one shared step entry point with a damping parameter:
+Use a small internal bump allocator over workspace-owned `double` scratch:
 
 ```text
-compute_step(context, damping_lambda)
+ADArena
+  buffer: span<double>
+  used: Index
+  overflowed: bool
 ```
 
-Then dispatch on the selected linear solver inside that helper:
+Arena policy:
+1. `ADArena` is non-owning.
+2. `LMWorkspace` owns the backing storage.
+3. `ADArena` is only used by `Dual<dynamic>` and dynamic autodiff paths.
+4. `ADArena` is reset once per autodiff residual evaluation.
+5. Arena scratch is always dynamic and may grow.
+6. Individual temporary allocations are never freed.
+7. Overflow sets a sticky `overflowed` flag.
+8. Later autodiff evaluation should grow scratch and retry on overflow.
+9. Operator code may continue after overflow, but later autodiff evaluation must
+   detect the sticky failure and return a proper solver error.
+
+Required helpers:
+1. `reset()`
+2. `allocate_grad(Index n, VectorView<dynamic>& out) -> bool`
+3. convenience wrapper returning `VectorView<dynamic>` if needed
+
+## Workspace Storage
+
+Split autodiff storage into persistent state and temporary scratch.
+
+Persistent workspace state:
+1. parameter gradient backing storage for dynamic paths
+2. residual gradient backing storage for dynamic paths
+3. dynamic wrapper objects only when their count is dynamic
+
+Temporary workspace state:
+1. one `double` scratch buffer used only by `ADArena`
+
+Recommended shape inside `LMWorkspace<M, N>`:
 
 ```text
-switch (context.options.linear_solver) {
-  case NormalEquationsCholesky:
-    compute_step_normal_equations_cholesky(context, damping_lambda)
-  case QR:
-    fail unsupported
-  case SVD:
-    fail unsupported
-}
+ad_x_grads  : MatrixStorage<N, N>
+ad_r_grads  : MatrixStorage<N, M>
+ad_scratch  : VectorStorage<dynamic>
+ad_arena    : ADArena
+ad_x_dynamic: VectorStorage<dynamic, Dual<dynamic>>
+ad_r_dynamic: VectorStorage<dynamic, Dual<N>>
 ```
 
-For the first implementation:
-1. `GaussNewton` passes `damping_lambda = 0.0`.
-2. `LevenbergMarquardt` passes its current `lambda`.
+Binding rules:
+1. each parameter dual gradient is bound to a contiguous column in `ad_x_grads`
+2. each residual dual gradient is bound to a contiguous column in `ad_r_grads`
+3. `ad_r_grads` stores autodiff output gradients as `J^T`
+4. residual output gradients must not come from the arena
+5. only dynamic intermediate temporaries allocate from the arena
 
-This keeps the linear solve backend shared between strategies while still
-leaving strategy-specific acceptance logic separate.
+Static-path rules:
+1. static input duals own their gradients inline and are seeded directly as
+   identity
+2. static output duals own their gradients inline
+3. static autodiff fills `J` directly from local output dual gradients
+4. static autodiff does not require persistent `ad_x_grads` or `ad_r_grads`
 
-For LM retries within one outer iteration:
-1. Keep the accepted iterate fixed in `work.x_current`.
-2. Keep the accepted residual and Jacobian fixed for that iterate.
-3. Retry step computation with larger `lambda` after rejection.
-4. Do not reevaluate the Jacobian until a step is accepted or the solve
-   terminates.
+Initialization policy:
+1. bind persistent dual views after workspace sizing
+2. rebind dynamic views inside `LMWorkspace::resize(...)`
+3. bind `ad_arena.buffer` to `ad_scratch.view()` after sizing
+4. static wrapper duals are created as local values inside autodiff evaluation,
+   not persisted in workspace
 
-## Normal Equations / Cholesky Path
+## Static Vs Dynamic Policy
 
-Shared normal-equations build:
-
-```text
-g   = J^T r
-JTJ = J^T J
-```
-
-For LM damping:
-
-```text
-JTJ(j,j) += lambda * D[j]
-```
-
-Initial damping policy can stay simple:
-1. Use diagonal damping only.
-2. A reasonable starting point is `D[j] = max(JTJ(j,j), 1.0)`.
-3. Revisit scaling policy only after the base algorithm is stable.
-
-The backend responsibilities are:
-1. Build the damped system.
-2. Factor it with in-place Cholesky.
-3. Solve the triangular systems.
-4. Write the step into `work.step`.
-
-Storage policy for the first implementation:
-1. Rebuild `g` and `JTJ` from `J` for each LM retry.
-2. Do not try to preserve a pristine undamped copy yet.
-3. This is simpler and avoids extra scratch-state design during the initial
-   refactor.
-
-Pseudocode:
-
-```text
-form g = J^T r
-form JTJ = J^T J
-apply damping to JTJ diagonal if lambda > 0
-factor JTJ = L L^T
-solve L y = -g
-solve L^T step = y
-```
-
-## Strategy Behavior
-
-### Gauss-Newton
-
-Step equation:
-
-```text
-(J^T J) step = -J^T r
-```
+Use static inline duals for fixed `N`, but keep arena scratch dynamic.
 
 Policy:
-1. No damping.
-2. Evaluate the trial point.
-3. Accept the step if cost decreases.
-4. If cost does not decrease, terminate cleanly rather than adding an LM-style
-   retry path.
-5. Map this stagnation case to `TerminationReason::SmallCostReduction`.
-
-### Levenberg-Marquardt
-
-Step equation:
-
-```text
-(J^T J + lambda D) step = -J^T r
-```
-
-Policy:
-1. Evaluate the trial point.
-2. If cost decreases, accept the step and decrease `lambda`.
-3. If cost does not decrease, reject the step and increase `lambda`.
-4. Retry with the larger `lambda` inside the same outer iteration.
-5. Keep the first implementation simple before refining the lambda update rule.
-
-## Workspace And Context
-
-`LMSolveContext` should remain a lightweight bundle of references.
-
-Current policy:
-1. It owns no storage.
-2. It stores immutable input `x` as a view.
-3. Callers size `LMWorkspace` before constructing or using the context.
-4. It does not run validation itself.
-
-`solve(context)` is responsible for:
-1. Validation.
-2. Copying `context.x` into `work.x_current` at solve start.
-3. Driving all iteration state transitions.
-
-Current baseline helpers already exist for:
-1. `validate_problem(...)`
-2. `validate_context(...)`
-3. `evaluate_residual(...)`
-4. `evaluate_jacobian(...)`, including finite-difference modes
-
-For the first implementation, existing option surface area is intentionally
-limited:
-1. `LossKind::Squared` only.
-2. `ScalingMode::None` only.
-3. `weights` remain unused until robust loss/scaling work is added.
-4. Unsupported modes should fail cleanly with `ErrorCode::InvalidProblem` and a
-   clear message rather than being silently ignored.
-
-Use:
-1. `work.x_current` for the accepted iterate.
-2. `work.x_trial` for the proposed step.
-3. `work.r` for residuals at `x_current`.
-4. `work.r_trial` for residuals at `x_trial`.
-
-## Result And Termination Policy
-
-Normal termination reasons should include:
-1. `TerminationReason::SmallGradient`
-2. `TerminationReason::SmallStep`
-3. `TerminationReason::SmallCostReduction`
-4. `TerminationReason::MaxIterations`
-
-Hard failures remain:
-1. `ErrorCode::InvalidProblem`
-2. `ErrorCode::UserFunctionError`
-3. `ErrorCode::NumericalFailure`
-
-Recommended `solve(...)` return convention:
-1. Return `ErrorOr<Result>`.
-2. Use `Result::termination` to report normal solver termination, including
-   `MaxIterations`.
-3. Return `std::unexpected(Error{...})` only for hard failures.
-
-Iteration accounting policy:
-1. Count one outer iteration per accepted iterate attempt.
-2. LM rejection retries do not advance the Jacobian to a new iterate.
-3. LM rejection retries still consume residual evaluations.
-4. `max_iterations` limits outer iterations.
-5. `max_function_evaluations` limits total residual evaluations, including LM
-   retries.
-
-## Runtime Dispatch First
-
-For now, keep `Strategy` and `LinearSolver` runtime-dispatched.
+1. if `N != std::dynamic_extent`, use inline-owning `Dual<N>` for operator
+   temporaries
+2. if `N == std::dynamic_extent`, use arena-backed `Dual<dynamic>` for operator
+   temporaries
+3. keep `ad_scratch` dynamic for dynamic autodiff paths
 
 Rationale:
-1. They are already runtime options.
-2. Switch overhead is negligible relative to residual/Jacobian evaluation and
-   factorization.
-3. Runtime dispatch keeps the control flow easy to inspect while the
-   implementation is still changing.
+1. static small-`N` problems benefit from jet-like inline dual storage
+2. dynamic problems need workspace-backed gradients and growable scratch
+3. static autodiff can avoid persistent gradient backing by using local owning
+   input and output duals
+4. temporary demand depends on residual expression complexity and the full
+   callback shape, not just `N`
+5. fixed arena scratch is brittle for callbacks that compute all `m` residuals
+   in one call
 
-Do not refactor to user-pluggable solver backend templates yet.
+Dynamic scratch heuristic:
+1. size scratch at runtime from `m` and `n`
+2. initial heuristic: `max(16 * m * n, 16 * n * n)` doubles
+3. keep overflow detection even with runtime sizing
+4. later autodiff evaluation should grow and retry on overflow
 
-That refactor can happen later, after:
-1. `GaussNewton` works.
-2. `LevenbergMarquardt` works.
-3. The normal-equations backend contract feels stable.
+## Operator Overloads
+
+Operator overloads are internal implementation helpers only.
+
+Initial arithmetic scope:
+1. unary `+`
+2. unary `-`
+3. binary `+`
+4. binary `-`
+5. binary `*`
+6. binary `/`
+7. mixed `Dual` and `double` overloads for the above
+
+Initial math function scope:
+1. `exp`, `log`, `sqrt`
+2. `sin`, `cos`, `tan`
+3. `abs`
+4. `pow`
+
+Operator policy:
+1. static `Dual<N>` operators return local owning results with no allocation
+2. dynamic `Dual<dynamic>` operators allocate result gradients from `ADArena`
+3. the dynamic result carries the same arena pointer forward
+4. operator overloads assume internal use and do not need public-library style
+   generality
+5. no thread-local or global arena state
+6. arithmetic formulas should be shared between static and dynamic overload
+   families via view-based helper kernels
+
+Gradient rules:
+1. `+` and `-` are elementwise on gradients
+2. `*` uses the product rule
+3. `/` uses the quotient rule
+4. unary math functions apply the scalar derivative multiplier to the full
+   gradient vector
+
+## Helper Utilities
+
+Add small internal helpers to keep operator code direct:
+1. zero a gradient view
+2. copy one gradient view into another
+3. `scal`-style gradient scaling
+4. `axpy`-style gradient accumulation
+5. linear combination helper kernels for binary ops
+6. allocate a dynamic result gradient and build a dynamic `Dual` result object
+7. gradient access helpers like `grad_view(...)` so static and dynamic duals can
+   share kernels
+
+Keep these helpers local to `levmar/lm.h` and avoid introducing a separate
+autodiff subsystem yet.
+
+## Transition Plan
+
+Move from the current single non-owning dual model to a split static/dynamic
+implementation.
+
+Target end state:
+1. `Dual<N>` for fixed `N` owns inline gradients
+2. `Dual<dynamic>` remains non-owning and arena-backed
+3. math formulas are shared through view-based helper kernels
+4. static autodiff writes `J` directly from local output duals
+5. dynamic autodiff keeps persistent workspace-backed gradient buffers
+
+Migration steps:
+1. Keep the current dynamic path contract stable:
+    `Dual<dynamic>`, `ADArena`, `ad_x_grads`, `ad_r_grads`, and dynamic wrapper
+    binding remain the basis for the dynamic path.
+2. Redefine `Dual` by specialization:
+   `Dual<N>` becomes owning for static `N`, and `Dual<dynamic>` stays
+   non-owning.
+3. Add `grad_view(...)` helpers for static and dynamic duals.
+4. Rewrite gradient helper utilities to operate only on views.
+5. Split temporary-result construction helpers:
+   static local result construction and dynamic arena-backed result
+   construction.
+6. Implement operators in two families:
+   static-owning overloads and dynamic-arena-backed overloads.
+7. Remove static temporary scratch assumptions from workspace.
+8. Remove static-path dependence on persistent `ad_x_grads` and `ad_r_grads`.
+9. Keep workspace scratch dynamic-only and later support grow-and-retry.
+10. Later, add autodiff evaluation in two branches:
+    static local inline dual arrays and dynamic workspace-backed wrapper arrays.
+
+## Implementation Checklist
+
+### Dual Refactor
+
+1. Add a dedicated `Dual<std::dynamic_extent>` specialization.
+2. Change fixed-extent `Dual<N>` to own inline gradients, likely via
+   `std::array<double, N>`.
+3. Add `grad_view(...)` helpers for mutable and const access.
+4. Ensure static duals can be seeded directly without workspace backing.
+
+### Helper And Kernel Layer
+
+1. Add `zero_grad`, `copy_grad`, `scal_grad`, `axpy_grad`, and
+   `linear_combine_grad` helpers on views.
+2. Keep helper signatures BLAS-friendly so the implementation can be swapped
+   later.
+3. Add dynamic temp helpers such as `allocate_temp_grad(...)` and
+   `make_temp_dual_like(...)`.
+4. Add shared derivative kernels used by both static and dynamic overloads.
+
+### Evaluation Split
+
+1. Static autodiff evaluation builds local input and output dual arrays.
+2. Static autodiff seeds input gradients directly as identity.
+3. Static autodiff writes residual values to `r` and gradients directly to `J`.
+4. Dynamic autodiff continues to use `ad_x_grads`, `ad_r_grads`, and dynamic
+   wrapper binding.
+5. Dynamic autodiff later adds grow-and-retry on arena overflow.
+
+### Operator Migration Order
+
+1. Port `operator*` first as the model implementation.
+2. Add unary `+` and unary `-`.
+3. Add binary `+` and `-`.
+4. Add binary `/`.
+5. Add mixed `Dual` / `double` overloads.
+6. Add unary math functions.
+7. Add `pow` overloads last.
 
 ## Near-Term Checklist
 
-1. Add `solve(context) -> ErrorOr<Result>`.
-2. Reset and populate `Result` inside `solve(context)`.
-3. Copy `context.x` into `work.x_current` at solve start.
-4. Add residual-cost evaluation helper.
-5. Add normal-equations formation helper.
-6. Add Cholesky factor and triangular solve helpers.
-7. Add `compute_step_normal_equations_cholesky(context, damping_lambda)`.
-8. Add `compute_step(context, damping_lambda)` with runtime linear-solver
-   dispatch.
-9. Add `solve_gauss_newton(context)`.
-10. Add `solve_levenberg_marquardt(context)`.
-11. Return clear unsupported messages for `QR`, `SVD`, `TrustRegionLM`, and
-    `DogLeg`.
-12. Validate the new path with the existing conformance runner.
+1. Add `ADArena` and its allocation helpers.
+2. Add internal `Dual<N>` and `Dual<dynamic>` split storage models.
+3. Keep `LMWorkspace<M, N>` persistent autodiff storage only for dynamic paths.
+4. Keep autodiff scratch dynamic and arena-backed.
+5. Add workspace binding helpers for dynamic autodiff views and arena buffer
+   setup.
+6. Add gradient helper kernels.
+7. Add the initial arithmetic operator overload set.
+8. Add the basic math function set.
+9. Add overflow-aware internal assertions or checks where useful during early
+   bring-up.
 
-## Later Refactors
+## Deferred Until After This Work
 
 Only after the above is stable:
-1. Revisit QR and SVD integration.
-2. Revisit workspace scratch for augmented-system solvers.
-3. Revisit trust-region and dogleg strategies.
-4. Revisit whether users should be able to inject custom linear solver
-   backends from their own code.
-5. If that extensibility is still desirable, make the enum-based built-in
-   solver selection a convenience wrapper over a more general backend
-   interface.
+1. add `JacobianMode::AutoDiff`
+2. add autodiff evaluation helpers that fill both residuals and Jacobians
+3. wire autodiff into `evaluate_jacobian(...)` or a fused evaluation path
+4. resume the broader solve-loop implementation work

@@ -14,6 +14,8 @@ cmake -S . -B build
 cmake --build build
 ```
 
+This also exports `build/compile_commands.json` for editor and LSP tooling.
+
 The conformance runner target is `levmar_nist_runner` when
 `LEVMAR_BUILD_CONFORMANCE_RUNNER=ON`.
 
