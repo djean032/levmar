@@ -44,6 +44,8 @@
 build/
 Build/
 build-*/
+build-benchmark/
+benchmark-results/
 
 # CMake generated files
 CMakeFiles/

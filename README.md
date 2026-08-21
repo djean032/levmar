@@ -3,7 +3,11 @@
 Small dense nonlinear least-squares experiments with dynamic and static callback paths.
 
 Recommended benchmark/accuracy flags:
-- C++: `-O3 -march=native -ffp-contract=off`
+- C++: `-O3 -march=native -fno-fast-math -ffp-contract=off`
+
+Clang and Intel are the recommended benchmark compilers. GCC is a valid
+reference compiler, but is slower in the current DAG benchmark results. Use
+the same portable flags with Intel.
 
 ## Build
 
@@ -18,6 +22,48 @@ This also exports `build/compile_commands.json` for editor and LSP tooling.
 
 The conformance runner target is `levmar_nist_runner` when
 `LEVMAR_BUILD_CONFORMANCE_RUNNER=ON`.
+
+## Benchmarking
+
+Build and run the NIST conformance benchmark with the portable flags above:
+
+```sh
+python3 scripts/benchmark.py
+python3 scripts/benchmark.py --iterations 100 --per-problem
+python3 scripts/benchmark.py --compiler icpx --env /path/to/compiler-env.sh
+```
+
+The script configures a Release `build-benchmark/`, builds
+`levmar_nist_runner`, verifies the corpus, and writes `nist-validation.csv`,
+`nist-benchmark.csv`, and `nist-report.md` to `benchmark-results/` by default.
+Use `--build-dir` and `--output-dir` to select different locations. `--env`
+sources a shell setup file before CMake invokes the requested compiler.
+
+For manual CMake benchmark builds, pass the flags through the runner-only
+`LEVMAR_BENCHMARK_COMPILE_OPTIONS` cache variable:
+
+```sh
+cmake -S . -B build-benchmark -DCMAKE_BUILD_TYPE=Release \
+  '-DLEVMAR_BENCHMARK_COMPILE_OPTIONS=-O3 -march=native -fno-fast-math -ffp-contract=off'
+cmake --build build-benchmark --target levmar_nist_runner
+```
+
+## Current Status
+
+The library currently provides residual/Jacobian callback infrastructure,
+static and dynamic storage paths, user-supplied and finite-difference
+Jacobians, and internal DAG-based forward-mode autodiff.
+
+Autodiff supports unary negation, `exp`, `log`, `log1p`, `expm1`, `sqrt`,
+`sin`, `cos`, and `tan`; binary addition, subtraction, multiplication,
+division, power, and `atan2`. Residuals selected for `JacobianMode::AutoDiff`
+must be scalar-generic so they operate on internal autodiff views as well as
+standard double-based views. `levmar/lm.h` is the public umbrella header; the
+implementation headers under `levmar/internal/` are not public API.
+
+A top-level `solve(...)` entry point is not implemented yet. The current focus
+is expanding autodiff coverage, implementing a minimal Levenberg-Marquardt
+solve loop, and validating it against the NIST corpus.
 
 ## Install
 
@@ -194,4 +240,5 @@ int main() {
 1. `ConstVectorView<N>` and `VectorView<M>` are thin aliases over `std::span`.
 2. `MatrixView<M, N>` is a thin alias over `std::mdspan` using `std::layout_left`.
 3. `x` is immutable input in `LMSolveContext`; the workspace owns `x_current` and `x_trial`.
-4. The examples above exercise residual and Jacobian evaluation directly. A top-level `solve(...)` entry point is still being wired through the refactor.
+4. The examples above exercise residual and Jacobian evaluation directly. A
+   top-level `solve(...)` entry point is not implemented yet.
