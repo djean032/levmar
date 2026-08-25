@@ -57,6 +57,10 @@ struct TimingStats {
   struct ModeComparison {
     double analytic_residual_and_jacobian_seconds = 0.0;
     double autodiff_residual_and_jacobian_seconds = 0.0;
+    double graph_residual_and_jacobian_seconds = 0.0;
+    double direct_dual_residual_and_jacobian_seconds = 0.0;
+    bool graph_available = false;
+    bool direct_dual_available = false;
     double forward_difference_residual_and_jacobian_seconds = 0.0;
     double central_difference_residual_and_jacobian_seconds = 0.0;
   };
@@ -65,6 +69,10 @@ struct TimingStats {
   double analytic_jacobian_seconds = 0.0;
   double analytic_residual_and_jacobian_seconds = 0.0;
   double autodiff_jacobian_seconds = 0.0;
+  double graph_jacobian_seconds = 0.0;
+  double direct_dual_jacobian_seconds = 0.0;
+  bool graph_jacobian_available = false;
+  bool direct_dual_jacobian_available = false;
   double forward_difference_seconds = 0.0;
   double forward_difference_residual_and_jacobian_seconds = 0.0;
   double central_difference_seconds = 0.0;
@@ -102,6 +110,8 @@ struct TimingMoments {
   ScalarMoments analytic;
   ScalarMoments analytic_residual_and_jacobian;
   ScalarMoments autodiff;
+  ScalarMoments graph;
+  ScalarMoments direct_dual;
   ScalarMoments forward_difference;
   ScalarMoments forward_difference_residual_and_jacobian;
   ScalarMoments central_difference;
@@ -110,12 +120,20 @@ struct TimingMoments {
   struct ModeComparison {
     ScalarMoments analytic;
     ScalarMoments autodiff;
+    ScalarMoments graph;
+    ScalarMoments direct_dual;
     ScalarMoments forward_difference;
     ScalarMoments central_difference;
 
     void add(const TimingStats::ModeComparison &timing) {
       analytic.add(timing.analytic_residual_and_jacobian_seconds);
       autodiff.add(timing.autodiff_residual_and_jacobian_seconds);
+      if (timing.graph_available) {
+        graph.add(timing.graph_residual_and_jacobian_seconds);
+      }
+      if (timing.direct_dual_available) {
+        direct_dual.add(timing.direct_dual_residual_and_jacobian_seconds);
+      }
       forward_difference.add(
           timing.forward_difference_residual_and_jacobian_seconds);
       central_difference.add(
@@ -129,6 +147,12 @@ struct TimingMoments {
     analytic_residual_and_jacobian.add(
         timing.analytic_residual_and_jacobian_seconds);
     autodiff.add(timing.autodiff_jacobian_seconds);
+    if (timing.graph_jacobian_available) {
+      graph.add(timing.graph_jacobian_seconds);
+    }
+    if (timing.direct_dual_jacobian_available) {
+      direct_dual.add(timing.direct_dual_jacobian_seconds);
+    }
     forward_difference.add(timing.forward_difference_seconds);
     forward_difference_residual_and_jacobian.add(
         timing.forward_difference_residual_and_jacobian_seconds);
@@ -160,6 +184,10 @@ struct ProblemReport {
   ComparisonStats analytic_stats;
   ComparisonStats autodiff_stats;
   ComparisonStats autodiff_vs_analytic_stats;
+  ComparisonStats graph_autodiff_stats;
+  ComparisonStats graph_autodiff_vs_analytic_stats;
+  ComparisonStats direct_dual_stats;
+  ComparisonStats direct_dual_vs_analytic_stats;
   ComparisonStats forward_difference_stats;
   ComparisonStats central_difference_stats;
 };
@@ -173,6 +201,10 @@ struct SummaryStats {
   ComparisonStats analytic_stats;
   ComparisonStats autodiff_stats;
   ComparisonStats autodiff_vs_analytic_stats;
+  ComparisonStats graph_autodiff_stats;
+  ComparisonStats graph_autodiff_vs_analytic_stats;
+  ComparisonStats direct_dual_stats;
+  ComparisonStats direct_dual_vs_analytic_stats;
   ComparisonStats forward_difference_stats;
   ComparisonStats central_difference_stats;
 };
@@ -338,8 +370,16 @@ void merge_summary(SummaryStats &summary, const ProblemReport &report) {
       report.dynamic_timing.analytic_jacobian_seconds;
   summary.dynamic_timing.analytic_residual_and_jacobian_seconds +=
       report.dynamic_timing.analytic_residual_and_jacobian_seconds;
-  summary.dynamic_timing.autodiff_jacobian_seconds +=
-      report.dynamic_timing.autodiff_jacobian_seconds;
+  summary.dynamic_timing.graph_jacobian_seconds +=
+      report.dynamic_timing.graph_jacobian_seconds;
+  summary.dynamic_timing.direct_dual_jacobian_seconds +=
+      report.dynamic_timing.direct_dual_jacobian_seconds;
+  summary.dynamic_timing.graph_jacobian_available =
+      summary.dynamic_timing.graph_jacobian_available ||
+      report.dynamic_timing.graph_jacobian_available;
+  summary.dynamic_timing.direct_dual_jacobian_available =
+      summary.dynamic_timing.direct_dual_jacobian_available ||
+      report.dynamic_timing.direct_dual_jacobian_available;
   summary.dynamic_timing.forward_difference_seconds +=
       report.dynamic_timing.forward_difference_seconds;
   summary.dynamic_timing.forward_difference_residual_and_jacobian_seconds +=
@@ -353,10 +393,19 @@ void merge_summary(SummaryStats &summary, const ProblemReport &report) {
       .analytic_residual_and_jacobian_seconds +=
       report.dynamic_timing.numerical_subset
           .analytic_residual_and_jacobian_seconds;
-  summary.dynamic_timing.numerical_subset
-      .autodiff_residual_and_jacobian_seconds +=
+  summary.dynamic_timing.numerical_subset.graph_residual_and_jacobian_seconds +=
       report.dynamic_timing.numerical_subset
-          .autodiff_residual_and_jacobian_seconds;
+          .graph_residual_and_jacobian_seconds;
+  summary.dynamic_timing.numerical_subset
+      .direct_dual_residual_and_jacobian_seconds +=
+      report.dynamic_timing.numerical_subset
+          .direct_dual_residual_and_jacobian_seconds;
+  summary.dynamic_timing.numerical_subset.graph_available =
+      summary.dynamic_timing.numerical_subset.graph_available ||
+      report.dynamic_timing.numerical_subset.graph_available;
+  summary.dynamic_timing.numerical_subset.direct_dual_available =
+      summary.dynamic_timing.numerical_subset.direct_dual_available ||
+      report.dynamic_timing.numerical_subset.direct_dual_available;
   summary.dynamic_timing.numerical_subset
       .forward_difference_residual_and_jacobian_seconds +=
       report.dynamic_timing.numerical_subset
@@ -371,8 +420,16 @@ void merge_summary(SummaryStats &summary, const ProblemReport &report) {
       report.static_timing.analytic_jacobian_seconds;
   summary.static_timing.analytic_residual_and_jacobian_seconds +=
       report.static_timing.analytic_residual_and_jacobian_seconds;
-  summary.static_timing.autodiff_jacobian_seconds +=
-      report.static_timing.autodiff_jacobian_seconds;
+  summary.static_timing.graph_jacobian_seconds +=
+      report.static_timing.graph_jacobian_seconds;
+  summary.static_timing.direct_dual_jacobian_seconds +=
+      report.static_timing.direct_dual_jacobian_seconds;
+  summary.static_timing.graph_jacobian_available =
+      summary.static_timing.graph_jacobian_available ||
+      report.static_timing.graph_jacobian_available;
+  summary.static_timing.direct_dual_jacobian_available =
+      summary.static_timing.direct_dual_jacobian_available ||
+      report.static_timing.direct_dual_jacobian_available;
   summary.static_timing.forward_difference_seconds +=
       report.static_timing.forward_difference_seconds;
   summary.static_timing.forward_difference_residual_and_jacobian_seconds +=
@@ -386,10 +443,18 @@ void merge_summary(SummaryStats &summary, const ProblemReport &report) {
       .analytic_residual_and_jacobian_seconds +=
       report.static_timing.numerical_subset
           .analytic_residual_and_jacobian_seconds;
+  summary.static_timing.numerical_subset.graph_residual_and_jacobian_seconds +=
+      report.static_timing.numerical_subset.graph_residual_and_jacobian_seconds;
   summary.static_timing.numerical_subset
-      .autodiff_residual_and_jacobian_seconds +=
+      .direct_dual_residual_and_jacobian_seconds +=
       report.static_timing.numerical_subset
-          .autodiff_residual_and_jacobian_seconds;
+          .direct_dual_residual_and_jacobian_seconds;
+  summary.static_timing.numerical_subset.graph_available =
+      summary.static_timing.numerical_subset.graph_available ||
+      report.static_timing.numerical_subset.graph_available;
+  summary.static_timing.numerical_subset.direct_dual_available =
+      summary.static_timing.numerical_subset.direct_dual_available ||
+      report.static_timing.numerical_subset.direct_dual_available;
   summary.static_timing.numerical_subset
       .forward_difference_residual_and_jacobian_seconds +=
       report.static_timing.numerical_subset
@@ -400,9 +465,12 @@ void merge_summary(SummaryStats &summary, const ProblemReport &report) {
           .central_difference_residual_and_jacobian_seconds;
   merge_stats(summary.residual_stats, report.residual_stats);
   merge_stats(summary.analytic_stats, report.analytic_stats);
-  merge_stats(summary.autodiff_stats, report.autodiff_stats);
-  merge_stats(summary.autodiff_vs_analytic_stats,
-              report.autodiff_vs_analytic_stats);
+  merge_stats(summary.graph_autodiff_stats, report.graph_autodiff_stats);
+  merge_stats(summary.graph_autodiff_vs_analytic_stats,
+              report.graph_autodiff_vs_analytic_stats);
+  merge_stats(summary.direct_dual_stats, report.direct_dual_stats);
+  merge_stats(summary.direct_dual_vs_analytic_stats,
+              report.direct_dual_vs_analytic_stats);
   merge_stats(summary.forward_difference_stats,
               report.forward_difference_stats);
   merge_stats(summary.central_difference_stats,
@@ -417,8 +485,10 @@ void run_kernel_variant(
     const std::vector<std::vector<double>> &expected_jacobian,
     bool run_numerical_derivatives, TimingStats &timing,
     ComparisonStats *residual_stats, ComparisonStats *analytic_stats,
-    ComparisonStats *autodiff_stats,
-    ComparisonStats *autodiff_vs_analytic_stats,
+    ComparisonStats *graph_autodiff_stats,
+    ComparisonStats *graph_autodiff_vs_analytic_stats,
+    ComparisonStats *direct_dual_stats,
+    ComparisonStats *direct_dual_vs_analytic_stats,
     ComparisonStats *forward_difference_stats,
     ComparisonStats *central_difference_stats, const std::string &what_prefix) {
   auto problem = [&]() {
@@ -458,13 +528,12 @@ void run_kernel_variant(
                  what_prefix + " residual row " + std::to_string(i));
   }
 
-  options.jacobian_mode = JacobianMode::User;
   std::vector<double> analytic_jacobian(corpus.m * corpus.n);
   timing.analytic_jacobian_seconds +=
       measure_average_seconds(kKernelTimingRepeats, [&] {
         std::ranges::copy(context.x, workspace.x_current.view().begin());
-        if (auto jacobian_result =
-                evaluate_jacobian(context, what_prefix + " analytic jacobian");
+        if (auto jacobian_result = evaluate_jacobian<UserJacobian>(
+                context, what_prefix + " analytic jacobian");
             !jacobian_result) {
           throw std::runtime_error(jacobian_result.error().message);
         }
@@ -488,7 +557,7 @@ void run_kernel_variant(
             !residual_result) {
           throw std::runtime_error(residual_result.error().message);
         }
-        if (auto jacobian_result = evaluate_jacobian(
+        if (auto jacobian_result = evaluate_jacobian<UserJacobian>(
                 context, what_prefix + " analytic residual/jacobian");
             !jacobian_result) {
           throw std::runtime_error(jacobian_result.error().message);
@@ -503,7 +572,7 @@ void run_kernel_variant(
               !residual_result) {
             throw std::runtime_error(residual_result.error().message);
           }
-          if (auto jacobian_result = evaluate_jacobian(
+          if (auto jacobian_result = evaluate_jacobian<UserJacobian>(
                   context, what_prefix + " subset analytic residual/jacobian");
               !jacobian_result) {
             throw std::runtime_error(jacobian_result.error().message);
@@ -512,50 +581,95 @@ void run_kernel_variant(
   }
 
   if constexpr (AutoDiffResidualCallable<ResidualFn, M, N>) {
-    options.jacobian_mode = JacobianMode::AutoDiff;
-    timing.autodiff_jacobian_seconds +=
+    if (auto activation = GraphAutoDiffJacobian::activate(
+            context, what_prefix + " graph autodiff activation");
+        !activation) {
+      throw std::runtime_error(activation.error().message);
+    }
+    timing.graph_jacobian_available = true;
+    timing.graph_jacobian_seconds +=
         measure_average_seconds(kKernelTimingRepeats, [&] {
           std::ranges::copy(context.x, workspace.x_current.view().begin());
-          if (auto jacobian_result = evaluate_jacobian(
-                  context, what_prefix + " autodiff jacobian");
-              !jacobian_result) {
-            throw std::runtime_error(jacobian_result.error().message);
+          if (auto graph_result = GraphAutoDiffJacobian::evaluate(
+                  context, what_prefix + " graph autodiff jacobian");
+              !graph_result) {
+            throw std::runtime_error(graph_result.error().message);
           }
         });
     if (run_numerical_derivatives) {
-      timing.numerical_subset.autodiff_residual_and_jacobian_seconds +=
+      timing.numerical_subset.graph_available = true;
+      timing.numerical_subset.graph_residual_and_jacobian_seconds +=
           measure_average_seconds(kKernelTimingRepeats, [&] {
             std::ranges::copy(context.x, workspace.x_current.view().begin());
-            if (auto jacobian_result = evaluate_jacobian(
+            if (auto graph_result = GraphAutoDiffJacobian::evaluate(
                     context,
-                    what_prefix + " subset autodiff residual/jacobian");
-                !jacobian_result) {
-              throw std::runtime_error(jacobian_result.error().message);
+                    what_prefix + " subset graph autodiff residual/jacobian");
+                !graph_result) {
+              throw std::runtime_error(graph_result.error().message);
             }
           });
     }
     for (Index j = 0; j < corpus.n; ++j) {
       for (Index i = 0; i < corpus.m; ++i) {
-        if (autodiff_stats != nullptr) {
-          autodiff_stats->add(workspace.J(i, j), expected_jacobian[i][j]);
+        if (graph_autodiff_stats != nullptr) {
+          graph_autodiff_stats->add(workspace.J(i, j), expected_jacobian[i][j]);
         }
-        if (autodiff_vs_analytic_stats != nullptr) {
-          autodiff_vs_analytic_stats->add(workspace.J(i, j),
-                                          analytic_jacobian[i + j * corpus.m]);
+        if (graph_autodiff_vs_analytic_stats != nullptr) {
+          graph_autodiff_vs_analytic_stats->add(
+              workspace.J(i, j), analytic_jacobian[i + j * corpus.m]);
         }
         expect_close(workspace.J(i, j), expected_jacobian[i][j], 1e-12, 1e-10,
-                     what_prefix + " autodiff jacobian row " +
+                     what_prefix + " graph autodiff jacobian row " +
                          std::to_string(i) + " col " + std::to_string(j));
+      }
+    }
+
+    if constexpr (kUsesDirectDualAutoDiff<N>) {
+      timing.direct_dual_jacobian_available = true;
+      timing.direct_dual_jacobian_seconds +=
+          measure_average_seconds(kKernelTimingRepeats, [&] {
+            std::ranges::copy(context.x, workspace.x_current.view().begin());
+            if (auto dual_result = DirectDualJacobian::evaluate(
+                    context, what_prefix + " direct-dual jacobian");
+                !dual_result) {
+              throw std::runtime_error(dual_result.error().message);
+            }
+          });
+      if (run_numerical_derivatives) {
+        timing.numerical_subset.direct_dual_available = true;
+        timing.numerical_subset.direct_dual_residual_and_jacobian_seconds +=
+            measure_average_seconds(kKernelTimingRepeats, [&] {
+              std::ranges::copy(context.x, workspace.x_current.view().begin());
+              if (auto dual_result = DirectDualJacobian::evaluate(
+                      context,
+                      what_prefix + " subset direct-dual residual/jacobian");
+                  !dual_result) {
+                throw std::runtime_error(dual_result.error().message);
+              }
+            });
+      }
+      for (Index j = 0; j < corpus.n; ++j) {
+        for (Index i = 0; i < corpus.m; ++i) {
+          if (direct_dual_stats != nullptr) {
+            direct_dual_stats->add(workspace.J(i, j), expected_jacobian[i][j]);
+          }
+          if (direct_dual_vs_analytic_stats != nullptr) {
+            direct_dual_vs_analytic_stats->add(
+                workspace.J(i, j), analytic_jacobian[i + j * corpus.m]);
+          }
+          expect_close(workspace.J(i, j), expected_jacobian[i][j], 1e-12, 1e-10,
+                       what_prefix + " direct-dual jacobian row " +
+                           std::to_string(i) + " col " + std::to_string(j));
+        }
       }
     }
   }
 
-  options.jacobian_mode = JacobianMode::ForwardDifference;
   timing.forward_difference_seconds +=
       measure_average_seconds(kKernelTimingRepeats, [&] {
         std::ranges::copy(context.x, workspace.x_current.view().begin());
-        if (auto jacobian_result =
-                evaluate_jacobian(context, what_prefix + " fd jacobian");
+        if (auto jacobian_result = evaluate_jacobian<ForwardDifferenceJacobian>(
+                context, what_prefix + " fd jacobian");
             !jacobian_result) {
           throw std::runtime_error(jacobian_result.error().message);
         }
@@ -568,7 +682,7 @@ void run_kernel_variant(
             !residual_result) {
           throw std::runtime_error(residual_result.error().message);
         }
-        if (auto jacobian_result = evaluate_jacobian(
+        if (auto jacobian_result = evaluate_jacobian<ForwardDifferenceJacobian>(
                 context, what_prefix + " fd residual/jacobian");
             !jacobian_result) {
           throw std::runtime_error(jacobian_result.error().message);
@@ -583,8 +697,9 @@ void run_kernel_variant(
               !residual_result) {
             throw std::runtime_error(residual_result.error().message);
           }
-          if (auto jacobian_result = evaluate_jacobian(
-                  context, what_prefix + " subset fd residual/jacobian");
+          if (auto jacobian_result =
+                  evaluate_jacobian<ForwardDifferenceJacobian>(
+                      context, what_prefix + " subset fd residual/jacobian");
               !jacobian_result) {
             throw std::runtime_error(jacobian_result.error().message);
           }
@@ -604,12 +719,11 @@ void run_kernel_variant(
     }
   }
 
-  options.jacobian_mode = JacobianMode::CentralDifference;
   timing.central_difference_seconds +=
       measure_average_seconds(kKernelTimingRepeats, [&] {
         std::ranges::copy(context.x, workspace.x_current.view().begin());
-        if (auto jacobian_result =
-                evaluate_jacobian(context, what_prefix + " central jacobian");
+        if (auto jacobian_result = evaluate_jacobian<CentralDifferenceJacobian>(
+                context, what_prefix + " central jacobian");
             !jacobian_result) {
           throw std::runtime_error(jacobian_result.error().message);
         }
@@ -622,7 +736,7 @@ void run_kernel_variant(
             !residual_result) {
           throw std::runtime_error(residual_result.error().message);
         }
-        if (auto jacobian_result = evaluate_jacobian(
+        if (auto jacobian_result = evaluate_jacobian<CentralDifferenceJacobian>(
                 context, what_prefix + " central residual/jacobian");
             !jacobian_result) {
           throw std::runtime_error(jacobian_result.error().message);
@@ -637,8 +751,10 @@ void run_kernel_variant(
               !residual_result) {
             throw std::runtime_error(residual_result.error().message);
           }
-          if (auto jacobian_result = evaluate_jacobian(
-                  context, what_prefix + " subset central residual/jacobian");
+          if (auto jacobian_result =
+                  evaluate_jacobian<CentralDifferenceJacobian>(
+                      context,
+                      what_prefix + " subset central residual/jacobian");
               !jacobian_result) {
             throw std::runtime_error(jacobian_result.error().message);
           }
@@ -660,7 +776,7 @@ void run_kernel_variant(
 
   timing.total_seconds =
       timing.residual_seconds + timing.analytic_jacobian_seconds +
-      timing.autodiff_jacobian_seconds + timing.forward_difference_seconds +
+      timing.graph_jacobian_seconds + timing.forward_difference_seconds +
       timing.central_difference_seconds;
 }
 
@@ -725,7 +841,9 @@ ProblemReport run_problem(const std::filesystem::path &problem_dir) {
                                                beta_storage.size()),
           expected_residuals, expected_jacobian, run_numerical_derivatives,
           report.dynamic_timing, &report.residual_stats, &report.analytic_stats,
-          &report.autodiff_stats, &report.autodiff_vs_analytic_stats,
+          &report.graph_autodiff_stats,
+          &report.graph_autodiff_vs_analytic_stats, &report.direct_dual_stats,
+          &report.direct_dual_vs_analytic_stats,
           &report.forward_difference_stats, &report.central_difference_stats,
           corpus.name + " dynamic " + label);
 
@@ -733,8 +851,9 @@ ProblemReport run_problem(const std::filesystem::path &problem_dir) {
           corpus, static_residual, static_jacobian,
           ConstVectorView<SN>(beta_storage.data(), beta_storage.size()),
           expected_residuals, expected_jacobian, run_numerical_derivatives,
-          report.static_timing, nullptr, nullptr, nullptr,
-          &report.autodiff_vs_analytic_stats, nullptr, nullptr,
+          report.static_timing, nullptr, nullptr, &report.graph_autodiff_stats,
+          &report.graph_autodiff_vs_analytic_stats, &report.direct_dual_stats,
+          &report.direct_dual_vs_analytic_stats, nullptr, nullptr,
           corpus.name + " static " + label);
     };
 
@@ -2931,49 +3050,78 @@ void write_csv_report(const std::filesystem::path &path,
     throw std::runtime_error("Failed to open CSV report path " + path.string());
   }
 
+  const auto write_stats = [&](const ComparisonStats &stats) {
+    file << stats.count << ',' << stats.max_abs_error << ','
+         << stats.max_rel_error << ',' << stats.rms_abs_error() << ','
+         << stats.rms_rel_error();
+  };
+  const auto write_row =
+      [&](const std::string &name, const std::string &row_type, bool skipped,
+          const ComparisonStats &residual, const ComparisonStats &analytic,
+          const ComparisonStats &graph,
+          const ComparisonStats &graph_vs_analytic,
+          const ComparisonStats &direct_dual,
+          const ComparisonStats &direct_dual_vs_analytic,
+          const ComparisonStats &forward_difference,
+          const ComparisonStats &central_difference) {
+        file << name << ',' << row_type << ',' << (skipped ? "true" : "false")
+             << ',' << std::setprecision(17);
+        write_stats(residual);
+        file << ',';
+        write_stats(analytic);
+        file << ',';
+        write_stats(graph);
+        file << ',';
+        write_stats(graph_vs_analytic);
+        file << ',';
+        write_stats(direct_dual);
+        file << ',';
+        write_stats(direct_dual_vs_analytic);
+        file << ',';
+        write_stats(forward_difference);
+        file << ',';
+        write_stats(central_difference);
+        file << '\n';
+      };
+
   file << "name,row_type,numerical_derivative_checks_skipped,"
-       << "dynamic_total_ms,dynamic_residual_ms,dynamic_analytic_jacobian_ms,"
-       << "dynamic_analytic_residual_and_jacobian_ms,"
-          "dynamic_autodiff_residual_and_jacobian_ms,"
-          "dynamic_forward_difference_ms,"
-          "dynamic_forward_difference_residual_and_jacobian_ms,"
-          "dynamic_central_difference_ms,"
-          "dynamic_central_difference_residual_and_jacobian_ms,"
-       << "static_total_ms,static_residual_ms,static_analytic_jacobian_ms,"
-       << "static_analytic_residual_and_jacobian_ms,"
-          "static_autodiff_residual_and_jacobian_ms,"
-          "static_forward_difference_ms,"
-          "static_forward_difference_residual_and_jacobian_ms,"
-          "static_central_difference_ms,"
-          "static_central_difference_residual_and_jacobian_ms,"
-       << "dynamic_subset_analytic_residual_and_jacobian_ms,"
-          "dynamic_subset_autodiff_residual_and_jacobian_ms,"
-          "dynamic_subset_forward_difference_residual_and_jacobian_ms,"
-          "dynamic_subset_central_difference_residual_and_jacobian_ms,"
-          "static_subset_analytic_residual_and_jacobian_ms,"
-          "static_subset_autodiff_residual_and_jacobian_ms,"
-          "static_subset_forward_difference_residual_and_jacobian_ms,"
-          "static_subset_central_difference_residual_and_jacobian_ms,"
        << "residual_count,residual_max_abs,residual_max_rel,residual_rms_abs,"
           "residual_rms_rel,"
        << "analytic_count,analytic_max_abs,analytic_max_rel,analytic_rms_abs,"
           "analytic_rms_rel,"
-       << "autodiff_count,autodiff_max_abs,autodiff_max_rel,autodiff_rms_abs,"
-          "autodiff_rms_rel,"
-       << "autodiff_vs_analytic_count,autodiff_vs_analytic_max_abs,"
-          "autodiff_vs_analytic_max_rel,autodiff_vs_analytic_rms_abs,"
-          "autodiff_vs_analytic_rms_rel,"
-       << "forward_difference_count,forward_difference_max_abs,forward_"
-          "difference_max_rel,forward_difference_rms_abs,forward_difference_"
-          "rms_rel,"
-       << "central_difference_count,central_difference_max_abs,central_"
-          "difference_max_rel,central_difference_rms_abs,central_difference_"
-          "rms_rel\n";
+       << "graph_autodiff_count,graph_autodiff_max_abs,"
+          "graph_autodiff_max_rel,graph_autodiff_rms_abs,"
+          "graph_autodiff_rms_rel,"
+       << "graph_autodiff_vs_analytic_count,"
+          "graph_autodiff_vs_analytic_max_abs,"
+          "graph_autodiff_vs_analytic_max_rel,"
+          "graph_autodiff_vs_analytic_rms_abs,"
+          "graph_autodiff_vs_analytic_rms_rel,"
+       << "direct_dual_count,direct_dual_max_abs,direct_dual_max_rel,"
+          "direct_dual_rms_abs,direct_dual_rms_rel,"
+       << "direct_dual_vs_analytic_count,direct_dual_vs_analytic_max_abs,"
+          "direct_dual_vs_analytic_max_rel,direct_dual_vs_analytic_rms_abs,"
+          "direct_dual_vs_analytic_rms_rel,"
+       << "forward_difference_count,forward_difference_max_abs,"
+          "forward_difference_max_rel,forward_difference_rms_abs,"
+          "forward_difference_rms_rel,"
+       << "central_difference_count,central_difference_max_abs,"
+          "central_difference_max_rel,central_difference_rms_abs,"
+          "central_difference_rms_rel\n";
 
   for (const auto &report : reports) {
-    write_problem_csv_row(file, report);
+    write_row(report.name, "problem", report.numerical_derivatives_skipped,
+              report.residual_stats, report.analytic_stats,
+              report.graph_autodiff_stats,
+              report.graph_autodiff_vs_analytic_stats, report.direct_dual_stats,
+              report.direct_dual_vs_analytic_stats,
+              report.forward_difference_stats, report.central_difference_stats);
   }
-  write_summary_csv_row(file, summary);
+  write_row("summary", "summary", false, summary.residual_stats,
+            summary.analytic_stats, summary.graph_autodiff_stats,
+            summary.graph_autodiff_vs_analytic_stats, summary.direct_dual_stats,
+            summary.direct_dual_vs_analytic_stats,
+            summary.forward_difference_stats, summary.central_difference_stats);
 }
 
 void write_benchmark_csv_rows(std::ofstream &file, const std::string &scope,
@@ -2983,18 +3131,28 @@ void write_benchmark_csv_rows(std::ofstream &file, const std::string &scope,
   const auto write_row = [&](const std::string &metric,
                              const ScalarMoments &dynamic_values,
                              const ScalarMoments &static_values) {
+    const auto mean_milliseconds = [](const ScalarMoments &values) {
+      return values.count == 0 ? std::numeric_limits<double>::quiet_NaN()
+                               : milliseconds(values.mean());
+    };
+    const auto stddev_milliseconds = [](const ScalarMoments &values) {
+      return values.count == 0 ? std::numeric_limits<double>::quiet_NaN()
+                               : milliseconds(values.stddev());
+    };
     file << scope << ',' << name << ',' << iterations << ',' << metric << ','
-         << std::setprecision(17) << milliseconds(dynamic_values.mean()) << ','
-         << milliseconds(dynamic_values.stddev()) << ','
-         << milliseconds(static_values.mean()) << ','
-         << milliseconds(static_values.stddev()) << '\n';
+         << std::setprecision(17) << mean_milliseconds(dynamic_values) << ','
+         << stddev_milliseconds(dynamic_values) << ','
+         << mean_milliseconds(static_values) << ','
+         << stddev_milliseconds(static_values) << '\n';
   };
 
   write_row("analytic_residual_and_jacobian",
             dynamic.analytic_residual_and_jacobian,
             statik.analytic_residual_and_jacobian);
-  write_row("autodiff_residual_and_jacobian", dynamic.autodiff,
-            statik.autodiff);
+  write_row("graph_autodiff_residual_and_jacobian", dynamic.graph,
+            statik.graph);
+  write_row("direct_dual_residual_and_jacobian", dynamic.direct_dual,
+            statik.direct_dual);
   write_row("forward_difference_residual_and_jacobian",
             dynamic.forward_difference_residual_and_jacobian,
             statik.forward_difference_residual_and_jacobian);
@@ -3004,9 +3162,11 @@ void write_benchmark_csv_rows(std::ofstream &file, const std::string &scope,
   write_row("subset_analytic_residual_and_jacobian",
             dynamic.numerical_subset.analytic,
             statik.numerical_subset.analytic);
-  write_row("subset_autodiff_residual_and_jacobian",
-            dynamic.numerical_subset.autodiff,
-            statik.numerical_subset.autodiff);
+  write_row("subset_graph_autodiff_residual_and_jacobian",
+            dynamic.numerical_subset.graph, statik.numerical_subset.graph);
+  write_row("subset_direct_dual_residual_and_jacobian",
+            dynamic.numerical_subset.direct_dual,
+            statik.numerical_subset.direct_dual);
   write_row("subset_forward_difference_residual_and_jacobian",
             dynamic.numerical_subset.forward_difference,
             statik.numerical_subset.forward_difference);

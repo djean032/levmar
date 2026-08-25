@@ -1,13 +1,84 @@
+#include <levmar/internal/autodiff/dual.h>
+#include <levmar/internal/autodiff/dual_forward.h>
 #include <levmar/internal/evaluation.h>
+#include <levmar/internal/solver_validation.h>
 
+#include <array>
 #include <bit>
 #include <cmath>
 #include <iomanip>
+#include <limits>
 #include <sstream>
 #include <stdexcept>
 #include <string>
 
 namespace {
+
+struct StaticResidual {
+  template <class Scalar>
+  ErrorOrVoid operator()(ConstVectorView<1, Scalar>,
+                         VectorView<2, Scalar>) const {
+    return {};
+  }
+};
+
+struct StaticJacobian {
+  ErrorOrVoid operator()(ConstVectorView<1>, MatrixView<2, 1>) const {
+    return {};
+  }
+};
+
+struct DoubleOnlyResidual {
+  ErrorOrVoid operator()(ConstVectorView<1>, VectorView<2>) const { return {}; }
+};
+
+struct UnderdeterminedResidual {
+  template <class Scalar>
+  ErrorOrVoid operator()(ConstVectorView<2, Scalar>,
+                         VectorView<1, Scalar>) const {
+    return {};
+  }
+};
+
+struct UnderdeterminedJacobian {
+  ErrorOrVoid operator()(ConstVectorView<2>, MatrixView<1, 2>) const {
+    return {};
+  }
+};
+
+using ValidUserContext = LMSolveContext<2, 1, StaticResidual, StaticJacobian>;
+using MissingUserJacobianContext =
+    LMSolveContext<2, 1, StaticResidual, NoJacobian>;
+using DoubleOnlyAutoDiffContext =
+    LMSolveContext<2, 1, DoubleOnlyResidual, NoJacobian>;
+using UnderdeterminedContext =
+    LMSolveContext<1, 2, UnderdeterminedResidual, UnderdeterminedJacobian>;
+
+using AutoDiffSolverPolicy = SolverPolicy<AutoDiffJacobian, LevenbergMarquardt,
+                                          DampedQr, SquaredLoss, NoScaling>;
+using ForwardDifferenceSolverPolicy =
+    SolverPolicy<ForwardDifferenceJacobian, LevenbergMarquardt, DampedQr,
+                 SquaredLoss, NoScaling>;
+using CentralDifferenceSolverPolicy =
+    SolverPolicy<CentralDifferenceJacobian, LevenbergMarquardt, DampedQr,
+                 SquaredLoss, NoScaling>;
+
+static_assert(
+    kStaticSolverConfigurationValid<DefaultSolverPolicy, ValidUserContext>);
+static_assert(
+    kStaticSolverConfigurationValid<AutoDiffSolverPolicy, ValidUserContext>);
+static_assert(!kStaticSolverConfigurationValid<DefaultSolverPolicy,
+                                               MissingUserJacobianContext>);
+static_assert(!kStaticSolverConfigurationValid<AutoDiffSolverPolicy,
+                                               DoubleOnlyAutoDiffContext>);
+static_assert(!kStaticSolverConfigurationValid<DefaultSolverPolicy,
+                                               UnderdeterminedContext>);
+static_assert([] {
+  validate_static_solver_configuration<DefaultSolverPolicy, ValidUserContext>();
+  validate_static_solver_configuration<AutoDiffSolverPolicy,
+                                       ValidUserContext>();
+  return true;
+}());
 
 void fail(const std::string &message) { throw std::runtime_error(message); }
 
@@ -39,6 +110,407 @@ void expect_close(double actual, double expected, double atol, double rtol,
     message << std::setprecision(17) << what << ": got " << actual
             << ", expected " << expected;
     fail(message.str());
+  }
+}
+
+void test_runtime_option_validation() {
+  const auto expect_valid = []<class Policy>(Options options,
+                                             const std::string &what) {
+    const auto result = validate_runtime_options<Policy>(options);
+    expect_true(result.has_value(), what + " should succeed");
+  };
+
+  const auto expect_invalid = []<class Policy>(Options options,
+                                               const std::string &what) {
+    const auto result = validate_runtime_options<Policy>(options);
+    expect_true(!result, what + " should fail");
+    expect_equal(result.error().code, ErrorCode::InvalidProblem,
+                 what + " should report an invalid problem");
+  };
+
+  const std::array<double, 3> invalid_tolerances{
+      std::numeric_limits<double>::quiet_NaN(),
+      std::numeric_limits<double>::infinity(), -1.0};
+  const std::array<double, 4> invalid_lambdas{
+      std::numeric_limits<double>::quiet_NaN(),
+      std::numeric_limits<double>::infinity(), 0.0, -1.0};
+
+  expect_valid.template operator()<DefaultSolverPolicy>(
+      Options{}, "default user-Jacobian options");
+  expect_valid.template operator()<AutoDiffSolverPolicy>(
+      Options{}, "default AutoDiff options");
+
+  Options zero_iterations;
+  zero_iterations.max_iterations = 0;
+  expect_valid.template operator()<DefaultSolverPolicy>(
+      zero_iterations, "zero iteration budget");
+
+  Options zero_function_evaluations;
+  zero_function_evaluations.max_function_evaluations = 0;
+  expect_invalid.template operator()<DefaultSolverPolicy>(
+      zero_function_evaluations, "zero function-evaluation budget");
+
+  for (const double value : invalid_tolerances) {
+    Options options;
+    options.gradient_tolerance = value;
+    expect_invalid.template operator()<DefaultSolverPolicy>(
+        options, "invalid gradient tolerance");
+
+    options = {};
+    options.step_tolerance = value;
+    expect_invalid.template operator()<DefaultSolverPolicy>(
+        options, "invalid step tolerance");
+
+    options = {};
+    options.cost_tolerance = value;
+    expect_invalid.template operator()<DefaultSolverPolicy>(
+        options, "invalid cost tolerance");
+  }
+
+  for (const double value : invalid_tolerances) {
+    Options options;
+    options.finite_difference_step = value;
+    expect_invalid.template operator()<ForwardDifferenceSolverPolicy>(
+        options, "invalid forward-difference step");
+    expect_invalid.template operator()<CentralDifferenceSolverPolicy>(
+        options, "invalid central-difference step");
+  }
+
+  Options unused_finite_difference_step;
+  unused_finite_difference_step.finite_difference_step =
+      std::numeric_limits<double>::quiet_NaN();
+  expect_valid.template operator()<DefaultSolverPolicy>(
+      unused_finite_difference_step,
+      "unused user-Jacobian finite-difference step");
+  expect_valid.template operator()<AutoDiffSolverPolicy>(
+      unused_finite_difference_step, "unused AutoDiff finite-difference step");
+
+  for (const double value : invalid_lambdas) {
+    Options options;
+    options.lm.min_lambda = value;
+    expect_invalid.template operator()<DefaultSolverPolicy>(
+        options, "invalid minimum lambda");
+
+    options = {};
+    options.lm.initial_lambda = value;
+    expect_invalid.template operator()<DefaultSolverPolicy>(
+        options, "invalid initial lambda");
+
+    options = {};
+    options.lm.max_lambda = value;
+    expect_invalid.template operator()<DefaultSolverPolicy>(
+        options, "invalid maximum lambda");
+  }
+
+  Options unordered_lambdas;
+  unordered_lambdas.lm.min_lambda = 2.0;
+  unordered_lambdas.lm.max_lambda = 1.0;
+  expect_invalid.template operator()<DefaultSolverPolicy>(unordered_lambdas,
+                                                          "unordered lambdas");
+
+  Options initial_below_minimum;
+  initial_below_minimum.lm.min_lambda = 2.0;
+  initial_below_minimum.lm.initial_lambda = 1.0;
+  initial_below_minimum.lm.max_lambda = 3.0;
+  expect_invalid.template operator()<DefaultSolverPolicy>(
+      initial_below_minimum, "initial lambda below minimum");
+
+  Options initial_above_maximum;
+  initial_above_maximum.lm.min_lambda = 1.0;
+  initial_above_maximum.lm.initial_lambda = 3.0;
+  initial_above_maximum.lm.max_lambda = 2.0;
+  expect_invalid.template operator()<DefaultSolverPolicy>(
+      initial_above_maximum, "initial lambda above maximum");
+
+  Options valid_lambdas;
+  valid_lambdas.lm.min_lambda = 1e-5;
+  valid_lambdas.lm.initial_lambda = 1e-3;
+  valid_lambdas.lm.max_lambda = 1.0;
+  expect_valid.template operator()<DefaultSolverPolicy>(valid_lambdas,
+                                                        "ordered lambdas");
+}
+
+void test_dual_arithmetic_and_math() {
+  DualEvaluationState state;
+  Dual<2> a{1.5};
+  a.derivatives[0] = 1.0;
+  a.state = &state;
+  Dual<2> b{0.75};
+  b.derivatives[1] = 1.0;
+  b.state = &state;
+
+  const auto expect_dual = [&](const Dual<2> &actual, double value,
+                               double derivative_a, double derivative_b,
+                               const std::string &what) {
+    expect_close(actual.value, value, 1e-12, 1e-12, what + " value");
+    expect_close(actual.derivatives[0], derivative_a, 1e-12, 1e-12,
+                 what + " derivative 0");
+    expect_close(actual.derivatives[1], derivative_b, 1e-12, 1e-12,
+                 what + " derivative 1");
+    expect_equal(actual.state, &state, what + " state");
+  };
+
+  expect_dual(a + b, 2.25, 1.0, 1.0, "dual addition");
+  expect_dual(a - b, 0.75, 1.0, -1.0, "dual subtraction");
+  expect_dual(-a, -1.5, -1.0, 0.0, "dual negation");
+  expect_dual(a * b, 1.125, 0.75, 1.5, "dual multiplication");
+  expect_dual(a / b, 2.0, 1.0 / b.value, -a.value / (b.value * b.value),
+              "dual division");
+
+  expect_dual(exp(a), std::exp(a.value), std::exp(a.value), 0.0, "dual exp");
+  expect_dual(log(a), std::log(a.value), 1.0 / a.value, 0.0, "dual log");
+  expect_dual(log1p(a), std::log1p(a.value), 1.0 / (1.0 + a.value), 0.0,
+              "dual log1p");
+  expect_dual(expm1(a), std::expm1(a.value), std::exp(a.value), 0.0,
+              "dual expm1");
+  expect_dual(sin(a), std::sin(a.value), std::cos(a.value), 0.0, "dual sin");
+  expect_dual(cos(a), std::cos(a.value), -std::sin(a.value), 0.0, "dual cos");
+  expect_dual(tan(a), std::tan(a.value),
+              1.0 / (std::cos(a.value) * std::cos(a.value)), 0.0, "dual tan");
+  expect_dual(sqrt(a), std::sqrt(a.value), 1.0 / (2.0 * std::sqrt(a.value)),
+              0.0, "dual sqrt");
+
+  const double atan2_denominator = a.value * a.value + b.value * b.value;
+  expect_dual(atan2(a, b), std::atan2(a.value, b.value),
+              b.value / atan2_denominator, -a.value / atan2_denominator,
+              "dual atan2");
+
+  const double power = std::pow(a.value, b.value);
+  expect_dual(pow(a, b), power, power * b.value / a.value,
+              power * std::log(a.value), "dual pow");
+}
+
+void test_dual_pow_domain_error() {
+  DualEvaluationState state;
+  Dual<1> base{-2.0};
+  base.state = &state;
+  Dual<1> exponent{0.5};
+  exponent.state = &state;
+
+  const Dual<1> result = pow(base, exponent);
+
+  expect_true(state.pow_domain_error,
+              "dual pow should record a nonpositive base");
+  expect_equal(result.state, &state,
+               "invalid dual pow should preserve evaluation state");
+}
+
+void test_evaluate_residual_dual_static() {
+  auto residual = []<class Scalar>(ConstVectorView<2, Scalar> x,
+                                   VectorView<2, Scalar> r) -> ErrorOrVoid {
+    using std::exp;
+    r[0] = x[0] * (1.0 - exp(-x[1]));
+    r[1] = x[0] / x[1];
+    return {};
+  };
+  const std::array<double, 2> parameters{1.5, 0.75};
+  VectorStorage<2> residuals;
+  MatrixStorage<2, 2> jacobian;
+  DualEvalContext<2, 2> context;
+
+  expect_success(
+      evaluate_residual_dual(
+          residual, ConstVectorView<2>(parameters.data(), parameters.size()),
+          residuals.view(), jacobian.view(), context, "static dual evaluation"),
+      "direct dual static evaluation should succeed");
+
+  const double exponential = std::exp(-parameters[1]);
+  expect_close(residuals[0], parameters[0] * (1.0 - exponential), 1e-12, 1e-12,
+               "direct dual static residual 0");
+  expect_close(residuals[1], parameters[0] / parameters[1], 1e-12, 1e-12,
+               "direct dual static residual 1");
+  expect_close(jacobian(0, 0), 1.0 - exponential, 1e-12, 1e-12,
+               "direct dual static dr0/dx0");
+  expect_close(jacobian(1, 0), 1.0 / parameters[1], 1e-12, 1e-12,
+               "direct dual static dr1/dx0");
+  expect_close(jacobian(0, 1), parameters[0] * exponential, 1e-12, 1e-12,
+               "direct dual static dr0/dx1");
+  expect_close(jacobian(1, 1), -parameters[0] / (parameters[1] * parameters[1]),
+               1e-12, 1e-12, "direct dual static dr1/dx1");
+
+  const std::array<double, 2> changed_parameters{2.0, 0.5};
+  expect_success(
+      evaluate_residual_dual(residual,
+                             ConstVectorView<2>(changed_parameters.data(),
+                                                changed_parameters.size()),
+                             residuals.view(), jacobian.view(), context),
+      "direct dual static evaluation should reuse context");
+  expect_close(residuals[1], changed_parameters[0] / changed_parameters[1],
+               1e-12, 1e-12,
+               "direct dual static context reuse should update residuals");
+  expect_close(
+      jacobian(1, 1),
+      -changed_parameters[0] / (changed_parameters[1] * changed_parameters[1]),
+      1e-12, 1e-12, "direct dual static context reuse should update Jacobian");
+}
+
+void test_evaluate_residual_dual_dynamic_residuals() {
+  auto residual =
+      []<class Scalar>(
+          ConstVectorView<2, Scalar> x,
+          VectorView<std::dynamic_extent, Scalar> r) -> ErrorOrVoid {
+    using std::sin;
+    r[0] = x[0] + x[1];
+    r[1] = x[0] * x[1];
+    r[2] = sin(x[0]);
+    return {};
+  };
+  const std::array<double, 2> parameters{1.5, 0.75};
+  VectorStorage<std::dynamic_extent> residuals;
+  residuals.resize(3);
+  MatrixStorage<std::dynamic_extent, 2> jacobian;
+  jacobian.resize(3);
+  DualEvalContext<std::dynamic_extent, 2> context;
+
+  expect_success(evaluate_residual_dual(
+                     residual,
+                     ConstVectorView<2>(parameters.data(), parameters.size()),
+                     residuals.view(), jacobian.view(), context),
+                 "direct dual dynamic-residual evaluation should succeed");
+
+  expect_equal(context.residuals.size(), Index{3},
+               "direct dual context should resize dynamic residual storage");
+  expect_close(residuals[0], parameters[0] + parameters[1], 1e-12, 1e-12,
+               "direct dual dynamic residual 0");
+  expect_close(residuals[1], parameters[0] * parameters[1], 1e-12, 1e-12,
+               "direct dual dynamic residual 1");
+  expect_close(residuals[2], std::sin(parameters[0]), 1e-12, 1e-12,
+               "direct dual dynamic residual 2");
+  expect_close(jacobian(0, 0), 1.0, 1e-12, 1e-12,
+               "direct dual dynamic dr0/dx0");
+  expect_close(jacobian(1, 0), parameters[1], 1e-12, 1e-12,
+               "direct dual dynamic dr1/dx0");
+  expect_close(jacobian(2, 0), std::cos(parameters[0]), 1e-12, 1e-12,
+               "direct dual dynamic dr2/dx0");
+  expect_close(jacobian(0, 1), 1.0, 1e-12, 1e-12,
+               "direct dual dynamic dr0/dx1");
+  expect_close(jacobian(1, 1), parameters[0], 1e-12, 1e-12,
+               "direct dual dynamic dr1/dx1");
+  expect_close(jacobian(2, 1), 0.0, 1e-12, 1e-12,
+               "direct dual dynamic dr2/dx1");
+}
+
+void test_evaluate_residual_dual_errors() {
+  auto callback_error = [](ConstVectorView<1, Dual<1>>,
+                           VectorView<1, Dual<1>>) -> ErrorOrVoid {
+    return std::unexpected(
+        Error{ErrorCode::UserFunctionError, "callback error"});
+  };
+  auto pow_error = []<class Scalar>(ConstVectorView<1, Scalar> x,
+                                    VectorView<1, Scalar> r) -> ErrorOrVoid {
+    using std::pow;
+    r[0] = pow(-2.0, x[0]);
+    return {};
+  };
+  auto identity = []<class Scalar>(ConstVectorView<1, Scalar> x,
+                                   VectorView<1, Scalar> r) -> ErrorOrVoid {
+    r[0] = x[0];
+    return {};
+  };
+  const std::array<double, 1> parameters{0.5};
+  VectorStorage<1> residuals;
+  MatrixStorage<1, 1> jacobian;
+  DualEvalContext<1, 1> context;
+  const auto parameter_view =
+      ConstVectorView<1>(parameters.data(), parameters.size());
+
+  const auto callback_result =
+      evaluate_residual_dual(callback_error, parameter_view, residuals.view(),
+                             jacobian.view(), context, "direct dual callback");
+  expect_true(!callback_result,
+              "direct dual should propagate callback failures");
+  expect_equal(callback_result.error().code, ErrorCode::UserFunctionError,
+               "direct dual callback error should preserve its code");
+  expect_equal(callback_result.error().message,
+               std::string("direct dual callback failed: callback error"),
+               "direct dual callback error should include its context");
+
+  const auto pow_result = evaluate_residual_dual(
+      pow_error, parameter_view, residuals.view(), jacobian.view(), context);
+  expect_true(!pow_result, "direct dual should reject invalid pow bases");
+  expect_equal(pow_result.error().code, ErrorCode::NumericalFailure,
+               "direct dual invalid pow should be numerical");
+
+  expect_success(evaluate_residual_dual(identity, parameter_view,
+                                        residuals.view(), jacobian.view(),
+                                        context),
+                 "direct dual context should reset pow errors");
+  expect_close(residuals[0], parameters[0], 1e-12, 1e-12,
+               "direct dual context reuse should evaluate after pow failure");
+  expect_close(jacobian(0, 0), 1.0, 1e-12, 1e-12,
+               "direct dual context reuse should reset derivative state");
+}
+
+void test_graph_and_direct_dual_policies_agree() {
+  Index recordings = 0;
+  auto residual =
+      [&recordings]<class Scalar>(ConstVectorView<2, Scalar> x,
+                                  VectorView<3, Scalar> r) -> ErrorOrVoid {
+    if constexpr (std::same_as<Scalar, AdExprRef>) {
+      ++recordings;
+    }
+    using std::exp;
+    using std::log1p;
+    using std::sin;
+    r[0] = x[0] * exp(-x[1]);
+    r[1] = log1p(x[0] * x[0]) + sin(x[1]);
+    r[2] = x[0] / x[1];
+    return {};
+  };
+  auto problem = make_problem<3, 2>(residual);
+  Options options;
+  const std::array<double, 2> x0{1.5, 0.75};
+
+  Result graph_result;
+  LMWorkspace<3, 2> graph_workspace;
+  LMSolveContext graph_context(problem, options, graph_result, graph_workspace,
+                               x0);
+  std::ranges::copy(graph_context.x, graph_workspace.x_current.view().begin());
+  expect_success(GraphAutoDiffJacobian::activate(graph_context, "graph policy"),
+                 "graph policy activation should succeed");
+  expect_success(GraphAutoDiffJacobian::evaluate(graph_context, "graph policy"),
+                 "graph policy evaluation should succeed");
+
+  Result dual_result;
+  LMWorkspace<3, 2> dual_workspace;
+  LMSolveContext dual_context(problem, options, dual_result, dual_workspace,
+                              x0);
+  std::ranges::copy(dual_context.x, dual_workspace.x_current.view().begin());
+  expect_success(DirectDualJacobian::evaluate(dual_context, "dual policy"),
+                 "direct-dual policy evaluation should succeed");
+
+  for (Index i = 0; i < 3; ++i) {
+    expect_close(graph_workspace.r[i], dual_workspace.r[i], 1e-12, 1e-12,
+                 "graph and direct-dual residuals should agree");
+    for (Index j = 0; j < 2; ++j) {
+      expect_close(graph_workspace.J(i, j), dual_workspace.J(i, j), 1e-12,
+                   1e-12, "graph and direct-dual Jacobians should agree");
+    }
+  }
+
+  graph_workspace.x_current[0] = 2.0;
+  graph_workspace.x_current[1] = 0.5;
+  dual_workspace.x_current[0] = 2.0;
+  dual_workspace.x_current[1] = 0.5;
+  expect_success(GraphAutoDiffJacobian::evaluate(graph_context, "graph policy"),
+                 "cached graph policy evaluation should succeed");
+  expect_success(DirectDualJacobian::evaluate(dual_context, "dual policy"),
+                 "reused direct-dual policy evaluation should succeed");
+
+  expect_equal(recordings, Index{1},
+               "graph policy should record the residual exactly once");
+  expect_true(graph_context.autodiff_cache.recorded,
+              "graph policy should retain its recorded graph");
+  expect_equal(dual_context.autodiff_cache.graph.nodes.size(), Index{0},
+               "direct-dual policy should not record a graph");
+  for (Index i = 0; i < 3; ++i) {
+    expect_close(graph_workspace.r[i], dual_workspace.r[i], 1e-12, 1e-12,
+                 "reused graph and direct-dual residuals should agree");
+    for (Index j = 0; j < 2; ++j) {
+      expect_close(graph_workspace.J(i, j), dual_workspace.J(i, j), 1e-12,
+                   1e-12,
+                   "reused graph and direct-dual Jacobians should agree");
+    }
   }
 }
 
@@ -551,7 +1023,6 @@ void test_evaluate_jacobian_autodiff_static_problem() {
   };
   auto problem = make_problem<2, 2>(residual);
   Options options;
-  options.jacobian_mode = JacobianMode::AutoDiff;
   Result result;
   LMWorkspace<2, 2> workspace;
   const std::array<double, 2> x0{1.25, 0.4};
@@ -561,8 +1032,8 @@ void test_evaluate_jacobian_autodiff_static_problem() {
   workspace.r.fill(-123.0);
   workspace.J.fill(-456.0);
 
-  if (auto jacobian_result =
-          evaluate_jacobian(context, "autodiff static jacobian");
+  if (auto jacobian_result = evaluate_jacobian<AutoDiffJacobian>(
+          context, "autodiff static jacobian");
       !jacobian_result) {
     fail(jacobian_result.error().message);
   }
@@ -620,7 +1091,6 @@ void test_evaluate_jacobian_autodiff_dynamic_problem() {
   };
   auto problem = make_dynamic_problem(3, 2, residual);
   Options options;
-  options.jacobian_mode = JacobianMode::AutoDiff;
   Result result;
   LMWorkspace<std::dynamic_extent, std::dynamic_extent> workspace;
   const std::vector<double> x0{1.25, 0.4};
@@ -630,8 +1100,8 @@ void test_evaluate_jacobian_autodiff_dynamic_problem() {
   workspace.r.fill(-123.0);
   workspace.J.fill(-456.0);
 
-  if (auto jacobian_result =
-          evaluate_jacobian(context, "autodiff dynamic jacobian");
+  if (auto jacobian_result = evaluate_jacobian<AutoDiffJacobian>(
+          context, "autodiff dynamic jacobian");
       !jacobian_result) {
     fail(jacobian_result.error().message);
   }
@@ -681,7 +1151,7 @@ void test_evaluate_jacobian_autodiff_dynamic_problem() {
                "jacobian_evaluations once for dynamic problems");
 }
 
-void test_evaluate_jacobian_autodiff_static_cache() {
+void test_evaluate_jacobian_autodiff_static_direct_dual() {
   Index recordings = 0;
   auto residual =
       [&recordings]<class Scalar>(ConstVectorView<2, Scalar> x,
@@ -693,41 +1163,100 @@ void test_evaluate_jacobian_autodiff_static_cache() {
   };
   auto problem = make_problem<2, 2>(residual);
   Options options;
-  options.jacobian_mode = JacobianMode::AutoDiff;
   Result result;
   LMWorkspace<2, 2> workspace;
   const std::array<double, 2> x0{2.0, 3.0};
   LMSolveContext context(problem, options, result, workspace, x0);
 
   std::ranges::copy(context.x, workspace.x_current.view().begin());
-  if (auto jacobian_result = evaluate_jacobian(context); !jacobian_result) {
+  if (auto jacobian_result = evaluate_jacobian<AutoDiffJacobian>(context);
+      !jacobian_result) {
     fail(jacobian_result.error().message);
   }
 
   workspace.x_current[0] = 4.0;
   workspace.x_current[1] = 5.0;
-  if (auto jacobian_result = evaluate_jacobian(context); !jacobian_result) {
+  if (auto jacobian_result = evaluate_jacobian<AutoDiffJacobian>(context);
+      !jacobian_result) {
     fail(jacobian_result.error().message);
   }
 
   expect_close(workspace.r[0], 26.0, 1e-12, 1e-12,
-               "cached static AutoDiff should evaluate the new residual");
+               "direct-dual AutoDiff should evaluate the new residual");
   expect_close(workspace.r[1], 20.0, 1e-12, 1e-12,
-               "cached static AutoDiff should evaluate the new residual");
+               "direct-dual AutoDiff should evaluate the new residual");
   expect_close(workspace.J(0, 0), 8.0, 1e-12, 1e-12,
-               "cached static AutoDiff should update dr0/dx0");
+               "direct-dual AutoDiff should update dr0/dx0");
   expect_close(workspace.J(1, 0), 5.0, 1e-12, 1e-12,
-               "cached static AutoDiff should update dr1/dx0");
+               "direct-dual AutoDiff should update dr1/dx0");
   expect_close(workspace.J(0, 1), 2.0, 1e-12, 1e-12,
-               "cached static AutoDiff should update dr0/dx1");
+               "direct-dual AutoDiff should update dr0/dx1");
   expect_close(workspace.J(1, 1), 4.0, 1e-12, 1e-12,
-               "cached static AutoDiff should update dr1/dx1");
-  expect_equal(recordings, Index{1},
-               "cached static AutoDiff should record the graph once");
+               "direct-dual AutoDiff should update dr1/dx1");
+  expect_equal(
+      recordings, Index{2},
+      "direct-dual AutoDiff should invoke the residual per evaluation");
+  expect_equal(context.autodiff_cache.graph.nodes.size(), Index{0},
+               "direct-dual AutoDiff should not record a graph");
   expect_equal(result.function_evaluations, Index{2},
-               "cached static AutoDiff should count both evaluations");
+               "direct-dual AutoDiff should count both evaluations");
   expect_equal(result.jacobian_evaluations, Index{2},
-               "cached static AutoDiff should count both Jacobians");
+               "direct-dual AutoDiff should count both Jacobians");
+}
+
+void test_evaluate_jacobian_autodiff_static_large_cache() {
+  Index recordings = 0;
+  auto residual =
+      [&recordings]<class Scalar>(ConstVectorView<17, Scalar> x,
+                                  VectorView<2, Scalar> r) -> ErrorOrVoid {
+    ++recordings;
+    r[0] = x[0] * x[0] + 2.0 * x[1];
+    r[1] = x[0] * x[1];
+    return {};
+  };
+  auto problem = make_problem<2, 17>(residual);
+  Options options;
+  Result result;
+  LMWorkspace<2, 17> workspace;
+  const std::array<double, 17> x0{2.0, 3.0};
+  LMSolveContext context(problem, options, result, workspace, x0);
+
+  std::ranges::copy(context.x, workspace.x_current.view().begin());
+  if (auto jacobian_result = evaluate_jacobian<AutoDiffJacobian>(context);
+      !jacobian_result) {
+    fail(jacobian_result.error().message);
+  }
+
+  workspace.x_current[0] = 4.0;
+  workspace.x_current[1] = 5.0;
+  if (auto jacobian_result = evaluate_jacobian<AutoDiffJacobian>(context);
+      !jacobian_result) {
+    fail(jacobian_result.error().message);
+  }
+
+  expect_close(workspace.r[0], 26.0, 1e-12, 1e-12,
+               "cached large static AutoDiff should evaluate the new residual");
+  expect_close(workspace.r[1], 20.0, 1e-12, 1e-12,
+               "cached large static AutoDiff should evaluate the new residual");
+  expect_close(workspace.J(0, 0), 8.0, 1e-12, 1e-12,
+               "cached large static AutoDiff should update dr0/dx0");
+  expect_close(workspace.J(1, 0), 5.0, 1e-12, 1e-12,
+               "cached large static AutoDiff should update dr1/dx0");
+  expect_close(workspace.J(0, 1), 2.0, 1e-12, 1e-12,
+               "cached large static AutoDiff should update dr0/dx1");
+  expect_close(workspace.J(1, 1), 4.0, 1e-12, 1e-12,
+               "cached large static AutoDiff should update dr1/dx1");
+  expect_close(
+      workspace.J(0, 16), 0.0, 1e-12, 1e-12,
+      "cached large static AutoDiff should differentiate unused inputs");
+  expect_equal(recordings, Index{1},
+               "cached large static AutoDiff should record the graph once");
+  expect_true(context.autodiff_cache.recorded,
+              "large static AutoDiff should activate the graph cache");
+  expect_equal(result.function_evaluations, Index{2},
+               "cached large static AutoDiff should count both evaluations");
+  expect_equal(result.jacobian_evaluations, Index{2},
+               "cached large static AutoDiff should count both Jacobians");
 }
 
 void test_evaluate_jacobian_autodiff_dynamic_cache() {
@@ -744,20 +1273,21 @@ void test_evaluate_jacobian_autodiff_dynamic_cache() {
   };
   auto problem = make_dynamic_problem(3, 2, residual);
   Options options;
-  options.jacobian_mode = JacobianMode::AutoDiff;
   Result result;
   LMWorkspace<std::dynamic_extent, std::dynamic_extent> workspace;
   const std::vector<double> x0{2.0, 3.0};
   LMSolveContext context(problem, options, result, workspace, x0);
 
   std::ranges::copy(context.x, workspace.x_current.view().begin());
-  if (auto jacobian_result = evaluate_jacobian(context); !jacobian_result) {
+  if (auto jacobian_result = evaluate_jacobian<AutoDiffJacobian>(context);
+      !jacobian_result) {
     fail(jacobian_result.error().message);
   }
 
   workspace.x_current[0] = 4.0;
   workspace.x_current[1] = 5.0;
-  if (auto jacobian_result = evaluate_jacobian(context); !jacobian_result) {
+  if (auto jacobian_result = evaluate_jacobian<AutoDiffJacobian>(context);
+      !jacobian_result) {
     fail(jacobian_result.error().message);
   }
 
@@ -796,14 +1326,14 @@ void test_evaluate_jacobian_autodiff_literal_residual() {
   };
   auto problem = make_problem<2, 1>(residual);
   Options options;
-  options.jacobian_mode = JacobianMode::AutoDiff;
   Result result;
   LMWorkspace<2, 1> workspace;
   const std::array<double, 1> x0{1.25};
   LMSolveContext context(problem, options, result, workspace, x0);
 
   std::ranges::copy(context.x, workspace.x_current.view().begin());
-  if (auto jacobian_result = evaluate_jacobian(context); !jacobian_result) {
+  if (auto jacobian_result = evaluate_jacobian<AutoDiffJacobian>(context);
+      !jacobian_result) {
     fail(jacobian_result.error().message);
   }
 
@@ -824,14 +1354,13 @@ void test_evaluate_jacobian_autodiff_double_only_residual() {
   };
   auto problem = make_problem<1, 1>(residual);
   Options options;
-  options.jacobian_mode = JacobianMode::AutoDiff;
   Result result;
   LMWorkspace<1, 1> workspace;
   const std::array<double, 1> x0{1.25};
   LMSolveContext context(problem, options, result, workspace, x0);
 
   std::ranges::copy(context.x, workspace.x_current.view().begin());
-  const auto jacobian_result = evaluate_jacobian(context);
+  const auto jacobian_result = evaluate_jacobian<AutoDiffJacobian>(context);
 
   expect_true(!jacobian_result,
               "AutoDiff should reject a double-only residual callback");
@@ -854,14 +1383,14 @@ void test_evaluate_jacobian_autodiff_mixed_extents() {
   };
   auto problem = make_problem_dynamic_residuals<1>(2, residual);
   Options options;
-  options.jacobian_mode = JacobianMode::AutoDiff;
   Result result;
   LMWorkspace<std::dynamic_extent, 1> workspace;
   const std::array<double, 1> x0{1.25};
   LMSolveContext context(problem, options, result, workspace, x0);
 
   std::ranges::copy(context.x, workspace.x_current.view().begin());
-  if (auto jacobian_result = evaluate_jacobian(context); !jacobian_result) {
+  if (auto jacobian_result = evaluate_jacobian<AutoDiffJacobian>(context);
+      !jacobian_result) {
     fail(jacobian_result.error().message);
   }
 
@@ -980,14 +1509,14 @@ void test_extended_primitives_scalar_generic_residual() {
   };
   auto problem = make_problem<3, 2>(residual);
   Options options;
-  options.jacobian_mode = JacobianMode::AutoDiff;
   Result result;
   LMWorkspace<3, 2> workspace;
   const std::array<double, 2> x0{1.5, 0.75};
   LMSolveContext context(problem, options, result, workspace, x0);
 
   std::ranges::copy(context.x, workspace.x_current.view().begin());
-  if (auto jacobian_result = evaluate_jacobian(context); !jacobian_result) {
+  if (auto jacobian_result = evaluate_jacobian<AutoDiffJacobian>(context);
+      !jacobian_result) {
     fail(jacobian_result.error().message);
   }
 
@@ -1032,13 +1561,12 @@ void test_pow_domain_errors() {
   };
   auto problem = make_problem<1, 1>(residual);
   Options options;
-  options.jacobian_mode = JacobianMode::AutoDiff;
   Result result;
   LMWorkspace<1, 1> workspace;
   LMSolveContext context(problem, options, result, workspace, parameters);
 
   std::ranges::copy(context.x, workspace.x_current.view().begin());
-  const auto jacobian_result = evaluate_jacobian(context);
+  const auto jacobian_result = evaluate_jacobian<AutoDiffJacobian>(context);
   expect_true(
       !jacobian_result,
       "pow domain failure should propagate through Jacobian evaluation");
@@ -1049,6 +1577,13 @@ void test_pow_domain_errors() {
 } // namespace
 
 int main() {
+  test_runtime_option_validation();
+  test_dual_arithmetic_and_math();
+  test_dual_pow_domain_error();
+  test_evaluate_residual_dual_static();
+  test_evaluate_residual_dual_dynamic_residuals();
+  test_evaluate_residual_dual_errors();
+  test_graph_and_direct_dual_policies_agree();
   test_node_key_equality_and_hash();
   test_constant_interning();
   test_variable_interning();
@@ -1069,7 +1604,8 @@ int main() {
   test_evaluate_roots_forward_dynamic_tail_block();
   test_evaluate_jacobian_autodiff_static_problem();
   test_evaluate_jacobian_autodiff_dynamic_problem();
-  test_evaluate_jacobian_autodiff_static_cache();
+  test_evaluate_jacobian_autodiff_static_direct_dual();
+  test_evaluate_jacobian_autodiff_static_large_cache();
   test_evaluate_jacobian_autodiff_dynamic_cache();
   test_evaluate_jacobian_autodiff_literal_residual();
   test_evaluate_jacobian_autodiff_double_only_residual();

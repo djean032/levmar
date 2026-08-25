@@ -13,6 +13,10 @@ option(LEVMAR_BUILD_CONFORMANCE_RUNNER
        "Build the NIST conformance runner executable" ON)
 set(LEVMAR_BENCHMARK_COMPILE_OPTIONS "" CACHE STRING
     "Additional compile options for benchmark targets")
+if(LEVMAR_BENCHMARK_COMPILE_OPTIONS)
+  separate_arguments(levmar_benchmark_compile_options NATIVE_COMMAND
+                     "${LEVMAR_BENCHMARK_COMPILE_OPTIONS}")
+endif()
 
 add_library(levmar INTERFACE)
 add_library(levmar::levmar ALIAS levmar)
@@ -32,8 +36,6 @@ if(LEVMAR_BUILD_CONFORMANCE_RUNNER)
     target_compile_options(levmar_nist_runner PRIVATE -ffp-contract=off)
   endif()
   if(LEVMAR_BENCHMARK_COMPILE_OPTIONS)
-    separate_arguments(levmar_benchmark_compile_options NATIVE_COMMAND
-                       "${LEVMAR_BENCHMARK_COMPILE_OPTIONS}")
     target_compile_options(levmar_nist_runner PRIVATE
                            ${levmar_benchmark_compile_options})
   endif()
@@ -43,6 +45,19 @@ add_executable(levmar_autodiff_graph_tests tests/autodiff_graph_tests.cpp)
 target_link_libraries(levmar_autodiff_graph_tests PRIVATE levmar::levmar)
 
 add_test(NAME levmar_autodiff_graph_tests COMMAND levmar_autodiff_graph_tests)
+
+add_executable(levmar_dual_extraction_benchmark
+               tests/dual_extraction_benchmark.cpp)
+target_link_libraries(levmar_dual_extraction_benchmark PRIVATE levmar::levmar)
+
+if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
+  target_compile_options(levmar_dual_extraction_benchmark PRIVATE
+                         -ffp-contract=off)
+endif()
+if(LEVMAR_BENCHMARK_COMPILE_OPTIONS)
+  target_compile_options(levmar_dual_extraction_benchmark PRIVATE
+                         ${levmar_benchmark_compile_options})
+endif()
 
 install(TARGETS levmar EXPORT levmarTargets)
 

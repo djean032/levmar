@@ -6,7 +6,9 @@
 #include <string_view>
 #include <vector>
 
-#include <levmar/internal/autodiff/forward.h>
+#include <levmar/internal/autodiff/dual_forward.h>
+#include <levmar/internal/autodiff/graph_forward.h>
+#include <levmar/internal/core.h>
 #include <levmar/internal/problem.h>
 #include <levmar/internal/storage.h>
 
@@ -36,7 +38,8 @@ template <Index M, Index N> struct LMWorkspace {
   Index m = (M == std::dynamic_extent ? 0 : M);
   Index n = (N == std::dynamic_extent ? 0 : N);
 
-  AdEvalContext ad_eval;
+  AdEvalContext graph_eval;
+  DualEvalContext<M, N> dual_eval;
 
   VectorStorage<N> x_current;
   VectorStorage<N> x_trial;
@@ -168,7 +171,7 @@ template <Index M, Index N, ResidualCallable<M, N> Residual, class Jacobian>
   requires OptionalJacobianCallable<Jacobian, M, N>
 [[nodiscard]] inline ErrorOrVoid
 validate_context(const LMSolveContext<M, N, Residual, Jacobian> &context) {
-  if (auto problem_result = validate_problem(context.problem, context.options);
+  if (auto problem_result = validate_problem(context.problem);
       !problem_result) {
     return problem_result;
   }

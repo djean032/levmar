@@ -15,7 +15,8 @@ template <Index M, Index N, ResidualCallable<M, N> Residual, class Jacobian>
   const auto &options = context.options;
   auto &work = context.work;
 
-  const double rel_step = resolved_finite_difference_step(options);
+  const double rel_step =
+      resolved_finite_difference_step<ForwardDifferenceJacobian>(options);
   auto x_current = work.x_current.view();
   auto x_trial = work.x_trial.view();
   auto r = work.r.view();
@@ -75,7 +76,8 @@ template <Index M, Index N, ResidualCallable<M, N> Residual, class Jacobian>
   const auto &options = context.options;
   auto &work = context.work;
 
-  const double rel_step = resolved_finite_difference_step(options);
+  const double rel_step =
+      resolved_finite_difference_step<CentralDifferenceJacobian>(options);
   auto x_current = work.x_current.view();
   auto x_trial = work.x_trial.view();
   auto r_trial = work.r_trial.view();

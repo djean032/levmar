@@ -12,7 +12,14 @@
 
 inline constexpr std::size_t kTangentBlockWidth = 8;
 
-template <std::size_t W> using TangentBlock = std::array<double, W>;
+template <std::size_t W> struct alignas(64) TangentBlock {
+  std::array<double, W> lanes{};
+
+  double &operator[](std::size_t lane) { return lanes[lane]; }
+  const double &operator[](std::size_t lane) const { return lanes[lane]; }
+
+  void fill(double value) { lanes.fill(value); }
+};
 
 struct AdEvalContext {
   std::vector<double> values;
@@ -159,10 +166,11 @@ inline void forward_tangent_pass(const AdGraph &graph, Index parameter_index,
     case NodeKind::Cos:
       ctx.tangents[id] = -std::sin(ctx.values[node.a]) * ctx.tangents[node.a];
       break;
-    case NodeKind::Tan:
-      ctx.tangents[id] =
-          ctx.tangents[node.a] / std::pow(std::cos(ctx.values[node.a]), 2);
+    case NodeKind::Tan: {
+      const double cosine = std::cos(ctx.values[node.a]);
+      ctx.tangents[id] = ctx.tangents[node.a] / (cosine * cosine);
       break;
+    }
     case NodeKind::Log1p:
       ctx.tangents[id] = ctx.tangents[node.a] / (1 + ctx.values[node.a]);
       break;
@@ -273,7 +281,7 @@ inline void forward_tangent_block(const AdGraph &graph, Index first_parameter,
     }
     case NodeKind::Sqrt: {
       const auto &a = ctx.tangent_blocks[node.a];
-      const double denominator = 2.0 * std::sqrt(ctx.values[node.a]);
+      const double denominator = 2.0 * ctx.values[id];
       for (Index lane = 0; lane < W; ++lane) {
         out[lane] = a[lane] / denominator;
       }

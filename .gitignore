@@ -71,3 +71,4 @@ vcpkg_installed/
 Testing/
 .cache/
 /conformance/nist_nls/generator/__pycache__
+/scripts

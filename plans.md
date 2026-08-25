@@ -14,19 +14,24 @@ Current direction:
 1. Keep the DAG autodiff engine internal to `levmar/lm.h`.
 2. Keep the public least-squares API `double`-based.
 3. Keep generic `Scalar` plumbing only in storage/view utilities.
-4. Use the unified DAG-based autodiff engine for all internal AD backends.
-5. Support both static and dynamic parameter extents from the start.
-6. Build graphs per evaluation until benchmark data justifies persistent graph
-   storage.
-7. Use scalar forward mode as the initial backend; add blocked forward and
-   reverse mode only after solver workloads are measurable.
+4. Use the cached DAG as the general AutoDiff backend for all dynamic parameter
+   extents and static parameter counts above 16.
+5. Use eager `Dual<N>` forward mode for static parameter counts up to 16.
+6. Record graph topology once per solve context and reuse it across Jacobian
+   evaluations.
+7. Keep all eager dual derivative storage fixed-size; do not introduce
+   `Dual<std::dynamic_extent>` or vector-owned derivative arrays.
 8. Avoid introducing a program-wide allocator or runtime framework.
 
 The immediate implementation target is:
-1. complete the AD primitive set needed by representative residual models
-2. implement a robust, minimal Levenberg-Marquardt solve loop
-3. validate solver convergence and AD Jacobians against the existing corpus
-4. benchmark before optimizing graph construction or derivative passes
+1. add the `solve<Policy>(context)` entry point, policy validation, and QR
+   workspace required by the first solver
+2. implement backend-specialized solver loops with no configuration dispatch in
+   their iteration loops
+3. implement a robust, minimal Levenberg-Marquardt solve loop
+4. validate solver convergence against the existing corpus
+5. measure solve-like graph and dual workloads before optimizing derivative
+   passes or adding further backends
 
 ## Current Status
 
@@ -52,7 +57,7 @@ Completed:
 15. added internal residual autodiff bridge types and helpers:
     `AdParamView`, `AdResidualSlot`, `AdResidualSink`, and
     `invoke_residual_autodiff(...)`
-16. added `work.ad_eval` to `LMWorkspace`
+16. added graph evaluation workspace state to `LMWorkspace`
 17. implemented `evaluate_autodiff_residual_and_jacobian(...)`
 18. wired `JacobianMode::AutoDiff` into `evaluate_jacobian(...)`
 19. added a dedicated zero-dependency graph-construction and forward-mode unit
@@ -64,28 +69,152 @@ Completed:
    commutative normalization, topological node creation, `value_slot == node_id`,
    literal lifting, operator-built graph reuse, single-root value evaluation,
    multi-root shared-subexpression value evaluation, scalar tangent
-   derivatives for single-root and multi-root graphs, and full residual/Jacobian
-   extraction through `evaluate_roots_forward(...)`
+    derivatives for single-root and multi-root graphs, and full residual/Jacobian
+    extraction through `evaluate_roots_forward(...)`
+22. added eager `Dual<N>` arithmetic, scalar-lifting, and math overloads through
+    `pow` and `atan2`
+23. added direct-dual evaluation state, fixed-size input seeding, and residual/
+    Jacobian extraction through `evaluate_residual_dual(...)`
+24. added direct-dual coverage for arithmetic, math, static and dynamic residual
+    extents, context reuse, callback errors, and `pow` domain errors
+25. reorganized AutoDiff headers into parallel graph and dual construction,
+    execution, and bridge layers
+26. added compile-time graph and direct-dual Jacobian policies:
+    `GraphAutoDiffJacobian` and `DirectDualJacobian`
+27. selected the direct-dual policy for static `N <= 16` and the cached graph
+    policy for static `N > 16` and all dynamic parameter extents
+28. added graph-versus-direct-dual correctness coverage, including cached graph
+    reuse and identical residual/Jacobian results
+29. split NIST benchmark and accuracy reporting into analytic, graph, and
+    direct-dual results; unsupported dynamic direct-dual cells report `N/A`
+30. added a direct-dual Jacobian extraction microbenchmark for widths 2, 4, 8,
+    and 16; the current column-major extraction is competitive for widths 8
+    and 16, while a simple stack-tiled transpose is consistently slower
+31. added compile-time solver policy tags and `SolverPolicy`, separating
+    Jacobian source, strategy, linear algebra, loss, and scaling from runtime
+    numeric options
+32. migrated user, finite-difference, and AutoDiff Jacobian evaluation to
+    policy-templated dispatch with no runtime Jacobian-mode switch
+33. added static policy compatibility checks and diagnostics for callback
+    compatibility, direct-dual selection, and fixed-extent QR shape
+34. added runtime numeric-option validation and coverage for budgets,
+    tolerances, finite-difference settings, and damping bounds
 
 Next:
-1. Harden the AD bridge: report invalid residual-root assignment and invalid
-   graph inputs as errors in release builds, and give incompatible residuals a
-   clear AutoDiff-specific diagnostic.
-2. Add `Div`, `Log`, `Sqrt`, `Sin`, `Cos`, and `Tan`, with primal, forward, and
-   test coverage added together. Define the domain behavior for `Pow` before
-   adding it.
-3. Add AutoDiff conformance and timing coverage for AD-capable models across
-   static, dynamic, and mixed extents.
-4. Implement a minimal squared-loss Levenberg-Marquardt solve path: cost and
-   gradient construction, scaling, a damped QR step, trial-step acceptance,
+1. Add `solve<Policy>(context)`, invoke static and runtime policy validation,
+   add dynamic QR shape validation, and extend solver workspace/result state.
+2. Implement the dependency-free damped QR policy and a policy-specialized
+   minimal Levenberg-Marquardt solve path: cost
+   and gradient construction, scaling, a damped QR step, trial-step acceptance,
    damping updates, termination checks, and evaluation budgets.
-5. Add NIST start-point convergence tests plus targeted failure tests for
-   rank-deficiency, rejected steps, nonfinite values, and callback errors.
-6. Measure graph-build and derivative-pass costs in solve-like workloads before
-   adding persistent graphs, blocked forward mode, or reverse mode.
+3. Add NIST start-point convergence and solver failure-mode tests.
+4. Benchmark solve-like graph and direct-dual workloads before adding persistent
+   graphs, dynamic direct duals, or reverse mode.
+5. Decide the default and optional linear-algebra policies after the minimal
+   solver has a measured baseline.
 
-Conflicting earlier plans about eager dual storage, arena-backed temp
-gradients, or reverse-mode-first execution are superseded by this document.
+Conflicting earlier plans about a DAG-only AutoDiff architecture, vector-owned
+eager dual derivatives, arena-backed temp gradients, or reverse-mode-first
+execution are superseded by this document.
+
+## Solver Execution Policy
+
+All solver decisions are encoded by the `solve<Policy>(context)` template
+argument, rather than runtime `Options` fields.
+
+1. A solver policy consists of Jacobian, strategy, linear-algebra, loss, and
+   scaling policy types.
+2. The selected solver loop is specialized on all five policy types.
+3. Static AutoDiff policy resolution selects eager direct dual for static
+   `N <= 16` and the cached graph otherwise.
+4. Context setup activates the selected graph context once before iteration;
+   direct dual requires no activation.
+5. Runtime options retain numerical values only: tolerances, iteration and
+   evaluation budgets, finite-difference step, and damping parameters.
+6. Future selected user-loss and user-scaling policies receive their callback
+   and numeric data through runtime options.
+
+The intended shape is:
+
+```cpp
+using Policy = SolverPolicy<AutoDiffPolicy, LevenbergMarquardtStrategy,
+                            DampedQrLinearAlgebra, SquaredLoss, NoScaling>;
+solve<Policy>(context);
+```
+
+### Static Compatibility
+
+`solve<Policy>(context)` validates policy and static problem compatibility at
+compile time. A separately testable `kStaticSolverConfigurationValid<Policy,
+Context>` predicate supports both positive and negative `static_assert` tests.
+
+Initial rules:
+1. the first solver accepts only Levenberg-Marquardt, damped QR, squared loss,
+   and no scaling
+2. a user-Jacobian policy requires a user Jacobian callback
+3. an AutoDiff policy requires a scalar-generic residual callback
+4. the initial QR policy requires `M >= N` when both extents are static
+5. direct dual is valid only for static `N <= 16`; larger static and dynamic
+   parameter extents resolve to the graph policy
+
+Dynamic problem shape and runtime callback state cannot be checked at compile
+time. The initial QR policy therefore rejects dynamic `m < n` at runtime.
+`validate_runtime_options<Policy>(...)` checks only the numeric controls used by
+the selected policy.
+
+### Hot-Loop Rule
+
+The iteration loop contains no backend enum switches, variant visitation,
+function-pointer calls, virtual dispatch, or Jacobian-mode switches. Runtime
+checks remain only where mathematically required: convergence, trial-step
+acceptance or rejection, numerical failure, evaluation limits, and comparisons
+against user-configured tolerances.
+
+The graph or dual context is activated before the solver loop begins and passed
+to the selected specialization directly. No runtime dispatcher, variant, or
+function pointer selects a solver policy.
+
+### Direct Dual Extent Policy
+
+`Dual<N>` always stores derivative lanes in `std::array<double, N>`.
+
+1. Static `N <= 16` uses eager `Dual<N>` in one residual evaluation.
+2. Static `N > 16` uses the cached DAG.
+3. Dynamic `N` uses the cached DAG initially.
+4. Do not implement `Dual<std::dynamic_extent>` or vector-owned eager dual
+   derivatives.
+
+If benchmarks later show a gain for small dynamic parameter counts, add a
+Ceres-style chunked direct-dual path:
+
+1. Dynamic `N <= 8`: one pass using `Dual<8>`.
+2. Dynamic `N <= 16`: two passes using `Dual<8>`.
+3. Dynamic `N > 16`: cached DAG.
+
+Unused lanes are zero-seeded and omitted while extracting the Jacobian tail
+block.
+
+## Jacobian Layout And Linear Algebra
+
+Keep the public and workspace Jacobian layout column-major.
+
+1. Analytic callbacks already write directly to column-major `J`.
+2. Graph and direct-dual evaluation both pay unavoidable `O(M * N)` Jacobian
+   output traffic when materializing `J`.
+3. Direct dual reads derivative lanes with a residual-major stride while
+   writing contiguous Jacobian columns. The measured extraction cost is small
+   for the current static widths; do not change the layout or add a tiled
+   transpose without a solver-profiled reason.
+4. A row-major Jacobian would make direct-dual and graph output filling more
+   natural, but it would impose a matrix conversion before native LAPACK QR.
+5. Native BLAS and LAPACK are column-major. Column-major `J` supports QR
+   directly and supports normal equations efficiently through `DSYRK` for
+   `J^T J` and `DGEMV` for `J^T r`.
+6. A future static direct-dual normal-equations policy may accumulate `J^T J`
+   and `J^T r` from residual derivative arrays without materializing `J`.
+   It remains optional because normal equations square the condition number.
+7. The concrete default, built-in normal-equations, and optional BLAS/LAPACK
+   policy choices are deferred until the minimal solver is measured.
 
 ## Public Solver Boundary
 
@@ -95,7 +224,7 @@ Keep unchanged:
 3. `ResidualCallable`
 4. `JacobianCallable`
 5. `LMSolveContext`
-6. `Options`
+6. `Options` as runtime numerical configuration
 7. `Result`
 8. plain residual and Jacobian callback shapes using `double`-based views
 
@@ -104,24 +233,31 @@ Policy:
 2. The autodiff engine is an internal implementation detail.
 3. The storage/view layer remains generic where it already is:
    `VectorView`, `MatrixView`, `VectorStorage`, `MatrixStorage`.
+4. Jacobian source, strategy, linear algebra, loss kind, and scaling are
+   compile-time solver-policy decisions, not `Options` fields.
+5. `Options` holds runtime numeric controls. Future user-loss and user-scaling
+   data are runtime inputs required only by their selected policy.
 
 ## Core AD Model
 
-Use a graph-based autodiff IR rather than eager dual propagation.
+Use two forward-mode implementations selected by parameter extent and measured
+cost.
 
 High-level model:
-1. Build one shared DAG of scalar operations.
-2. Keep a list of root nodes, one per residual/observation.
-3. Run one forward pass over the whole graph to compute scalar values.
-4. First backend:
-   run one tangent forward pass per parameter and read all roots to fill one
-   Jacobian column.
-5. Second backend:
-   run one tangent forward pass per parameter block of width `K`.
-6. Third backend:
-   run one reverse pass per root.
+1. The cached DAG records one shared graph of scalar operations, keeps root
+   nodes, and evaluates graph values and tangent blocks.
+2. Eager `Dual<N>` evaluates ordinary scalar-generic residual operations
+   directly, carrying a fixed derivative array through every operation.
+3. The graph backend:
+    run one tangent forward pass per parameter and read all roots to fill one
+    Jacobian column.
+4. The blocked graph backend:
+    run one tangent forward pass per parameter block of width `K`.
+5. A later graph backend:
+    run one reverse pass per root.
 
-The DAG is the shared IR for all backends.
+The DAG remains the general dynamic-extent backend. Eager dual is a separate
+fixed-extent direct backend and records no graph.
 
 ## Backend Roadmap
 
@@ -482,12 +618,13 @@ Stage 1 needs no dedicated Jacobian row staging for the forward backend.
 
 Policy:
 1. scalar forward mode writes `J` directly by columns
-2. `LMWorkspace` keeps existing solver state unchanged for now
+2. `LMWorkspace` owns the selected graph or direct-dual evaluation context
 3. if reverse mode later benefits from row staging, add that storage at the
    reverse-mode stage rather than forcing it into the first forward-mode phase
 
-Dynamic autodiff-specific storage from the old eager-dual design should be
-de-emphasized or removed as the DAG path lands.
+Direct-dual storage is fixed-width and owned by the selected dual evaluation
+context. Dynamic parameter counts remain on the DAG until a chunked direct-dual
+path is justified by benchmarks.
 
 ## Execution API Split
 
@@ -523,10 +660,9 @@ Current status:
 
 ## Static And Dynamic Support
 
-Support both static and dynamic parameter extents from the first
-implementation.
+The graph backend supports both static and dynamic parameter extents.
 
-Unified policy:
+Unified graph policy:
 1. same graph representation
 2. same node kinds
 3. same primal forward formulas
@@ -537,33 +673,34 @@ Only storage differs:
 1. static paths use fixed-size views/buffers where appropriate
 2. dynamic paths use runtime-sized views/buffers
 
-No split eager-dual architecture should be pursued in parallel with the DAG
-path.
+The eager dual policy is intentionally narrower:
+1. static `N <= 16` uses `Dual<N>` and fixed derivative arrays
+2. dynamic parameter counts use the graph until a benchmarked chunked dual path
+   is justified
 
-## Rebuild-Per-Eval First
+## Cached Graph Evaluation
 
-First implementation:
-1. rebuild the DAG per evaluation
-
-Reason:
-1. simpler correctness story
-2. no stale graph structure issues
-3. enough to prove the model
+Current implementation:
+1. record graph topology once per solve context
+2. reuse graph nodes, interning, and roots across Jacobian evaluations
+3. rebind current parameter values during graph forward evaluation
 
 Later optimization:
-1. persistent graph storage
-2. graph reuse across LM iterations
-3. eventual amortization of interning/build cost
+1. measure graph cache lifetime and invalidation behavior in full solve
+   workloads
+2. add explicit cache lifecycle controls only if users need them
 
-## Persistent Graph Storage Later
+## Cross-Solve Graph Reuse Later
 
 Long-term direction:
 1. separate graph shape from evaluation values
 2. keep topology and interning persistent
 3. rebind current parameter values per evaluation
-4. reuse roots and node structure across repeated solves
+4. reuse roots and node structure across separate solve contexts where the
+   residual shape is known to remain fixed
 
-This is a later optimization, not a prerequisite for correctness.
+The current cache is scoped to one solve context. Cross-solve reuse is a later
+optimization, not a prerequisite for correctness.
 
 ## Initial Implementation Subset
 
@@ -602,7 +739,7 @@ After primitive coverage and a minimal solver are stable:
    residual structure is fixed
 2. add blocked forward mode with width `K`, guided by benchmarks
 3. add reverse mode on the same graph for wide problems where `N > M`
-4. select the AD backend according to problem shape and measured cost
+4. benchmark a chunked `Dual<8>` path for dynamic parameter counts up to 16
 5. add robust losses, additional linear solvers, and solver strategies beyond
    Levenberg-Marquardt
 
@@ -630,14 +767,26 @@ After primitive coverage and a minimal solver are stable:
     `AutoDiff` dispatch through solver-facing helpers
 18. Done: Harden the fused autodiff integration path
 19. Done: Expand math coverage and add AD conformance coverage
-20. Implement the minimal Levenberg-Marquardt solve loop
-21. Add solver convergence and failure-mode tests
-22. Benchmark persistent graphs, blocked forward mode, and reverse mode before
-    implementing them
+20. Done: implement one-time AutoDiff context selection and Jacobian policies
+21. Done: add graph-versus-direct-dual correctness coverage
+22. Done: add analytic, graph, and direct-dual benchmark and accuracy reporting
+23. Done: benchmark direct-dual Jacobian extraction layouts
+24. Done: introduce compile-time solver policies and policy-templated Jacobian
+    evaluation; make `Options` runtime numeric configuration only
+25. Done: add static policy-compatibility and runtime numeric-option validation
+    tests
+26. Add `solve<Policy>(context)`, policy-validation integration, and QR
+    workspace/result groundwork
+27. Implement policy-specialized solver loops and the minimal
+    Levenberg-Marquardt solve loop
+28. Add solver convergence and failure-mode tests
+29. Benchmark solve-like graph and direct-dual workloads before implementing
+    further backends
 
 ## Deferred Until After This Work
 
 Only after the minimal solver and its validation are stable:
 1. persistent graph storage
-2. blocked-forward and reverse-mode backends
-3. robust losses, SVD, DogLeg, and TrustRegionLM
+2. chunked direct-dual support for dynamic parameter counts
+3. blocked-forward and reverse-mode graph backends
+4. robust losses, SVD, DogLeg, and TrustRegionLM

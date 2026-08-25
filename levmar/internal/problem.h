@@ -1,9 +1,10 @@
 #pragma once
 
+#include "levmar/internal/core.h"
+#include "levmar/internal/solver_policy.h"
 #include <algorithm>
 #include <cmath>
 #include <concepts>
-#include <functional>
 #include <limits>
 #include <type_traits>
 
@@ -62,6 +63,8 @@ template <Index M, Index N, ResidualCallable<M, N> Residual,
           class Jacobian = NoJacobian>
   requires OptionalJacobianCallable<Jacobian, M, N>
 struct [[nodiscard]] Problem {
+  using ResidualType = Residual;
+  using JacobianType = Jacobian;
   static constexpr Index residual_extent = M;
   static constexpr Index parameter_extent = N;
 
@@ -80,14 +83,6 @@ struct [[nodiscard]] Problem {
       : num_residuals(M == std::dynamic_extent ? m : M),
         num_parameters(N == std::dynamic_extent ? n : N), residual(residual_),
         jacobian(jacobian_) {}
-
-  bool has_user_jacobian() const {
-    if constexpr (std::is_same_v<Jacobian, NoJacobian>) {
-      return false;
-    } else {
-      return true;
-    }
-  }
 };
 
 template <Index M, Index N, ResidualCallable<M, N> Residual,
@@ -126,15 +121,6 @@ template <Index M, ResidualCallable<M, std::dynamic_extent> Residual,
                                                              jacobian);
 }
 
-struct LossOptions {
-  LossKind kind = LossKind::Squared;
-
-  double scale = 1.0;
-
-  std::function<bool(double s, double &rho0, double &rho1, double &rho2)>
-      user_loss;
-};
-
 struct LMOptions {
   double initial_lambda = 1e-3;
   double min_lambda = 1e-15;
@@ -142,13 +128,6 @@ struct LMOptions {
 };
 
 struct Options {
-  Strategy strategy = Strategy::LevenbergMarquardt;
-  LinearSolver linear_solver = LinearSolver::NormalEquationsCholesky;
-  JacobianMode jacobian_mode = JacobianMode::User;
-  ScalingMode scaling = ScalingMode::None;
-
-  LossOptions loss;
-
   Index max_iterations = 100;
   Index max_function_evaluations = 1000;
 
@@ -164,8 +143,7 @@ struct Options {
 template <Index M, Index N, ResidualCallable<M, N> Residual, class Jacobian>
   requires OptionalJacobianCallable<Jacobian, M, N>
 [[nodiscard]] inline ErrorOrVoid
-validate_problem(const Problem<M, N, Residual, Jacobian> &problem,
-                 const Options &options) {
+validate_problem(const Problem<M, N, Residual, Jacobian> &problem) {
   if (problem.num_residuals < 1) {
     return std::unexpected(Error{ErrorCode::InvalidProblem,
                                  "Problem must have at least one residual"});
@@ -191,44 +169,24 @@ validate_problem(const Problem<M, N, Residual, Jacobian> &problem,
                                    "static parameter extent"});
     }
   }
-
-  if (options.jacobian_mode == JacobianMode::User) {
-    if (!problem.has_user_jacobian()) {
-      return std::unexpected(Error{ErrorCode::InvalidProblem,
-                                   "JacobianMode::User requires a jacobian "
-                                   "function"});
-    }
-  }
-
-  if (options.jacobian_mode == JacobianMode::AutoDiff) {
-    if constexpr (!AutoDiffResidualCallable<Residual, M, N>) {
-      return std::unexpected(Error{
-          ErrorCode::InvalidProblem,
-          "JacobianMode::AutoDiff requires a scalar-generic Residual callback "
-          "using ConstVectorView<N, Scalar> and VectorView<M, Scalar>"});
-    }
-  }
-
   return {};
 }
 
+template <class JacobianPolicy>
 inline double resolved_finite_difference_step(const Options &options) {
   if (options.finite_difference_step > 0.0) {
     return options.finite_difference_step;
   }
 
-  switch (options.jacobian_mode) {
-  case JacobianMode::ForwardDifference:
+  if constexpr (std::same_as<JacobianPolicy, ForwardDifferenceJacobian>) {
     return std::sqrt(std::numeric_limits<double>::epsilon());
-  case JacobianMode::CentralDifference:
+  } else if constexpr (std::same_as<JacobianPolicy,
+                                    CentralDifferenceJacobian>) {
     return std::cbrt(std::numeric_limits<double>::epsilon());
-  case JacobianMode::User:
-    return 0.0;
-  case JacobianMode::AutoDiff:
+  } else {
     return 0.0;
   }
-  return std::sqrt(std::numeric_limits<double>::epsilon());
-}
+};
 
 inline double finite_difference_perturbation(double xj, double rel_step) {
   return rel_step * std::max(double{1.0}, std::abs(xj));
