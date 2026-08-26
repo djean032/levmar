@@ -5,10 +5,16 @@
 #include <cassert>
 #include <concepts>
 #include <cstdint>
+#include <limits>
 #include <unordered_map>
 #include <vector>
 
 #include <levmar/internal/core.h>
+
+namespace levmar::detail {
+
+using NodeId = Index;
+constexpr NodeId kInvalidNode = std::numeric_limits<Index>::max();
 
 enum class NodeKind {
   Constant,
@@ -378,3 +384,5 @@ inline AdExprRef operator/(T lhs, const AdExprRef &rhs) {
   assert(rhs.graph != nullptr);
   return constant(*rhs.graph, static_cast<double>(lhs)) / rhs;
 }
+
+} // namespace levmar::detail

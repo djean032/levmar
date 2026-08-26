@@ -1,10 +1,11 @@
 #pragma once
 
 #include <array>
-#include <ranges>
 #include <vector>
 
 #include <levmar/internal/core.h>
+
+namespace levmar::detail {
 
 template <Index Extent, class Scalar = double> struct VectorStorage {
   std::array<Scalar, Extent> storage{};
@@ -244,3 +245,5 @@ struct MatrixStorage<std::dynamic_extent, std::dynamic_extent, Scalar> {
 
   void fill(const Scalar &value) { std::ranges::fill(storage, value); }
 };
+
+} // namespace levmar::detail

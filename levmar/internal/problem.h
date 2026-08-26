@@ -8,7 +8,7 @@
 #include <limits>
 #include <type_traits>
 
-#include <levmar/internal/autodiff/graph.h>
+namespace levmar {
 
 template <Index M, Index N>
 using ResidualSignature = ErrorOrVoid(ConstVectorView<N> x, VectorView<M> r);
@@ -26,11 +26,6 @@ template <class Residual, Index M, Index N>
 concept ResidualCallable =
     ResidualCallableOn<Residual, ConstVectorView<N>, VectorView<M>>;
 
-template <class Residual, Index M, Index N>
-concept AutoDiffResidualCallable =
-    ResidualCallableOn<Residual, ConstVectorView<N, AdExprRef>,
-                       VectorView<M, AdExprRef>>;
-
 template <class Jacobian, class XView, class JView>
 concept JacobianCallableOn = requires(Jacobian jacobian, XView x, JView J) {
   { jacobian(x, J) } -> std::same_as<ErrorOrVoid>;
@@ -43,21 +38,6 @@ concept JacobianCallable =
 template <class Jacobian, Index M, Index N>
 concept OptionalJacobianCallable =
     std::same_as<Jacobian, NoJacobian> || JacobianCallable<Jacobian, M, N>;
-
-enum class JacobianMode {
-  User,
-  ForwardDifference,
-  CentralDifference,
-  AutoDiff
-};
-
-enum class Strategy { GaussNewton, LevenbergMarquardt, TrustRegionLM, DogLeg };
-
-enum class LinearSolver { NormalEquationsCholesky, QR, SVD };
-
-enum class LossKind { Squared, Huber, Cauchy, SoftL1, User };
-
-enum class ScalingMode { None, JacobianColumnNorm, User };
 
 template <Index M, Index N, ResidualCallable<M, N> Residual,
           class Jacobian = NoJacobian>
@@ -140,6 +120,10 @@ struct Options {
   LMOptions lm;
 };
 
+} // namespace levmar
+
+namespace levmar::detail {
+
 template <Index M, Index N, ResidualCallable<M, N> Residual, class Jacobian>
   requires OptionalJacobianCallable<Jacobian, M, N>
 [[nodiscard]] inline ErrorOrVoid
@@ -191,3 +175,5 @@ inline double resolved_finite_difference_step(const Options &options) {
 inline double finite_difference_perturbation(double xj, double rel_step) {
   return rel_step * std::max(double{1.0}, std::abs(xj));
 }
+
+} // namespace levmar::detail

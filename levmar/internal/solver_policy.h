@@ -1,5 +1,7 @@
 #pragma once
 
+namespace levmar {
+
 struct UserJacobian {};
 struct ForwardDifferenceJacobian {};
 struct CentralDifferenceJacobian {};
@@ -25,3 +27,5 @@ struct SolverPolicy {
 
 using DefaultSolverPolicy = SolverPolicy<UserJacobian, LevenbergMarquardt,
                                          DampedQr, SquaredLoss, NoScaling>;
+
+} // namespace levmar

@@ -46,19 +46,6 @@ target_link_libraries(levmar_autodiff_graph_tests PRIVATE levmar::levmar)
 
 add_test(NAME levmar_autodiff_graph_tests COMMAND levmar_autodiff_graph_tests)
 
-add_executable(levmar_dual_extraction_benchmark
-               tests/dual_extraction_benchmark.cpp)
-target_link_libraries(levmar_dual_extraction_benchmark PRIVATE levmar::levmar)
-
-if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
-  target_compile_options(levmar_dual_extraction_benchmark PRIVATE
-                         -ffp-contract=off)
-endif()
-if(LEVMAR_BENCHMARK_COMPILE_OPTIONS)
-  target_compile_options(levmar_dual_extraction_benchmark PRIVATE
-                         ${levmar_benchmark_compile_options})
-endif()
-
 install(TARGETS levmar EXPORT levmarTargets)
 
 install(

@@ -15,6 +15,9 @@
 
 namespace {
 
+using namespace levmar;
+using namespace levmar::detail;
+
 struct CorpusProblem {
   std::string name;
   std::string model_id;

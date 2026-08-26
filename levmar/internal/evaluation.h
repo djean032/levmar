@@ -9,6 +9,8 @@
 #include <levmar/internal/autodiff/jacobian_policy.h>
 #include <levmar/internal/finite_difference.h>
 
+namespace levmar::detail {
+
 template <class JacobianPolicy, Index M, Index N,
           ResidualCallable<M, N> Residual, class Jacobian>
   requires OptionalJacobianCallable<Jacobian, M, N>
@@ -46,3 +48,5 @@ evaluate_jacobian(LMSolveContext<M, N, Residual, Jacobian> &context,
     return evaluate_autodiff_residual_and_jacobian(context, what);
   }
 }
+
+} // namespace levmar::detail

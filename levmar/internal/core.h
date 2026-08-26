@@ -2,10 +2,11 @@
 
 #include <cstddef>
 #include <expected>
-#include <limits>
 #include <mdspan>
 #include <span>
 #include <string>
+
+namespace levmar {
 
 using Index = std::size_t;
 
@@ -19,8 +20,6 @@ struct Error {
 template <class T> using ErrorOr = std::expected<T, Error>;
 
 using ErrorOrVoid = ErrorOr<void>;
-using NodeId = Index;
-constexpr NodeId kInvalidNode = std::numeric_limits<Index>::max();
 
 struct NoJacobian {};
 
@@ -29,7 +28,10 @@ enum class TerminationReason {
   SmallStep,
   SmallGradient,
   SmallCostReduction,
-  MaxIterations
+  MaxIterations,
+  MaxFunctionEvaluations,
+  NumericalFailure,
+  DampingLimit
 };
 
 template <Index N, class Scalar = double>
@@ -45,3 +47,5 @@ using MatrixView =
 template <Index M, Index N, class Scalar = double>
 using ConstMatrixView =
     std::mdspan<const Scalar, std::extents<Index, M, N>, std::layout_left>;
+
+} // namespace levmar

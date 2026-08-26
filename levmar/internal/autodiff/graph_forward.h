@@ -10,6 +10,8 @@
 
 #include <levmar/internal/autodiff/graph.h>
 
+namespace levmar::detail {
+
 inline constexpr std::size_t kTangentBlockWidth = 8;
 
 template <std::size_t W> struct alignas(64) TangentBlock {
@@ -404,3 +406,5 @@ evaluate_roots_forward(const AdGraph &graph, std::span<const NodeId> roots,
   }
   return {};
 }
+
+} // namespace levmar::detail

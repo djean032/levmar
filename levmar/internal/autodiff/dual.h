@@ -6,6 +6,8 @@
 
 #include <levmar/internal/core.h>
 
+namespace levmar::detail {
+
 struct DualEvaluationState {
   bool pow_domain_error = false;
 };
@@ -266,3 +268,5 @@ template <Index N> constexpr Dual<N> pow(const Dual<N> &a, double b) {
 template <Index N> constexpr Dual<N> pow(double a, const Dual<N> &b) {
   return pow(Dual<N>{a}, b);
 }
+
+} // namespace levmar::detail

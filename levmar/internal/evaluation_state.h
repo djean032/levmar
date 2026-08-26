@@ -2,6 +2,7 @@
 
 #include <array>
 #include <limits>
+#include <span>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -11,6 +12,8 @@
 #include <levmar/internal/core.h>
 #include <levmar/internal/problem.h>
 #include <levmar/internal/storage.h>
+
+namespace levmar {
 
 struct Result {
   TerminationReason termination = TerminationReason::NotTerminated;
@@ -28,8 +31,14 @@ struct Result {
 
   double lambda = std::numeric_limits<double>::quiet_NaN();
 
+  std::vector<double> parameters;
+
   std::string message;
 };
+
+} // namespace levmar
+
+namespace levmar::detail {
 
 template <Index M, Index N> struct LMWorkspace {
   static constexpr Index residual_extent = M;
@@ -49,7 +58,6 @@ template <Index M, Index N> struct LMWorkspace {
   VectorStorage<M> r;
 
   MatrixStorage<M, N> J;
-  MatrixStorage<N, N> JTJ;
 
   VectorStorage<N> g;
   VectorStorage<N> step;
@@ -57,18 +65,27 @@ template <Index M, Index N> struct LMWorkspace {
   VectorStorage<N> scale;
   VectorStorage<M> weights;
 
-  LMWorkspace() = default;
+  LMWorkspace() {
+    scale.fill(1.0);
+    weights.fill(1.0);
+  }
 
-  LMWorkspace(Index m_runtime, Index n_runtime) {
+  LMWorkspace(Index m_runtime, Index n_runtime) : LMWorkspace() {
     resize(m_runtime, n_runtime);
   }
 
   void resize(Index m_runtime, Index n_runtime) {
+    const Index requested_m = M == std::dynamic_extent ? m_runtime : M;
+    const Index requested_n = N == std::dynamic_extent ? n_runtime : N;
+
+    if (m == requested_m && n == requested_n) {
+      return;
+    }
+
+    m = requested_m;
+    n = requested_n;
     if constexpr (M == std::dynamic_extent && N == std::dynamic_extent) {
-      m = m_runtime;
-      n = n_runtime;
       J.resize(m, n);
-      JTJ.resize(n, n);
       r.resize(m);
       r_trial.resize(m);
       r_trial_minus.resize(m);
@@ -79,26 +96,18 @@ template <Index M, Index N> struct LMWorkspace {
       step.resize(n);
       scale.resize(n);
     } else if constexpr (M == std::dynamic_extent) {
-      m = m_runtime;
-      n = N;
       J.resize(m);
       r.resize(m);
       r_trial.resize(m);
       r_trial_minus.resize(m);
       weights.resize(m);
     } else if constexpr (N == std::dynamic_extent) {
-      n = n_runtime;
-      m = M;
       J.resize(n);
-      JTJ.resize(n, n);
       x_current.resize(n);
       x_trial.resize(n);
       g.resize(n);
       step.resize(n);
       scale.resize(n);
-    } else {
-      n = N;
-      m = M;
     }
 
     scale.fill(1.0);
@@ -231,3 +240,5 @@ evaluate_residual(LMSolveContext<M, N, Residual, Jacobian> &context,
   return evaluate_residual_at(context, context.work.x_current.view(),
                               context.work.r.view(), what);
 }
+
+} // namespace levmar::detail

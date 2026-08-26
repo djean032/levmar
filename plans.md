@@ -99,18 +99,22 @@ Completed:
     compatibility, direct-dual selection, and fixed-extent QR shape
 34. added runtime numeric-option validation and coverage for budgets,
     tolerances, finite-difference settings, and damping bounds
+35. moved supported user contracts into `levmar` and implementation machinery
+    into `levmar::detail`; removed the obsolete temporary extraction benchmark
+    target
+36. added policy-owned solver workspace, solver context, initialization,
+    cost/gradient evaluation, and terminal result state
+37. implemented dependency-free damped QR through streamed Givens rotations,
+    without forming `J^T J`, with static and dynamic extent coverage
 
 Next:
-1. Add `solve<Policy>(context)`, invoke static and runtime policy validation,
-   add dynamic QR shape validation, and extend solver workspace/result state.
-2. Implement the dependency-free damped QR policy and a policy-specialized
-   minimal Levenberg-Marquardt solve path: cost
-   and gradient construction, scaling, a damped QR step, trial-step acceptance,
-   damping updates, termination checks, and evaluation budgets.
-3. Add NIST start-point convergence and solver failure-mode tests.
-4. Benchmark solve-like graph and direct-dual workloads before adding persistent
+1. Complete the policy-specialized Levenberg-Marquardt loop: trial residual
+   evaluation, gain-ratio acceptance, damping updates, termination checks, and
+   evaluation budgets.
+2. Add NIST start-point convergence and solver failure-mode tests.
+3. Benchmark solve-like graph and direct-dual workloads before adding persistent
    graphs, dynamic direct duals, or reverse mode.
-5. Decide the default and optional linear-algebra policies after the minimal
+4. Decide the default and optional linear-algebra policies after the minimal
    solver has a measured baseline.
 
 Conflicting earlier plans about a DAG-only AutoDiff architecture, vector-owned
@@ -174,6 +178,41 @@ The graph or dual context is activated before the solver loop begins and passed
 to the selected specialization directly. No runtime dispatcher, variant, or
 function pointer selects a solver policy.
 
+### LM Gain Ratio
+
+The initial Levenberg-Marquardt loop uses a trust-region gain ratio for trial
+step acceptance and damping updates. Let `step` be the full candidate step,
+`F(x) = 0.5 * ||r(x)||^2`, and `r_model = r + J * step`.
+
+```text
+actual_reduction = F(x) - F(x + step)
+predicted_reduction = 0.5 * (||r||^2 - ||r_model||^2)
+rho = actual_reduction / predicted_reduction
+```
+
+Accept only when `predicted_reduction > 0` and `rho > 0`; otherwise retain the
+current state and increase damping. The predicted reduction is computed from
+the linearized residual directly, without forming `J^T J`.
+
+Do not use the velocity-only identity
+`0.5 * step^T * (lambda * step - gradient)` as the general ratio denominator.
+It is valid for the unmodified damped LM velocity step, but not after a future
+geodesic-acceleration correction changes the candidate step.
+
+### Future Geodesic Acceleration
+
+Geodesic acceleration is deferred until the minimal LM loop and NIST
+convergence coverage are stable. It adds an acceleration correction to the LM
+velocity and retains the same gain-ratio acceptance logic, evaluated using the
+combined candidate step.
+
+1. enforce an acceleration guard such as
+   `||acceleration|| <= alpha * ||velocity||`
+2. reuse the damped QR factor for the acceleration linear solve
+3. compute `rho` from the total `velocity + acceleration` step
+4. add directional second-residual evaluation and its evaluation-budget
+   accounting before exposing the policy
+
 ### Direct Dual Extent Policy
 
 `Dual<N>` always stores derivative lanes in `std::array<double, N>`.
@@ -218,15 +257,16 @@ Keep the public and workspace Jacobian layout column-major.
 
 ## Public Solver Boundary
 
-Keep unchanged:
+Supported user API:
 1. `Problem<M, N, Residual, Jacobian>`
 2. `make_problem(...)` and dynamic variants
 3. `ResidualCallable`
 4. `JacobianCallable`
-5. `LMSolveContext`
-6. `Options` as runtime numerical configuration
-7. `Result`
+5. `Options` as runtime numerical configuration
+6. `Result`
+7. compile-time solver-policy tags and `SolverPolicy`
 8. plain residual and Jacobian callback shapes using `double`-based views
+9. future `solve(...)` entry points
 
 Policy:
 1. Public solver numerics remain `double`-based.
@@ -237,6 +277,9 @@ Policy:
    compile-time solver-policy decisions, not `Options` fields.
 5. `Options` holds runtime numeric controls. Future user-loss and user-scaling
    data are runtime inputs required only by their selected policy.
+6. `LMWorkspace`, `LMSolveContext`, direct evaluation helpers, storage, and
+   AutoDiff machinery live in `levmar::detail` until the public solver API is
+   available.
 
 ## Core AD Model
 
@@ -775,12 +818,14 @@ After primitive coverage and a minimal solver are stable:
     evaluation; make `Options` runtime numeric configuration only
 25. Done: add static policy-compatibility and runtime numeric-option validation
     tests
-26. Add `solve<Policy>(context)`, policy-validation integration, and QR
+26. Done: move supported contracts into `levmar` and implementation machinery
+    into `levmar::detail`
+27. Done: add `solve<Policy>(context)`, policy-validation integration, and QR
     workspace/result groundwork
-27. Implement policy-specialized solver loops and the minimal
+28. Implement policy-specialized solver loops and the minimal
     Levenberg-Marquardt solve loop
-28. Add solver convergence and failure-mode tests
-29. Benchmark solve-like graph and direct-dual workloads before implementing
+29. Add solver convergence and failure-mode tests
+30. Benchmark solve-like graph and direct-dual workloads before implementing
     further backends
 
 ## Deferred Until After This Work

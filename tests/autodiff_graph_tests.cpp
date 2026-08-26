@@ -1,6 +1,7 @@
 #include <levmar/internal/autodiff/dual.h>
 #include <levmar/internal/autodiff/dual_forward.h>
 #include <levmar/internal/evaluation.h>
+#include <levmar/internal/solver.h>
 #include <levmar/internal/solver_validation.h>
 
 #include <array>
@@ -11,8 +12,12 @@
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <vector>
 
 namespace {
+
+using namespace levmar;
+using namespace levmar::detail;
 
 struct StaticResidual {
   template <class Scalar>
@@ -1574,6 +1579,75 @@ void test_pow_domain_errors() {
                "Jacobian evaluation should preserve pow numerical failure");
 }
 
+template <Index M, Index N>
+double augmented_damped_qr_objective(const LMWorkspace<M, N> &work,
+                                     double lambda) {
+  double objective = 0.0;
+  for (Index i = 0; i < work.m; ++i) {
+    double residual = work.r[i];
+    for (Index j = 0; j < work.n; ++j) {
+      residual += work.J(i, j) * work.step[j];
+    }
+    objective += residual * residual;
+  }
+
+  for (Index j = 0; j < work.n; ++j) {
+    objective += lambda * work.step[j] * work.step[j];
+  }
+  return objective;
+}
+
+void test_damped_qr_static() {
+  LMWorkspace<3, 2> work;
+  DampedQrWorkspace<3, 2> qr;
+
+  work.J(0, 0) = 1.0;
+  work.J(1, 0) = 0.0;
+  work.J(2, 0) = 1.0;
+  work.J(0, 1) = 0.0;
+  work.J(1, 1) = 1.0;
+  work.J(2, 1) = 1.0;
+  work.r[0] = 1.0;
+  work.r[1] = 2.0;
+  work.r[2] = 3.0;
+
+  constexpr double lambda = 1.0;
+  expect_true(solve_damped_qr(work, qr, lambda),
+              "static damped QR should succeed");
+  expect_close(work.step[0], -0.875, 1e-12, 1e-12,
+               "static damped QR first step component");
+  expect_close(work.step[1], -1.375, 1e-12, 1e-12,
+               "static damped QR second step component");
+  expect_true(augmented_damped_qr_objective(work, lambda) < 14.0,
+              "static damped QR should lower the augmented objective");
+}
+
+void test_damped_qr_dynamic() {
+  LMWorkspace<std::dynamic_extent, std::dynamic_extent> work(3, 2);
+  DampedQrWorkspace<std::dynamic_extent, std::dynamic_extent> qr;
+  qr.resize(3, 2);
+
+  work.J(0, 0) = 1.0;
+  work.J(1, 0) = 0.0;
+  work.J(2, 0) = 1.0;
+  work.J(0, 1) = 0.0;
+  work.J(1, 1) = 1.0;
+  work.J(2, 1) = 1.0;
+  work.r[0] = 1.0;
+  work.r[1] = 2.0;
+  work.r[2] = 3.0;
+
+  constexpr double lambda = 1.0;
+  expect_true(solve_damped_qr(work, qr, lambda),
+              "dynamic damped QR should succeed");
+  expect_close(work.step[0], -0.875, 1e-12, 1e-12,
+               "dynamic damped QR first step component");
+  expect_close(work.step[1], -1.375, 1e-12, 1e-12,
+               "dynamic damped QR second step component");
+  expect_true(augmented_damped_qr_objective(work, lambda) < 14.0,
+              "dynamic damped QR should lower the augmented objective");
+}
+
 } // namespace
 
 int main() {
@@ -1613,5 +1687,7 @@ int main() {
   test_extended_primitives_forward();
   test_extended_primitives_scalar_generic_residual();
   test_pow_domain_errors();
+  test_damped_qr_static();
+  test_damped_qr_dynamic();
   return 0;
 }

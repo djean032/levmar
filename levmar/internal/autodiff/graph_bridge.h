@@ -10,6 +10,13 @@
 
 #include <levmar/internal/evaluation_state.h>
 
+namespace levmar::detail {
+
+template <class Residual, Index M, Index N>
+concept AutoDiffResidualCallable =
+    ResidualCallableOn<Residual, ConstVectorView<N, AdExprRef>,
+                       VectorView<M, AdExprRef>>;
+
 template <Index M, Index N, class Residual>
 ErrorOrVoid invoke_residual_autodiff(const Residual &residual, AdGraph &graph,
                                      std::array<AdExprRef, N> &x_exprs,
@@ -156,3 +163,5 @@ template <Index M, Index N, class Residual, class Jacobian>
       ConstVectorView<N>(work.x_current.data(), work.x_current.size()),
       work.r.view(), work.J.view(), work.graph_eval);
 }
+
+} // namespace levmar::detail

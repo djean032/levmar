@@ -7,6 +7,8 @@
 #include <levmar/internal/autodiff/dual_forward.h>
 #include <levmar/internal/autodiff/graph_bridge.h>
 
+namespace levmar::detail {
+
 template <Index N>
 inline constexpr bool kUsesDirectDualAutoDiff =
     N != std::dynamic_extent && N <= 16;
@@ -72,3 +74,5 @@ template <Index M, Index N, ResidualCallable<M, N> Residual, class Jacobian>
   ++context.result.jacobian_evaluations;
   return {};
 }
+
+} // namespace levmar::detail

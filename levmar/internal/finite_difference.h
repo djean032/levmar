@@ -6,6 +6,8 @@
 
 #include <levmar/internal/evaluation_state.h>
 
+namespace levmar::detail {
+
 template <Index M, Index N, ResidualCallable<M, N> Residual, class Jacobian>
   requires OptionalJacobianCallable<Jacobian, M, N>
 [[nodiscard]] inline ErrorOrVoid evaluate_forward_difference_jacobian(
@@ -133,3 +135,5 @@ template <Index M, Index N, ResidualCallable<M, N> Residual, class Jacobian>
   ++result.jacobian_evaluations;
   return {};
 }
+
+} // namespace levmar::detail

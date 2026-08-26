@@ -10,6 +10,8 @@
 #include <levmar/internal/problem.h>
 #include <levmar/internal/storage.h>
 
+namespace levmar::detail {
+
 template <Index M, Index N> struct DualEvalContext {};
 
 template <Index M, Index N>
@@ -85,3 +87,5 @@ template <Index M, Index N, class Residual>
 
   return {};
 }
+
+} // namespace levmar::detail

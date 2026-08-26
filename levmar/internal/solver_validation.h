@@ -10,6 +10,8 @@
 #include <levmar/internal/evaluation_state.h>
 #include <levmar/internal/solver_policy.h>
 
+namespace levmar::detail {
+
 template <class JacobianPolicy>
 inline constexpr bool kInitialJacobianPolicy =
     std::same_as<JacobianPolicy, UserJacobian> ||
@@ -168,3 +170,5 @@ ErrorOrVoid validate_runtime_options(const Options &options) {
 
   return {};
 }
+
+} // namespace levmar::detail

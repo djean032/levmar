@@ -88,16 +88,18 @@ target_link_libraries(my_app PRIVATE levmar::levmar)
 The public callback shapes are:
 
 ```cpp
-template <class Residual, Index M, Index N>
+template <class Residual, levmar::Index M, levmar::Index N>
 concept ResidualCallable =
-    requires(Residual residual, ConstVectorView<N> x, VectorView<M> r) {
-      { residual(x, r) } -> std::same_as<ErrorOrVoid>;
+    requires(Residual residual, levmar::ConstVectorView<N> x,
+             levmar::VectorView<M> r) {
+      { residual(x, r) } -> std::same_as<levmar::ErrorOrVoid>;
     };
 
-template <class Jacobian, Index M, Index N>
+template <class Jacobian, levmar::Index M, levmar::Index N>
 concept JacobianCallable =
-    requires(Jacobian jacobian, ConstVectorView<N> x, MatrixView<M, N> J) {
-      { jacobian(x, J) } -> std::same_as<ErrorOrVoid>;
+    requires(Jacobian jacobian, levmar::ConstVectorView<N> x,
+             levmar::MatrixView<M, N> J) {
+      { jacobian(x, J) } -> std::same_as<levmar::ErrorOrVoid>;
     };
 ```
 
@@ -114,6 +116,8 @@ Benchmark takeaway:
 ## Dynamic Example
 
 This is the most straightforward style. Dimensions are provided at runtime.
+The direct evaluation objects below are temporary implementation APIs; the
+future normal user path is `levmar::solve(...)`.
 
 ```cpp
 #include <levmar/lm.h>
@@ -126,17 +130,20 @@ int main() {
   const std::vector<double> x_data{0.25, 0.50, 0.75, 1.00};
   const std::vector<double> y_data{0.28, 0.39, 0.46, 0.51};
 
-  auto residual = [&](ConstVectorView<std::dynamic_extent> x,
-                      VectorView<std::dynamic_extent> r) -> ErrorOrVoid {
-    for (Index i = 0; i < x_data.size(); ++i) {
+  auto residual = [&](levmar::ConstVectorView<std::dynamic_extent> x,
+                      levmar::VectorView<std::dynamic_extent> r)
+      -> levmar::ErrorOrVoid {
+    for (levmar::Index i = 0; i < x_data.size(); ++i) {
       r[i] = x[0] * (1.0 - std::exp(-x[1] * x_data[i])) - y_data[i];
     }
     return {};
   };
 
-  auto jacobian = [&](ConstVectorView<std::dynamic_extent> x,
-                      MatrixView<std::dynamic_extent, std::dynamic_extent> J) -> ErrorOrVoid {
-    for (Index i = 0; i < x_data.size(); ++i) {
+  auto jacobian = [&](levmar::ConstVectorView<std::dynamic_extent> x,
+                      levmar::MatrixView<std::dynamic_extent,
+                                         std::dynamic_extent> J)
+      -> levmar::ErrorOrVoid {
+    for (levmar::Index i = 0; i < x_data.size(); ++i) {
       const double xv = x_data[i];
       const double e = std::exp(-x[1] * xv);
       J[i, 0] = 1.0 - e;
@@ -145,29 +152,33 @@ int main() {
     return {};
   };
 
-  auto problem = make_dynamic_problem(x_data.size(), 2, residual, jacobian);
+  auto problem = levmar::make_dynamic_problem(x_data.size(), 2, residual, jacobian);
 
-  Options options;
-  Result result;
-  LMWorkspace<std::dynamic_extent, std::dynamic_extent> work;
+  levmar::Options options;
+  levmar::Result result;
+  levmar::detail::LMWorkspace<std::dynamic_extent, std::dynamic_extent> work;
 
   const std::vector<double> beta0{0.9, 1.5};
-  LMSolveContext<std::dynamic_extent,
-                 std::dynamic_extent,
-                 decltype(residual),
-                 decltype(jacobian)> context(problem, options, result, work, beta0);
+  levmar::detail::LMSolveContext<std::dynamic_extent,
+                                 std::dynamic_extent,
+                                 decltype(residual),
+                                 decltype(jacobian)> context(
+      problem, options, result, work, beta0);
 
-  if (auto validation = validate_context(context); !validation) {
+  if (auto validation = levmar::detail::validate_context(context); !validation) {
     return 1;
   }
 
   std::ranges::copy(context.x, work.x_current.view().begin());
 
-  if (auto residual_result = evaluate_residual(context); !residual_result) {
+  if (auto residual_result = levmar::detail::evaluate_residual(context);
+      !residual_result) {
     return 1;
   }
 
-  if (auto jacobian_result = evaluate_jacobian(context); !jacobian_result) {
+  if (auto jacobian_result =
+          levmar::detail::evaluate_jacobian<levmar::UserJacobian>(context);
+      !jacobian_result) {
     return 1;
   }
 
@@ -190,15 +201,17 @@ int main() {
   constexpr std::array<double, 6> x_data{0.25, 0.50, 0.75, 1.00, 1.25, 1.50};
   constexpr std::array<double, 6> y_data{0.28, 0.39, 0.46, 0.51, 0.54, 0.56};
 
-  auto residual = [&](ConstVectorView<2> x, VectorView<6> r) -> ErrorOrVoid {
-    for (Index i = 0; i < 6; ++i) {
+  auto residual = [&](levmar::ConstVectorView<2> x, levmar::VectorView<6> r)
+      -> levmar::ErrorOrVoid {
+    for (levmar::Index i = 0; i < 6; ++i) {
       r[i] = x[0] * (1.0 - std::exp(-x[1] * x_data[i])) - y_data[i];
     }
     return {};
   };
 
-  auto jacobian = [&](ConstVectorView<2> x, MatrixView<6, 2> J) -> ErrorOrVoid {
-    for (Index i = 0; i < 6; ++i) {
+  auto jacobian = [&](levmar::ConstVectorView<2> x,
+                      levmar::MatrixView<6, 2> J) -> levmar::ErrorOrVoid {
+    for (levmar::Index i = 0; i < 6; ++i) {
       const double xv = x_data[i];
       const double e = std::exp(-x[1] * xv);
       J[i, 0] = 1.0 - e;
@@ -207,27 +220,30 @@ int main() {
     return {};
   };
 
-  auto problem = make_problem<6, 2>(residual, jacobian);
+  auto problem = levmar::make_problem<6, 2>(residual, jacobian);
 
-  Options options;
-  Result result;
-  LMWorkspace<6, 2> work;
+  levmar::Options options;
+  levmar::Result result;
+  levmar::detail::LMWorkspace<6, 2> work;
 
   const std::array<double, 2> beta0{0.9, 1.5};
-  LMSolveContext<6, 2, decltype(residual), decltype(jacobian)> context(
-      problem, options, result, work, beta0);
+  levmar::detail::LMSolveContext<6, 2, decltype(residual), decltype(jacobian)>
+      context(problem, options, result, work, beta0);
 
-  if (auto validation = validate_context(context); !validation) {
+  if (auto validation = levmar::detail::validate_context(context); !validation) {
     return 1;
   }
 
   std::ranges::copy(context.x, work.x_current.view().begin());
 
-  if (auto residual_result = evaluate_residual(context); !residual_result) {
+  if (auto residual_result = levmar::detail::evaluate_residual(context);
+      !residual_result) {
     return 1;
   }
 
-  if (auto jacobian_result = evaluate_jacobian(context); !jacobian_result) {
+  if (auto jacobian_result =
+          levmar::detail::evaluate_jacobian<levmar::UserJacobian>(context);
+      !jacobian_result) {
     return 1;
   }
 
@@ -237,8 +253,10 @@ int main() {
 
 ## Notes
 
-1. `ConstVectorView<N>` and `VectorView<M>` are thin aliases over `std::span`.
-2. `MatrixView<M, N>` is a thin alias over `std::mdspan` using `std::layout_left`.
-3. `x` is immutable input in `LMSolveContext`; the workspace owns `x_current` and `x_trial`.
-4. The examples above exercise residual and Jacobian evaluation directly. A
-   top-level `solve(...)` entry point is not implemented yet.
+1. `levmar::ConstVectorView<N>` and `levmar::VectorView<M>` are thin aliases
+   over `std::span`.
+2. `levmar::MatrixView<M, N>` is a thin alias over `std::mdspan` using
+   `std::layout_left`.
+3. `levmar::detail` is unsupported implementation API. The examples use it
+   only because a top-level `levmar::solve(...)` entry point is not implemented
+   yet.
