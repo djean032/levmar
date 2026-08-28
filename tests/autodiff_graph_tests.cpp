@@ -170,6 +170,11 @@ void test_runtime_option_validation() {
     options.cost_tolerance = value;
     expect_invalid.template operator()<DefaultSolverPolicy>(
         options, "invalid cost tolerance");
+
+    options = {};
+    options.relative_cost_tolerance = value;
+    expect_invalid.template operator()<DefaultSolverPolicy>(
+        options, "invalid relative cost tolerance");
   }
 
   for (const double value : invalid_tolerances) {
@@ -1209,61 +1214,6 @@ void test_evaluate_jacobian_autodiff_static_direct_dual() {
                "direct-dual AutoDiff should count both Jacobians");
 }
 
-void test_evaluate_jacobian_autodiff_static_large_cache() {
-  Index recordings = 0;
-  auto residual =
-      [&recordings]<class Scalar>(ConstVectorView<17, Scalar> x,
-                                  VectorView<2, Scalar> r) -> ErrorOrVoid {
-    ++recordings;
-    r[0] = x[0] * x[0] + 2.0 * x[1];
-    r[1] = x[0] * x[1];
-    return {};
-  };
-  auto problem = make_problem<2, 17>(residual);
-  Options options;
-  Result result;
-  LMWorkspace<2, 17> workspace;
-  const std::array<double, 17> x0{2.0, 3.0};
-  LMSolveContext context(problem, options, result, workspace, x0);
-
-  std::ranges::copy(context.x, workspace.x_current.view().begin());
-  if (auto jacobian_result = evaluate_jacobian<AutoDiffJacobian>(context);
-      !jacobian_result) {
-    fail(jacobian_result.error().message);
-  }
-
-  workspace.x_current[0] = 4.0;
-  workspace.x_current[1] = 5.0;
-  if (auto jacobian_result = evaluate_jacobian<AutoDiffJacobian>(context);
-      !jacobian_result) {
-    fail(jacobian_result.error().message);
-  }
-
-  expect_close(workspace.r[0], 26.0, 1e-12, 1e-12,
-               "cached large static AutoDiff should evaluate the new residual");
-  expect_close(workspace.r[1], 20.0, 1e-12, 1e-12,
-               "cached large static AutoDiff should evaluate the new residual");
-  expect_close(workspace.J(0, 0), 8.0, 1e-12, 1e-12,
-               "cached large static AutoDiff should update dr0/dx0");
-  expect_close(workspace.J(1, 0), 5.0, 1e-12, 1e-12,
-               "cached large static AutoDiff should update dr1/dx0");
-  expect_close(workspace.J(0, 1), 2.0, 1e-12, 1e-12,
-               "cached large static AutoDiff should update dr0/dx1");
-  expect_close(workspace.J(1, 1), 4.0, 1e-12, 1e-12,
-               "cached large static AutoDiff should update dr1/dx1");
-  expect_close(
-      workspace.J(0, 16), 0.0, 1e-12, 1e-12,
-      "cached large static AutoDiff should differentiate unused inputs");
-  expect_equal(recordings, Index{1},
-               "cached large static AutoDiff should record the graph once");
-  expect_true(context.autodiff_cache.recorded,
-              "large static AutoDiff should activate the graph cache");
-  expect_equal(result.function_evaluations, Index{2},
-               "cached large static AutoDiff should count both evaluations");
-  expect_equal(result.jacobian_evaluations, Index{2},
-               "cached large static AutoDiff should count both Jacobians");
-}
-
 void test_evaluate_jacobian_autodiff_dynamic_cache() {
   Index recordings = 0;
   auto residual =
@@ -1612,7 +1562,7 @@ void test_damped_qr_static() {
   work.r[2] = 3.0;
 
   constexpr double lambda = 1.0;
-  expect_true(solve_damped_qr(work, qr, lambda),
+  expect_true(solve_damped_qr(NoScaling{}, work, qr, lambda),
               "static damped QR should succeed");
   expect_close(work.step[0], -0.875, 1e-12, 1e-12,
                "static damped QR first step component");
@@ -1638,7 +1588,7 @@ void test_damped_qr_dynamic() {
   work.r[2] = 3.0;
 
   constexpr double lambda = 1.0;
-  expect_true(solve_damped_qr(work, qr, lambda),
+  expect_true(solve_damped_qr(NoScaling{}, work, qr, lambda),
               "dynamic damped QR should succeed");
   expect_close(work.step[0], -0.875, 1e-12, 1e-12,
                "dynamic damped QR first step component");
@@ -1646,6 +1596,401 @@ void test_damped_qr_dynamic() {
                "dynamic damped QR second step component");
   expect_true(augmented_damped_qr_objective(work, lambda) < 14.0,
               "dynamic damped QR should lower the augmented objective");
+}
+
+void test_damped_qr_column_scaling_static() {
+  LMWorkspace<3, 2> work;
+  DampedQrWorkspace<3, 2> qr;
+
+  work.J(0, 0) = 1.0;
+  work.J(1, 0) = 0.0;
+  work.J(2, 0) = 1.0;
+  work.J(0, 1) = 0.0;
+  work.J(1, 1) = 1.0;
+  work.J(2, 1) = 1.0;
+  work.r[0] = 1.0;
+  work.r[1] = 2.0;
+  work.r[2] = 3.0;
+  work.scale[0] = 2.0;
+  work.scale[1] = 4.0;
+
+  constexpr double lambda = 1.0;
+  expect_true(solve_damped_qr(JacobianColumnScaling{}, work, qr, lambda),
+              "scaled damped QR should succeed");
+  expect_close(work.step[0], -67.0 / 107.0, 1e-12, 1e-12,
+               "scaled damped QR first step component");
+  expect_close(work.step[1], -26.0 / 107.0, 1e-12, 1e-12,
+               "scaled damped QR second step component");
+}
+
+void test_solve_static_user_jacobian() {
+  auto residual = [](ConstVectorView<2> x, VectorView<3> r) {
+    r[0] = x[0] - 1.0;
+    r[1] = x[1] - 2.0;
+    r[2] = x[0] + x[1] - 3.0;
+    return ErrorOrVoid{};
+  };
+  auto jacobian = [](ConstVectorView<2>, MatrixView<3, 2> J) {
+    J[0, 0] = 1.0;
+    J[1, 0] = 0.0;
+    J[2, 0] = 1.0;
+    J[0, 1] = 0.0;
+    J[1, 1] = 1.0;
+    J[2, 1] = 1.0;
+    return ErrorOrVoid{};
+  };
+  const auto problem = make_problem<3, 2>(residual, jacobian);
+  Options options;
+  options.max_iterations = 50;
+  options.max_function_evaluations = 100;
+  SolverWorkspace<DefaultSolverPolicy, 3, 2> workspace;
+  const std::array<double, 2> x0{0.0, 0.0};
+  SolverContext<DefaultSolverPolicy, 3, 2, decltype(residual),
+                decltype(jacobian)>
+      context(problem, options, workspace, x0);
+
+  const auto solved = solve<DefaultSolverPolicy>(context);
+  expect_true(solved.has_value(), "static solve should succeed");
+  const Result &result = *solved;
+  expect_close(result.parameters[0], 1.0, 1e-8, 1e-8,
+               "static solve first parameter");
+  expect_close(result.parameters[1], 2.0, 1e-8, 1e-8,
+               "static solve second parameter");
+  expect_true(result.final_cost < 1e-14,
+              "static solve should reach near-zero cost");
+  expect_true(result.iterations > 0,
+              "static solve should perform an LM attempt");
+  expect_true(result.linear_solves > 0,
+              "static solve should perform a linear solve");
+  expect_true(result.termination != TerminationReason::NotTerminated,
+              "static solve should return a terminal result");
+}
+
+void test_solve_dynamic_user_jacobian() {
+  auto residual = [](ConstVectorView<std::dynamic_extent> x,
+                     VectorView<std::dynamic_extent> r) {
+    r[0] = x[0] - 1.0;
+    r[1] = x[1] - 2.0;
+    r[2] = x[0] + x[1] - 3.0;
+    return ErrorOrVoid{};
+  };
+  auto jacobian = [](ConstVectorView<std::dynamic_extent>,
+                     MatrixView<std::dynamic_extent, std::dynamic_extent> J) {
+    J[0, 0] = 1.0;
+    J[1, 0] = 0.0;
+    J[2, 0] = 1.0;
+    J[0, 1] = 0.0;
+    J[1, 1] = 1.0;
+    J[2, 1] = 1.0;
+    return ErrorOrVoid{};
+  };
+  const auto problem = make_dynamic_problem(3, 2, residual, jacobian);
+  Options options;
+  options.max_iterations = 50;
+  options.max_function_evaluations = 100;
+  SolverWorkspace<DefaultSolverPolicy, std::dynamic_extent, std::dynamic_extent>
+      workspace;
+  const std::vector<double> x0{0.0, 0.0};
+  SolverContext<DefaultSolverPolicy, std::dynamic_extent, std::dynamic_extent,
+                decltype(residual), decltype(jacobian)>
+      context(problem, options, workspace, x0);
+
+  const auto solved = solve<DefaultSolverPolicy>(context);
+  expect_true(solved.has_value(), "dynamic solve should succeed");
+  const Result &result = *solved;
+  expect_close(result.parameters[0], 1.0, 1e-8, 1e-8,
+               "dynamic solve first parameter");
+  expect_close(result.parameters[1], 2.0, 1e-8, 1e-8,
+               "dynamic solve second parameter");
+  expect_true(result.final_cost < 1e-14,
+              "dynamic solve should reach near-zero cost");
+  expect_true(result.termination != TerminationReason::NotTerminated,
+              "dynamic solve should return a terminal result");
+}
+
+void test_solve_forward_difference_evaluation_budget() {
+  Index residual_calls = 0;
+  auto residual = [&residual_calls](ConstVectorView<2> x, VectorView<3> r) {
+    ++residual_calls;
+    r[0] = x[0] - 1.0;
+    r[1] = x[1] - 2.0;
+    r[2] = x[0] + x[1] - 3.0;
+    return ErrorOrVoid{};
+  };
+  const auto problem = make_problem<3, 2>(residual);
+  Options options;
+  options.max_function_evaluations = 2;
+  SolverWorkspace<ForwardDifferenceSolverPolicy, 3, 2> workspace;
+  const std::array<double, 2> x0{0.0, 0.0};
+  SolverContext<ForwardDifferenceSolverPolicy, 3, 2, decltype(residual),
+                NoJacobian>
+      context(problem, options, workspace, x0);
+
+  const auto solved = solve<ForwardDifferenceSolverPolicy>(context);
+  expect_true(solved.has_value(), "budget termination should be a result");
+  expect_equal(solved->termination, TerminationReason::MaxFunctionEvaluations,
+               "forward difference solve should stop before budget overrun");
+  expect_equal(residual_calls, Index{0},
+               "budget preflight should avoid residual callbacks");
+}
+
+void test_solve_numerical_termination() {
+  auto residual = [](ConstVectorView<1>, VectorView<2> r) {
+    r[0] = std::numeric_limits<double>::infinity();
+    r[1] = 0.0;
+    return ErrorOrVoid{};
+  };
+  auto jacobian = [](ConstVectorView<1>, MatrixView<2, 1> J) {
+    J[0, 0] = 1.0;
+    J[1, 0] = 0.0;
+    return ErrorOrVoid{};
+  };
+  const auto problem = make_problem<2, 1>(residual, jacobian);
+  Options options;
+  SolverWorkspace<DefaultSolverPolicy, 2, 1> workspace;
+  const std::array<double, 1> x0{0.0};
+  SolverContext<DefaultSolverPolicy, 2, 1, decltype(residual),
+                decltype(jacobian)>
+      context(problem, options, workspace, x0);
+
+  const auto solved = solve<DefaultSolverPolicy>(context);
+  expect_true(solved.has_value(), "numerical failure should be a result");
+  expect_equal(solved->termination, TerminationReason::NumericalFailure,
+               "non-finite residual should terminate numerically");
+}
+
+void test_solve_callback_error() {
+  auto residual = [](ConstVectorView<1>, VectorView<2>) -> ErrorOrVoid {
+    return std::unexpected(
+        Error{ErrorCode::UserFunctionError, "expected residual failure"});
+  };
+  auto jacobian = [](ConstVectorView<1>, MatrixView<2, 1>) {
+    return ErrorOrVoid{};
+  };
+  const auto problem = make_problem<2, 1>(residual, jacobian);
+  Options options;
+  SolverWorkspace<DefaultSolverPolicy, 2, 1> workspace;
+  const std::array<double, 1> x0{0.0};
+  SolverContext<DefaultSolverPolicy, 2, 1, decltype(residual),
+                decltype(jacobian)>
+      context(problem, options, workspace, x0);
+
+  const auto solved = solve<DefaultSolverPolicy>(context);
+  expect_true(!solved, "residual callback error should propagate");
+  expect_equal(solved.error().code, ErrorCode::UserFunctionError,
+               "residual callback error code should be preserved");
+}
+
+void test_solve_zero_iteration_budget() {
+  auto residual = [](ConstVectorView<1> x, VectorView<2> r) {
+    r[0] = x[0] - 1.0;
+    r[1] = x[0] - 1.0;
+    return ErrorOrVoid{};
+  };
+  auto jacobian = [](ConstVectorView<1>, MatrixView<2, 1> J) {
+    J[0, 0] = 1.0;
+    J[1, 0] = 1.0;
+    return ErrorOrVoid{};
+  };
+  const auto problem = make_problem<2, 1>(residual, jacobian);
+  Options options;
+  options.max_iterations = 0;
+  SolverWorkspace<DefaultSolverPolicy, 2, 1> workspace;
+  const std::array<double, 1> x0{0.0};
+  SolverContext<DefaultSolverPolicy, 2, 1, decltype(residual),
+                decltype(jacobian)>
+      context(problem, options, workspace, x0);
+
+  const auto solved = solve<DefaultSolverPolicy>(context);
+  expect_true(solved.has_value(), "zero iteration limit should be a result");
+  expect_equal(solved->termination, TerminationReason::MaxIterations,
+               "zero iteration limit should terminate immediately");
+}
+
+void test_solve_finite_difference_policies() {
+  auto residual = [](ConstVectorView<2> x, VectorView<3> r) {
+    r[0] = x[0] - 1.0;
+    r[1] = x[1] - 2.0;
+    r[2] = x[0] + x[1] - 3.0;
+    return ErrorOrVoid{};
+  };
+  const auto problem = make_problem<3, 2>(residual);
+  const std::array<double, 2> x0{0.0, 0.0};
+
+  const auto run = [&]<class Policy>(const std::string &name) {
+    Options options;
+    options.max_iterations = 50;
+    options.max_function_evaluations = 500;
+    SolverWorkspace<Policy, 3, 2> workspace;
+    SolverContext<Policy, 3, 2, decltype(residual), NoJacobian> context(
+        problem, options, workspace, x0);
+
+    const auto solved = solve<Policy>(context);
+    expect_true(solved.has_value(), name + " solve should succeed");
+    expect_close(solved->parameters[0], 1.0, 1e-6, 1e-6,
+                 name + " first parameter");
+    expect_close(solved->parameters[1], 2.0, 1e-6, 1e-6,
+                 name + " second parameter");
+    expect_true(solved->final_cost < 1e-12,
+                name + " solve should reach near-zero cost");
+  };
+
+  run.template operator()<ForwardDifferenceSolverPolicy>("forward difference");
+  run.template operator()<CentralDifferenceSolverPolicy>("central difference");
+}
+
+void test_solve_autodiff_policies() {
+  auto static_residual = []<class Scalar>(ConstVectorView<2, Scalar> x,
+                                          VectorView<3, Scalar> r) {
+    r[0] = x[0] - 1.0;
+    r[1] = x[1] - 2.0;
+    r[2] = x[0] + x[1] - 3.0;
+    return ErrorOrVoid{};
+  };
+  const auto static_problem = make_problem<3, 2>(static_residual);
+  Options static_options;
+  static_options.max_iterations = 50;
+  SolverWorkspace<AutoDiffSolverPolicy, 3, 2> static_workspace;
+  const std::array<double, 2> static_x0{0.0, 0.0};
+  SolverContext<AutoDiffSolverPolicy, 3, 2, decltype(static_residual),
+                NoJacobian>
+      static_context(static_problem, static_options, static_workspace,
+                     static_x0);
+
+  const auto static_solved = solve<AutoDiffSolverPolicy>(static_context);
+  expect_true(static_solved.has_value(), "direct dual solve should succeed");
+  expect_close(static_solved->parameters[0], 1.0, 1e-8, 1e-8,
+               "direct dual solve first parameter");
+  expect_close(static_solved->parameters[1], 2.0, 1e-8, 1e-8,
+               "direct dual solve second parameter");
+
+  auto dynamic_residual =
+      []<class Scalar>(ConstVectorView<std::dynamic_extent, Scalar> x,
+                       VectorView<std::dynamic_extent, Scalar> r) {
+        r[0] = x[0] - 1.0;
+        r[1] = x[1] - 2.0;
+        r[2] = x[0] + x[1] - 3.0;
+        return ErrorOrVoid{};
+      };
+  const auto dynamic_problem = make_dynamic_problem(3, 2, dynamic_residual);
+  Options dynamic_options;
+  dynamic_options.max_iterations = 50;
+  SolverWorkspace<AutoDiffSolverPolicy, std::dynamic_extent,
+                  std::dynamic_extent>
+      dynamic_workspace;
+  const std::vector<double> dynamic_x0{0.0, 0.0};
+  SolverContext<AutoDiffSolverPolicy, std::dynamic_extent, std::dynamic_extent,
+                decltype(dynamic_residual), NoJacobian>
+      dynamic_context(dynamic_problem, dynamic_options, dynamic_workspace,
+                      dynamic_x0);
+
+  const auto dynamic_solved = solve<AutoDiffSolverPolicy>(dynamic_context);
+  expect_true(dynamic_solved.has_value(), "graph solve should succeed");
+  expect_close(dynamic_solved->parameters[0], 1.0, 1e-8, 1e-8,
+               "graph solve first parameter");
+  expect_close(dynamic_solved->parameters[1], 2.0, 1e-8, 1e-8,
+               "graph solve second parameter");
+}
+
+void test_solve_termination_paths() {
+  auto residual = [](ConstVectorView<1> x, VectorView<1> r) {
+    r[0] = x[0] - 1.0;
+    return ErrorOrVoid{};
+  };
+  auto incorrect_jacobian = [](ConstVectorView<1>, MatrixView<1, 1> jacobian) {
+    jacobian[0, 0] = -1.0;
+    return ErrorOrVoid{};
+  };
+  auto jacobian = [](ConstVectorView<1>, MatrixView<1, 1> jacobian) {
+    jacobian[0, 0] = 1.0;
+    return ErrorOrVoid{};
+  };
+  const auto incorrect_problem =
+      make_problem<1, 1>(residual, incorrect_jacobian);
+  const std::array<double, 1> x0{0.0};
+
+  Options damping_options;
+  damping_options.max_iterations = 20;
+  damping_options.lm.max_lambda = 1e-2;
+  SolverWorkspace<DefaultSolverPolicy, 1, 1> damping_workspace;
+  SolverContext<DefaultSolverPolicy, 1, 1, decltype(residual),
+                decltype(incorrect_jacobian)>
+      damping_context(incorrect_problem, damping_options, damping_workspace,
+                      x0);
+  const auto damping_solved = solve<DefaultSolverPolicy>(damping_context);
+  expect_true(damping_solved.has_value(), "damping-limit solve should succeed");
+  expect_equal(damping_solved->termination, TerminationReason::DampingLimit,
+               "rejected trials should reach damping limit");
+  expect_true(damping_solved->linear_solves > 1,
+              "rejected trials should grow lambda across multiple solves");
+
+  const auto problem = make_problem<1, 1>(residual, jacobian);
+  Options step_options;
+  step_options.step_tolerance = 2.0;
+  SolverWorkspace<DefaultSolverPolicy, 1, 1> step_workspace;
+  SolverContext<DefaultSolverPolicy, 1, 1, decltype(residual),
+                decltype(jacobian)>
+      step_context(problem, step_options, step_workspace, x0);
+  const auto step_solved = solve<DefaultSolverPolicy>(step_context);
+  expect_true(step_solved.has_value(), "small-step solve should succeed");
+  expect_equal(step_solved->termination, TerminationReason::SmallStep,
+               "large step tolerance should terminate with SmallStep");
+
+  Options cost_options;
+  cost_options.cost_tolerance = 1.0;
+  SolverWorkspace<DefaultSolverPolicy, 1, 1> cost_workspace;
+  SolverContext<DefaultSolverPolicy, 1, 1, decltype(residual),
+                decltype(jacobian)>
+      cost_context(problem, cost_options, cost_workspace, x0);
+  const auto cost_solved = solve<DefaultSolverPolicy>(cost_context);
+  expect_true(cost_solved.has_value(), "small-cost solve should succeed");
+  expect_equal(cost_solved->termination, TerminationReason::SmallCostReduction,
+               "large cost tolerance should terminate with SmallCostReduction");
+
+  Options relative_cost_options;
+  relative_cost_options.cost_tolerance = 0.0;
+  relative_cost_options.relative_cost_tolerance = 1.0;
+  SolverWorkspace<DefaultSolverPolicy, 1, 1> relative_cost_workspace;
+  SolverContext<DefaultSolverPolicy, 1, 1, decltype(residual),
+                decltype(jacobian)>
+      relative_cost_context(problem, relative_cost_options,
+                            relative_cost_workspace, x0);
+  const auto relative_cost_solved =
+      solve<DefaultSolverPolicy>(relative_cost_context);
+  expect_true(relative_cost_solved.has_value(),
+              "relative small-cost solve should succeed");
+  expect_equal(relative_cost_solved->termination,
+               TerminationReason::SmallCostReduction,
+               "large relative cost tolerance should terminate with "
+               "SmallCostReduction");
+
+  auto nonlinear_residual = [](ConstVectorView<1> x, VectorView<1> r) {
+    r[0] = x[0] * x[0] - 1.0;
+    return ErrorOrVoid{};
+  };
+  auto nonlinear_jacobian = [](ConstVectorView<1> x,
+                               MatrixView<1, 1> jacobian) {
+    jacobian[0, 0] = 2.0 * x[0];
+    return ErrorOrVoid{};
+  };
+  const auto nonlinear_problem =
+      make_problem<1, 1>(nonlinear_residual, nonlinear_jacobian);
+  const std::array<double, 1> nonlinear_x0{2.0};
+  Options budget_options;
+  budget_options.max_iterations = 20;
+  budget_options.max_function_evaluations = 3;
+  SolverWorkspace<DefaultSolverPolicy, 1, 1> budget_workspace;
+  SolverContext<DefaultSolverPolicy, 1, 1, decltype(nonlinear_residual),
+                decltype(nonlinear_jacobian)>
+      budget_context(nonlinear_problem, budget_options, budget_workspace,
+                     nonlinear_x0);
+  const auto budget_solved = solve<DefaultSolverPolicy>(budget_context);
+  expect_true(budget_solved.has_value(), "budget solve should succeed");
+  expect_equal(budget_solved->termination,
+               TerminationReason::MaxFunctionEvaluations,
+               "accepted relinearization should exhaust the exact budget");
+  expect_equal(budget_solved->function_evaluations, Index{3},
+               "accepted relinearization should use all allowed evaluations");
 }
 
 } // namespace
@@ -1679,7 +2024,6 @@ int main() {
   test_evaluate_jacobian_autodiff_static_problem();
   test_evaluate_jacobian_autodiff_dynamic_problem();
   test_evaluate_jacobian_autodiff_static_direct_dual();
-  test_evaluate_jacobian_autodiff_static_large_cache();
   test_evaluate_jacobian_autodiff_dynamic_cache();
   test_evaluate_jacobian_autodiff_literal_residual();
   test_evaluate_jacobian_autodiff_double_only_residual();
@@ -1689,5 +2033,15 @@ int main() {
   test_pow_domain_errors();
   test_damped_qr_static();
   test_damped_qr_dynamic();
+  test_damped_qr_column_scaling_static();
+  test_solve_static_user_jacobian();
+  test_solve_dynamic_user_jacobian();
+  test_solve_forward_difference_evaluation_budget();
+  test_solve_numerical_termination();
+  test_solve_callback_error();
+  test_solve_zero_iteration_budget();
+  test_solve_finite_difference_policies();
+  test_solve_autodiff_policies();
+  test_solve_termination_paths();
   return 0;
 }

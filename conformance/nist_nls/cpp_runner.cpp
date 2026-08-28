@@ -1,4 +1,14 @@
+#include <levmar/internal/solver.h>
 #include <levmar/lm.h>
+
+#ifdef LEVMAR_HAVE_CERES
+#include <ceres/autodiff_cost_function.h>
+#include <ceres/ceres.h>
+#endif
+
+#ifdef LEVMAR_HAVE_CMINPACK
+#include <cminpack.h>
+#endif
 
 #include <chrono>
 #include <cstdint>
@@ -11,17 +21,28 @@
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <string_view>
+#include <utility>
 #include <vector>
 
 namespace {
 
 using namespace levmar;
 using namespace levmar::detail;
+using std::exp;
+
+using NistAnalyticSolverPolicy =
+    SolverPolicy<UserJacobian, LevenbergMarquardt, DampedQr, SquaredLoss,
+                 JacobianColumnScaling>;
+using NistAutoDiffSolverPolicy =
+    SolverPolicy<AutoDiffJacobian, LevenbergMarquardt, DampedQr, SquaredLoss,
+                 JacobianColumnScaling>;
 
 struct CorpusProblem {
   std::string name;
   std::string model_id;
   std::string model_class;
+  std::string difficulty;
   Index m = 0;
   Index n = 0;
   Index predictor_count = 0;
@@ -178,9 +199,82 @@ struct SummaryBenchmark {
   TimingMoments static_timing;
 };
 
+struct SolverBenchmark {
+  ScalarMoments dynamic_total;
+  ScalarMoments static_total;
+};
+
+struct ExternalSolverBenchmark {
+  // One sample per complete NIST sweep, matching SolverBenchmark semantics.
+  ScalarMoments seconds;
+
+  // Conformance/work statistics are collected once per (problem, start) case,
+  // not once per timing repetition.
+  ScalarMoments lre;
+  ScalarMoments iterations;
+  ScalarMoments function_evaluations;
+  ScalarMoments jacobian_evaluations;
+  ScalarMoments linear_solves;
+  ScalarMoments accepted_steps;
+  ScalarMoments rejected_steps;
+  std::uint64_t usable = 0;
+  std::uint64_t cases = 0;
+};
+
+struct ExternalSolverResult {
+  std::string solver;
+  std::string start_label;
+  Index m = 0;
+  Index n = 0;
+  double seconds = 0.0;
+  double lre = 0.0;
+  std::uint64_t iterations = 0;
+  std::uint64_t function_evaluations = 0;
+  std::uint64_t jacobian_evaluations = 0;
+  std::uint64_t linear_solves = 0;
+  std::uint64_t accepted_steps = 0;
+  std::uint64_t rejected_steps = 0;
+  bool has_jacobian_evaluations = false;
+  bool has_linear_solves = false;
+  bool has_accepted_steps = false;
+  bool has_rejected_steps = false;
+  bool usable = false;
+};
+
+struct SolverWorkRow {
+  std::string start_label;
+  std::string extent;
+  Index m = 0;
+  Index n = 0;
+  double elapsed_seconds = 0.0;
+  double lre = 0.0;
+  Result result;
+};
+
 struct ProblemReport {
   std::string name;
   bool numerical_derivatives_skipped = false;
+  Index solver_start_cases = 0;
+  Index solver_start_case_passes = 0;
+  double solver_dynamic_lre_sum = 0.0;
+  double solver_static_lre_sum = 0.0;
+  double solver_dynamic_seconds = 0.0;
+  double solver_static_seconds = 0.0;
+  Index solver_dynamic_iterations = 0;
+  Index solver_static_iterations = 0;
+  Index solver_dynamic_function_evaluations = 0;
+  Index solver_static_function_evaluations = 0;
+  Index solver_dynamic_jacobian_evaluations = 0;
+  Index solver_static_jacobian_evaluations = 0;
+  Index solver_dynamic_linear_solves = 0;
+  Index solver_static_linear_solves = 0;
+  Index solver_dynamic_accepted_steps = 0;
+  Index solver_static_accepted_steps = 0;
+  Index solver_dynamic_rejected_steps = 0;
+  Index solver_static_rejected_steps = 0;
+  std::vector<std::string> solver_failures;
+  std::vector<SolverWorkRow> solver_work_rows;
+  std::vector<ExternalSolverResult> external_solver_results;
   TimingStats dynamic_timing;
   TimingStats static_timing;
   ComparisonStats residual_stats;
@@ -198,6 +292,26 @@ struct ProblemReport {
 struct SummaryStats {
   std::uint64_t problems = 0;
   std::uint64_t numerical_derivative_skips = 0;
+  Index solver_start_cases = 0;
+  Index solver_start_case_passes = 0;
+  double solver_dynamic_lre_sum = 0.0;
+  double solver_static_lre_sum = 0.0;
+  double solver_dynamic_seconds = 0.0;
+  double solver_static_seconds = 0.0;
+  Index solver_dynamic_iterations = 0;
+  Index solver_static_iterations = 0;
+  Index solver_dynamic_function_evaluations = 0;
+  Index solver_static_function_evaluations = 0;
+  Index solver_dynamic_jacobian_evaluations = 0;
+  Index solver_static_jacobian_evaluations = 0;
+  Index solver_dynamic_linear_solves = 0;
+  Index solver_static_linear_solves = 0;
+  Index solver_dynamic_accepted_steps = 0;
+  Index solver_static_accepted_steps = 0;
+  Index solver_dynamic_rejected_steps = 0;
+  Index solver_static_rejected_steps = 0;
+  std::vector<std::string> solver_failures;
+  std::vector<ExternalSolverResult> external_solver_results;
   TimingStats dynamic_timing;
   TimingStats static_timing;
   ComparisonStats residual_stats;
@@ -216,6 +330,55 @@ using Clock = std::chrono::steady_clock;
 constexpr std::uint64_t kKernelTimingRepeats = 64;
 
 double milliseconds(double seconds) { return seconds * 1000.0; }
+
+double elapsed_seconds(Clock::time_point start, Clock::time_point end);
+
+std::string solver_diagnostics(const Result &result) {
+  std::ostringstream message;
+  message << std::scientific << "termination "
+          << static_cast<int>(result.termination) << ", iterations "
+          << result.iterations << ", function evaluations "
+          << result.function_evaluations << ", lambda " << result.lambda
+          << ", gradient " << result.gradient_inf_norm;
+  return message.str();
+}
+
+std::string_view termination_reason_name(TerminationReason termination) {
+  switch (termination) {
+  case TerminationReason::NotTerminated:
+    return "not_terminated";
+  case TerminationReason::SmallStep:
+    return "small_step";
+  case TerminationReason::SmallGradient:
+    return "small_gradient";
+  case TerminationReason::SmallCostReduction:
+    return "small_cost_reduction";
+  case TerminationReason::MaxIterations:
+    return "max_iterations";
+  case TerminationReason::MaxFunctionEvaluations:
+    return "max_function_evaluations";
+  case TerminationReason::NumericalFailure:
+    return "numerical_failure";
+  case TerminationReason::DampingLimit:
+    return "damping_limit";
+  }
+  return "unknown";
+}
+
+double log_relative_error(const std::vector<double> &parameters,
+                          const std::vector<double> &certified) {
+  constexpr double kMaxDigits = 11.0;
+  double lre = kMaxDigits;
+  for (Index j = 0; j < parameters.size(); ++j) {
+    const double relative_error =
+        std::abs(certified[j] - parameters[j]) / std::abs(certified[j]);
+    const double parameter_lre = -std::log10(relative_error);
+    lre = std::min(lre, std::clamp(parameter_lre, 0.0, kMaxDigits));
+  }
+  return lre;
+}
+
+#include "external_benchmark_adapters.h"
 
 template <class Fn>
 double measure_average_seconds(std::uint64_t repeats, Fn &&fn) {
@@ -316,6 +479,7 @@ CorpusProblem load_problem(const std::filesystem::path &path) {
   problem.name = meta.at("name");
   problem.model_id = meta.at("model_id");
   problem.model_class = meta.at("model_class");
+  problem.difficulty = meta.at("difficulty");
   problem.m = static_cast<Index>(std::stoull(meta.at("m")));
   problem.n = static_cast<Index>(std::stoull(meta.at("n")));
   problem.predictor_count =
@@ -367,6 +531,34 @@ void merge_summary(SummaryStats &summary, const ProblemReport &report) {
   if (report.numerical_derivatives_skipped) {
     ++summary.numerical_derivative_skips;
   }
+  summary.solver_start_cases += report.solver_start_cases;
+  summary.solver_start_case_passes += report.solver_start_case_passes;
+  summary.solver_dynamic_lre_sum += report.solver_dynamic_lre_sum;
+  summary.solver_static_lre_sum += report.solver_static_lre_sum;
+  summary.solver_dynamic_seconds += report.solver_dynamic_seconds;
+  summary.solver_static_seconds += report.solver_static_seconds;
+  summary.solver_dynamic_iterations += report.solver_dynamic_iterations;
+  summary.solver_static_iterations += report.solver_static_iterations;
+  summary.solver_dynamic_function_evaluations +=
+      report.solver_dynamic_function_evaluations;
+  summary.solver_static_function_evaluations +=
+      report.solver_static_function_evaluations;
+  summary.solver_dynamic_jacobian_evaluations +=
+      report.solver_dynamic_jacobian_evaluations;
+  summary.solver_static_jacobian_evaluations +=
+      report.solver_static_jacobian_evaluations;
+  summary.solver_dynamic_linear_solves += report.solver_dynamic_linear_solves;
+  summary.solver_static_linear_solves += report.solver_static_linear_solves;
+  summary.solver_dynamic_accepted_steps += report.solver_dynamic_accepted_steps;
+  summary.solver_static_accepted_steps += report.solver_static_accepted_steps;
+  summary.solver_dynamic_rejected_steps += report.solver_dynamic_rejected_steps;
+  summary.solver_static_rejected_steps += report.solver_static_rejected_steps;
+  summary.solver_failures.insert(summary.solver_failures.end(),
+                                 report.solver_failures.begin(),
+                                 report.solver_failures.end());
+  summary.external_solver_results.insert(summary.external_solver_results.end(),
+                                         report.external_solver_results.begin(),
+                                         report.external_solver_results.end());
   summary.dynamic_timing.residual_seconds +=
       report.dynamic_timing.residual_seconds;
   summary.dynamic_timing.analytic_jacobian_seconds +=
@@ -783,6 +975,57 @@ void run_kernel_variant(
       timing.central_difference_seconds;
 }
 
+template <class Policy, Index M, Index N, class ResidualFn, class JacobianFn>
+Result solve_nist_variant(const CorpusProblem &corpus, ResidualFn residual,
+                          JacobianFn jacobian, ConstVectorView<N> beta,
+                          const std::string &what,
+                          bool require_convergence = true,
+                          bool enable_relative_cost_termination = true) {
+  auto problem = [&]() {
+    if constexpr (M == std::dynamic_extent && N == std::dynamic_extent) {
+      return make_dynamic_problem(corpus.m, corpus.n, residual, jacobian);
+    } else if constexpr (M == std::dynamic_extent) {
+      return make_problem_dynamic_residuals<N>(corpus.m, residual, jacobian);
+    } else if constexpr (N == std::dynamic_extent) {
+      return make_problem_dynamic_parameters<M>(corpus.n, residual, jacobian);
+    } else {
+      return make_problem<M, N>(residual, jacobian);
+    }
+  }();
+
+  Options options;
+  constexpr double tolerance = std::numeric_limits<double>::epsilon();
+  options.max_iterations = 10'000;
+  options.max_function_evaluations = 100'000;
+  options.gradient_tolerance = tolerance;
+  options.step_tolerance = tolerance;
+  // Ceres and MINPACK use relative cost tolerances; levmar's is absolute.
+  options.cost_tolerance = 0.0;
+  options.relative_cost_tolerance =
+      enable_relative_cost_termination ? tolerance : 0.0;
+  options.lm.initial_lambda = 1e-4;
+  options.lm.min_lambda = 1e-16;
+  options.lm.max_lambda = 1e32;
+
+  SolverWorkspace<Policy, M, N> workspace;
+  SolverContext<Policy, M, N, decltype(residual), decltype(jacobian)> context(
+      problem, options, workspace, beta);
+  auto solved = solve<Policy>(context);
+  if (!solved) {
+    throw std::runtime_error(what + ": " + solved.error().message);
+  }
+  if (require_convergence &&
+      (solved->termination == TerminationReason::MaxIterations ||
+       solved->termination == TerminationReason::MaxFunctionEvaluations ||
+       solved->termination == TerminationReason::NumericalFailure ||
+       solved->termination == TerminationReason::DampingLimit)) {
+    throw std::runtime_error(what + ": solver did not converge (" +
+                             solver_diagnostics(*solved) +
+                             "): " + solved->message);
+  }
+  return std::move(*solved);
+}
+
 template <class Fn>
 void dispatch_static_problem(const CorpusProblem &corpus, Fn &&fn) {
 #define LEVMAR_STATIC_CASE(M, N)                                               \
@@ -815,7 +1058,13 @@ void dispatch_static_problem(const CorpusProblem &corpus, Fn &&fn) {
       std::to_string(corpus.m) + "x" + std::to_string(corpus.n));
 }
 
-ProblemReport run_problem(const std::filesystem::path &problem_dir) {
+template <class Policy>
+ProblemReport
+run_problem(const std::filesystem::path &problem_dir,
+            bool solve_all_starts = false, bool time_solvers = false,
+            std::uint64_t solver_order_offset = 0,
+            bool run_external_solvers = false, bool run_validation = true,
+            bool enable_relative_cost_termination = true) {
   const auto corpus = load_problem(problem_dir);
   ProblemReport report;
   report.name = corpus.name;
@@ -823,6 +1072,19 @@ ProblemReport run_problem(const std::filesystem::path &problem_dir) {
       !corpus.numerical_derivatives_recommended;
 
   std::vector<double> beta_storage(corpus.n, 0.0);
+  const auto certified_residuals =
+      read_numeric_csv(problem_dir / "residuals_certified.csv");
+  double certified_cost = 0.0;
+  for (const auto &row : certified_residuals) {
+    certified_cost += 0.5 * row[0] * row[0];
+  }
+  const auto certified_parameters =
+      std::ranges::find_if(corpus.params, [](const auto &entry) {
+        return entry.first == "certified";
+      });
+  if (certified_parameters == corpus.params.end()) {
+    throw std::runtime_error(corpus.name + " has no certified parameters");
+  }
 
   for (const auto &[label, params] : corpus.params) {
     beta_storage = params;
@@ -838,26 +1100,207 @@ ProblemReport run_problem(const std::filesystem::path &problem_dir) {
     auto run_pair = [&]<Index SM, Index SN>(
                         auto dynamic_residual, auto dynamic_jacobian,
                         auto static_residual, auto static_jacobian) {
-      run_kernel_variant<std::dynamic_extent, std::dynamic_extent>(
-          corpus, dynamic_residual, dynamic_jacobian,
-          ConstVectorView<std::dynamic_extent>(beta_storage.data(),
-                                               beta_storage.size()),
-          expected_residuals, expected_jacobian, run_numerical_derivatives,
-          report.dynamic_timing, &report.residual_stats, &report.analytic_stats,
-          &report.graph_autodiff_stats,
-          &report.graph_autodiff_vs_analytic_stats, &report.direct_dual_stats,
-          &report.direct_dual_vs_analytic_stats,
-          &report.forward_difference_stats, &report.central_difference_stats,
-          corpus.name + " dynamic " + label);
+      if (run_validation) {
+        run_kernel_variant<std::dynamic_extent, std::dynamic_extent>(
+            corpus, dynamic_residual, dynamic_jacobian,
+            ConstVectorView<std::dynamic_extent>(beta_storage.data(),
+                                                 beta_storage.size()),
+            expected_residuals, expected_jacobian, run_numerical_derivatives,
+            report.dynamic_timing, &report.residual_stats,
+            &report.analytic_stats, &report.graph_autodiff_stats,
+            &report.graph_autodiff_vs_analytic_stats, &report.direct_dual_stats,
+            &report.direct_dual_vs_analytic_stats,
+            &report.forward_difference_stats, &report.central_difference_stats,
+            corpus.name + " dynamic " + label);
 
-      run_kernel_variant<SM, SN>(
-          corpus, static_residual, static_jacobian,
-          ConstVectorView<SN>(beta_storage.data(), beta_storage.size()),
-          expected_residuals, expected_jacobian, run_numerical_derivatives,
-          report.static_timing, nullptr, nullptr, &report.graph_autodiff_stats,
-          &report.graph_autodiff_vs_analytic_stats, &report.direct_dual_stats,
-          &report.direct_dual_vs_analytic_stats, nullptr, nullptr,
-          corpus.name + " static " + label);
+        run_kernel_variant<SM, SN>(
+            corpus, static_residual, static_jacobian,
+            ConstVectorView<SN>(beta_storage.data(), beta_storage.size()),
+            expected_residuals, expected_jacobian, run_numerical_derivatives,
+            report.static_timing, nullptr, nullptr,
+            &report.graph_autodiff_stats,
+            &report.graph_autodiff_vs_analytic_stats, &report.direct_dual_stats,
+            &report.direct_dual_vs_analytic_stats, nullptr, nullptr,
+            corpus.name + " static " + label);
+      }
+
+      const bool solve_start =
+          label.starts_with("start") &&
+          (corpus.difficulty == "lower" || solve_all_starts);
+      if (solve_start) {
+        auto solve_pair = [&](bool require_convergence, double *dynamic_seconds,
+                              double *static_seconds, bool static_first) {
+          auto solve_dynamic = [&] {
+            const auto start = Clock::now();
+            auto solution = solve_nist_variant<Policy, std::dynamic_extent,
+                                               std::dynamic_extent>(
+                corpus, dynamic_residual, dynamic_jacobian,
+                ConstVectorView<std::dynamic_extent>(beta_storage.data(),
+                                                     beta_storage.size()),
+                corpus.name + " dynamic " + label + " solve",
+                require_convergence, enable_relative_cost_termination);
+            if (dynamic_seconds != nullptr) {
+              *dynamic_seconds += elapsed_seconds(start, Clock::now());
+            }
+            return solution;
+          };
+          auto solve_static = [&] {
+            const auto start = Clock::now();
+            auto solution = solve_nist_variant<Policy, SM, SN>(
+                corpus, static_residual, static_jacobian,
+                ConstVectorView<SN>(beta_storage.data(), beta_storage.size()),
+                corpus.name + " static " + label + " solve",
+                require_convergence, enable_relative_cost_termination);
+            if (static_seconds != nullptr) {
+              *static_seconds += elapsed_seconds(start, Clock::now());
+            }
+            return solution;
+          };
+          if (static_first) {
+            auto static_solution = solve_static();
+            auto dynamic_solution = solve_dynamic();
+            return std::pair{std::move(dynamic_solution),
+                             std::move(static_solution)};
+          }
+          auto dynamic_solution = solve_dynamic();
+          auto static_solution = solve_static();
+          return std::pair{std::move(dynamic_solution),
+                           std::move(static_solution)};
+        };
+        auto verify_solution = [&] {
+          const auto [dynamic_solution, static_solution] =
+              solve_pair(true, nullptr, nullptr, false);
+          for (Index j = 0; j < corpus.n; ++j) {
+            expect_close(static_solution.parameters[j],
+                         dynamic_solution.parameters[j], 1e-10, 1e-8,
+                         corpus.name + " static/dynamic " + label +
+                             " parameter " + std::to_string(j));
+          }
+          expect_close(dynamic_solution.final_cost, certified_cost, 1e-8, 1e-6,
+                       corpus.name + " dynamic " + label + " cost (" +
+                           solver_diagnostics(dynamic_solution) + ")");
+          expect_close(static_solution.final_cost, certified_cost, 1e-8, 1e-6,
+                       corpus.name + " static " + label + " cost (" +
+                           solver_diagnostics(static_solution) + ")");
+        };
+
+        if (!solve_all_starts) {
+          verify_solution();
+        } else {
+          ++report.solver_start_cases;
+
+          // External solvers are independent competitors.  Run them outside
+          // the levmar try block so a levmar failure cannot suppress a Ceres
+          // or Minpack test case (and vice versa).
+          if (run_external_solvers) {
+            auto run_external = [&](std::string_view solver_name, auto &&fn) {
+              try {
+                auto result = fn();
+                result.start_label = label;
+                result.m = corpus.m;
+                result.n = corpus.n;
+                report.external_solver_results.push_back(std::move(result));
+              } catch (const std::exception &error) {
+                ExternalSolverResult failed;
+                failed.solver = std::string(solver_name);
+                failed.start_label = label;
+                failed.m = corpus.m;
+                failed.n = corpus.n;
+                failed.lre = 0.0;
+                failed.usable = false;
+                report.external_solver_results.push_back(std::move(failed));
+                report.solver_failures.push_back(
+                    corpus.name + " " + label + " " + std::string(solver_name) +
+                    ": " + error.what());
+              }
+            };
+#ifdef LEVMAR_HAVE_CMINPACK
+            run_external("minpack_lmder", [&] {
+              return run_minpack_solver(
+                  "minpack_lmder", corpus, dynamic_residual, dynamic_jacobian,
+                  beta_storage, certified_parameters->second, true);
+            });
+            run_external("minpack_lmdif", [&] {
+              return run_minpack_solver(
+                  "minpack_lmdif", corpus, dynamic_residual, dynamic_jacobian,
+                  beta_storage, certified_parameters->second, false);
+            });
+#endif
+#ifdef LEVMAR_HAVE_CERES
+            run_external("ceres_analytic", [&] {
+              return run_ceres_analytic_solver(corpus, dynamic_residual,
+                                               dynamic_jacobian, beta_storage,
+                                               certified_parameters->second);
+            });
+            run_external("ceres_autodiff", [&] {
+              return run_ceres_autodiff_solver<SM, SN>(
+                  static_residual, beta_storage, certified_parameters->second);
+            });
+#endif
+          }
+
+          try {
+            const bool static_first =
+                (solver_order_offset + report.solver_start_cases) % 2 != 0;
+            double dynamic_seconds = 0.0;
+            double static_seconds = 0.0;
+            const auto [dynamic_solution, static_solution] = solve_pair(
+                false, &dynamic_seconds, &static_seconds, static_first);
+            if (time_solvers) {
+              report.solver_dynamic_seconds += dynamic_seconds;
+              report.solver_static_seconds += static_seconds;
+            }
+            report.solver_dynamic_iterations += dynamic_solution.iterations;
+            report.solver_static_iterations += static_solution.iterations;
+            report.solver_dynamic_function_evaluations +=
+                dynamic_solution.function_evaluations;
+            report.solver_static_function_evaluations +=
+                static_solution.function_evaluations;
+            report.solver_dynamic_jacobian_evaluations +=
+                dynamic_solution.jacobian_evaluations;
+            report.solver_static_jacobian_evaluations +=
+                static_solution.jacobian_evaluations;
+            report.solver_dynamic_linear_solves +=
+                dynamic_solution.linear_solves;
+            report.solver_static_linear_solves += static_solution.linear_solves;
+            report.solver_dynamic_accepted_steps +=
+                dynamic_solution.accepted_steps;
+            report.solver_static_accepted_steps +=
+                static_solution.accepted_steps;
+            report.solver_dynamic_rejected_steps +=
+                dynamic_solution.rejected_steps;
+            report.solver_static_rejected_steps +=
+                static_solution.rejected_steps;
+            const double dynamic_lre = log_relative_error(
+                dynamic_solution.parameters, certified_parameters->second);
+            const double static_lre = log_relative_error(
+                static_solution.parameters, certified_parameters->second);
+            report.solver_work_rows.push_back({label, "dynamic", corpus.m,
+                                                corpus.n, dynamic_seconds,
+                                                dynamic_lre,
+                                                dynamic_solution});
+            report.solver_work_rows.push_back({label, "static", corpus.m,
+                                                corpus.n, static_seconds,
+                                                static_lre,
+                                                static_solution});
+            report.solver_dynamic_lre_sum += dynamic_lre;
+            report.solver_static_lre_sum += static_lre;
+            if (dynamic_lre >= 4.0) {
+              ++report.solver_start_case_passes;
+            } else {
+              std::ostringstream message;
+              message << corpus.name << ' ' << label
+                      << ": dynamic_lre=" << dynamic_lre
+                      << ", static_lre=" << static_lre << ", "
+                      << solver_diagnostics(dynamic_solution);
+              report.solver_failures.push_back(message.str());
+            }
+          } catch (const std::exception &error) {
+            report.solver_failures.push_back(corpus.name + " " + label + ": " +
+                                             error.what());
+          }
+        }
+      }
     };
 
     if (corpus.model_id == "bennett5") {
@@ -1147,7 +1590,7 @@ ProblemReport run_problem(const std::filesystem::path &problem_dir) {
         for (Index i = 0; i < corpus.m; ++i) {
           const auto &row = corpus.data[i];
           const double xv = row[0];
-          r[i] = 0.0;
+          r[i] = x[0] * 0.0;
           for (Index j = 0; j < 6; j += 2) {
             r[i] = r[i] + x[j] * exp(-x[j + 1] * xv);
           }
@@ -1177,7 +1620,7 @@ ProblemReport run_problem(const std::filesystem::path &problem_dir) {
         for (Index i = 0; i < 24; ++i) {
           const auto &row = corpus.data[i];
           const double xv = row[0];
-          r[i] = 0.0;
+          r[i] = x[0] * 0.0;
           for (Index j = 0; j < 6; j += 2) {
             r[i] = r[i] + x[j] * exp(-x[j + 1] * xv);
           }
@@ -1825,8 +2268,10 @@ ProblemReport run_problem(const std::filesystem::path &problem_dir) {
         for (Index i = 0; i < corpus.m; ++i) {
           const auto &row = corpus.data[i];
           const double xv = row[0];
-          r[i] = x[0] - x[1] * xv -
-                 atan2(x[2] / (xv - x[3]), 1.0) / std::numbers::pi - row.back();
+          r[i] =
+              x[0] - x[1] * xv -
+              atan2(x[2] / (xv - x[3]), x[0] * 0.0 + 1.0) / std::numbers::pi -
+              row.back();
         }
         return {};
       };
@@ -1853,8 +2298,10 @@ ProblemReport run_problem(const std::filesystem::path &problem_dir) {
         for (Index i = 0; i < 25; ++i) {
           const auto &row = corpus.data[i];
           const double xv = row[0];
-          r[i] = x[0] - x[1] * xv -
-                 atan2(x[2] / (xv - x[3]), 1.0) / std::numbers::pi - row.back();
+          r[i] =
+              x[0] - x[1] * xv -
+              atan2(x[2] / (xv - x[3]), x[0] * 0.0 + 1.0) / std::numbers::pi -
+              row.back();
         }
         return {};
       };
@@ -2279,13 +2726,14 @@ ProblemReport run_problem(const std::filesystem::path &problem_dir) {
     } else if (corpus.model_id == "linear_dense" && corpus.m == 1000 &&
                corpus.n == 4) {
       auto residual_dynamic =
-          [&](ConstVectorView<std::dynamic_extent> x,
-              VectorView<std::dynamic_extent> r) -> ErrorOrVoid {
+          [&]<class Scalar>(
+              ConstVectorView<std::dynamic_extent, Scalar> x,
+              VectorView<std::dynamic_extent, Scalar> r) -> ErrorOrVoid {
         for (Index i = 0; i < corpus.m; ++i) {
           const auto &row = corpus.data[i];
-          double value = 0.0;
+          auto value = x[0] * 0.0;
           for (Index j = 0; j < 4; ++j) {
-            value += x[j] * row[j];
+            value = value + x[j] * row[j];
           }
           r[i] = value - row.back();
         }
@@ -2303,13 +2751,14 @@ ProblemReport run_problem(const std::filesystem::path &problem_dir) {
         }
         return {};
       };
-      auto residual_static = [&](ConstVectorView<4> x,
-                                 VectorView<1000> r) -> ErrorOrVoid {
+      auto residual_static =
+          [&]<class Scalar>(ConstVectorView<4, Scalar> x,
+                            VectorView<1000, Scalar> r) -> ErrorOrVoid {
         for (Index i = 0; i < 1000; ++i) {
           const auto &row = corpus.data[i];
-          double value = 0.0;
+          auto value = x[0] * 0.0;
           for (Index j = 0; j < 4; ++j) {
-            value += x[j] * row[j];
+            value = value + x[j] * row[j];
           }
           r[i] = value - row.back();
         }
@@ -2330,13 +2779,14 @@ ProblemReport run_problem(const std::filesystem::path &problem_dir) {
     } else if (corpus.model_id == "linear_dense" && corpus.m == 10000 &&
                corpus.n == 4) {
       auto residual_dynamic =
-          [&](ConstVectorView<std::dynamic_extent> x,
-              VectorView<std::dynamic_extent> r) -> ErrorOrVoid {
+          [&]<class Scalar>(
+              ConstVectorView<std::dynamic_extent, Scalar> x,
+              VectorView<std::dynamic_extent, Scalar> r) -> ErrorOrVoid {
         for (Index i = 0; i < corpus.m; ++i) {
           const auto &row = corpus.data[i];
-          double value = 0.0;
+          auto value = x[0] * 0.0;
           for (Index j = 0; j < 4; ++j) {
-            value += x[j] * row[j];
+            value = value + x[j] * row[j];
           }
           r[i] = value - row.back();
         }
@@ -2354,13 +2804,14 @@ ProblemReport run_problem(const std::filesystem::path &problem_dir) {
         }
         return {};
       };
-      auto residual_static = [&](ConstVectorView<4> x,
-                                 VectorView<10000> r) -> ErrorOrVoid {
+      auto residual_static =
+          [&]<class Scalar>(ConstVectorView<4, Scalar> x,
+                            VectorView<10000, Scalar> r) -> ErrorOrVoid {
         for (Index i = 0; i < 10000; ++i) {
           const auto &row = corpus.data[i];
-          double value = 0.0;
+          auto value = x[0] * 0.0;
           for (Index j = 0; j < 4; ++j) {
-            value += x[j] * row[j];
+            value = value + x[j] * row[j];
           }
           r[i] = value - row.back();
         }
@@ -2381,8 +2832,9 @@ ProblemReport run_problem(const std::filesystem::path &problem_dir) {
     } else if (corpus.model_id == "rational_dense" && corpus.m == 32 &&
                corpus.n == 32) {
       auto residual_dynamic =
-          [&](ConstVectorView<std::dynamic_extent> x,
-              VectorView<std::dynamic_extent> r) -> ErrorOrVoid {
+          [&]<class Scalar>(
+              ConstVectorView<std::dynamic_extent, Scalar> x,
+              VectorView<std::dynamic_extent, Scalar> r) -> ErrorOrVoid {
         constexpr Index Half = 16;
         for (Index i = 0; i < corpus.m; ++i) {
           const auto &row = corpus.data[i];
@@ -2391,11 +2843,11 @@ ProblemReport run_problem(const std::filesystem::path &problem_dir) {
           powers[0] = 1.0;
           for (Index j = 1; j <= Half; ++j)
             powers[j] = powers[j - 1] * xv;
-          double num = 0.0;
-          double den = 1.0;
+          auto num = x[0] * 0.0;
+          auto den = x[0] * 0.0 + 1.0;
           for (Index j = 0; j < Half; ++j) {
-            num += x[j] * powers[j];
-            den += x[Half + j] * powers[j + 1];
+            num = num + x[j] * powers[j];
+            den = den + x[Half + j] * powers[j + 1];
           }
           r[i] = num / den - row.back();
         }
@@ -2416,8 +2868,8 @@ ProblemReport run_problem(const std::filesystem::path &problem_dir) {
           double num = 0.0;
           double den = 1.0;
           for (Index j = 0; j < Half; ++j) {
-            num += x[j] * powers[j];
-            den += x[Half + j] * powers[j + 1];
+            num = num + x[j] * powers[j];
+            den = den + x[Half + j] * powers[j + 1];
           }
           const double den2 = den * den;
           for (Index j = 0; j < Half; ++j) {
@@ -2427,8 +2879,9 @@ ProblemReport run_problem(const std::filesystem::path &problem_dir) {
         }
         return {};
       };
-      auto residual_static = [&](ConstVectorView<32> x,
-                                 VectorView<32> r) -> ErrorOrVoid {
+      auto residual_static =
+          [&]<class Scalar>(ConstVectorView<32, Scalar> x,
+                            VectorView<32, Scalar> r) -> ErrorOrVoid {
         constexpr Index Half = 16;
         for (Index i = 0; i < 32; ++i) {
           const auto &row = corpus.data[i];
@@ -2437,11 +2890,11 @@ ProblemReport run_problem(const std::filesystem::path &problem_dir) {
           powers[0] = 1.0;
           for (Index j = 1; j <= Half; ++j)
             powers[j] = powers[j - 1] * xv;
-          double num = 0.0;
-          double den = 1.0;
+          auto num = x[0] * 0.0;
+          auto den = x[0] * 0.0 + 1.0;
           for (Index j = 0; j < Half; ++j) {
-            num += x[j] * powers[j];
-            den += x[Half + j] * powers[j + 1];
+            num = num + x[j] * powers[j];
+            den = den + x[Half + j] * powers[j + 1];
           }
           r[i] = num / den - row.back();
         }
@@ -2460,8 +2913,8 @@ ProblemReport run_problem(const std::filesystem::path &problem_dir) {
           double num = 0.0;
           double den = 1.0;
           for (Index j = 0; j < Half; ++j) {
-            num += x[j] * powers[j];
-            den += x[Half + j] * powers[j + 1];
+            num = num + x[j] * powers[j];
+            den = den + x[Half + j] * powers[j + 1];
           }
           const double den2 = den * den;
           for (Index j = 0; j < Half; ++j) {
@@ -2476,8 +2929,9 @@ ProblemReport run_problem(const std::filesystem::path &problem_dir) {
     } else if (corpus.model_id == "rational_dense" && corpus.m == 64 &&
                corpus.n == 64) {
       auto residual_dynamic =
-          [&](ConstVectorView<std::dynamic_extent> x,
-              VectorView<std::dynamic_extent> r) -> ErrorOrVoid {
+          [&]<class Scalar>(
+              ConstVectorView<std::dynamic_extent, Scalar> x,
+              VectorView<std::dynamic_extent, Scalar> r) -> ErrorOrVoid {
         constexpr Index Half = 32;
         for (Index i = 0; i < corpus.m; ++i) {
           const auto &row = corpus.data[i];
@@ -2486,11 +2940,11 @@ ProblemReport run_problem(const std::filesystem::path &problem_dir) {
           powers[0] = 1.0;
           for (Index j = 1; j <= Half; ++j)
             powers[j] = powers[j - 1] * xv;
-          double num = 0.0;
-          double den = 1.0;
+          auto num = x[0] * 0.0;
+          auto den = x[0] * 0.0 + 1.0;
           for (Index j = 0; j < Half; ++j) {
-            num += x[j] * powers[j];
-            den += x[Half + j] * powers[j + 1];
+            num = num + x[j] * powers[j];
+            den = den + x[Half + j] * powers[j + 1];
           }
           r[i] = num / den - row.back();
         }
@@ -2511,8 +2965,8 @@ ProblemReport run_problem(const std::filesystem::path &problem_dir) {
           double num = 0.0;
           double den = 1.0;
           for (Index j = 0; j < Half; ++j) {
-            num += x[j] * powers[j];
-            den += x[Half + j] * powers[j + 1];
+            num = num + x[j] * powers[j];
+            den = den + x[Half + j] * powers[j + 1];
           }
           const double den2 = den * den;
           for (Index j = 0; j < Half; ++j) {
@@ -2522,8 +2976,9 @@ ProblemReport run_problem(const std::filesystem::path &problem_dir) {
         }
         return {};
       };
-      auto residual_static = [&](ConstVectorView<64> x,
-                                 VectorView<64> r) -> ErrorOrVoid {
+      auto residual_static =
+          [&]<class Scalar>(ConstVectorView<64, Scalar> x,
+                            VectorView<64, Scalar> r) -> ErrorOrVoid {
         constexpr Index Half = 32;
         for (Index i = 0; i < 64; ++i) {
           const auto &row = corpus.data[i];
@@ -2532,11 +2987,11 @@ ProblemReport run_problem(const std::filesystem::path &problem_dir) {
           powers[0] = 1.0;
           for (Index j = 1; j <= Half; ++j)
             powers[j] = powers[j - 1] * xv;
-          double num = 0.0;
-          double den = 1.0;
+          auto num = x[0] * 0.0;
+          auto den = x[0] * 0.0 + 1.0;
           for (Index j = 0; j < Half; ++j) {
-            num += x[j] * powers[j];
-            den += x[Half + j] * powers[j + 1];
+            num = num + x[j] * powers[j];
+            den = den + x[Half + j] * powers[j + 1];
           }
           r[i] = num / den - row.back();
         }
@@ -2571,14 +3026,15 @@ ProblemReport run_problem(const std::filesystem::path &problem_dir) {
     } else if (corpus.model_id == "exp_sum" && corpus.m == 512 &&
                corpus.n == 32) {
       auto residual_dynamic =
-          [&](ConstVectorView<std::dynamic_extent> x,
-              VectorView<std::dynamic_extent> r) -> ErrorOrVoid {
+          [&]<class Scalar>(
+              ConstVectorView<std::dynamic_extent, Scalar> x,
+              VectorView<std::dynamic_extent, Scalar> r) -> ErrorOrVoid {
         for (Index i = 0; i < corpus.m; ++i) {
           const auto &row = corpus.data[i];
           const double xv = row[0];
-          double value = 0.0;
+          auto value = x[0] * 0.0;
           for (Index j = 0; j < corpus.n; j += 2) {
-            value += x[j] * std::exp(-x[j + 1] * xv);
+            value = value + x[j] * exp(-x[j + 1] * xv);
           }
           r[i] = value - row.back();
         }
@@ -2599,14 +3055,15 @@ ProblemReport run_problem(const std::filesystem::path &problem_dir) {
         }
         return {};
       };
-      auto residual_static = [&](ConstVectorView<32> x,
-                                 VectorView<512> r) -> ErrorOrVoid {
+      auto residual_static =
+          [&]<class Scalar>(ConstVectorView<32, Scalar> x,
+                            VectorView<512, Scalar> r) -> ErrorOrVoid {
         for (Index i = 0; i < 512; ++i) {
           const auto &row = corpus.data[i];
           const double xv = row[0];
-          double value = 0.0;
+          auto value = x[0] * 0.0;
           for (Index j = 0; j < 32; j += 2) {
-            value += x[j] * std::exp(-x[j + 1] * xv);
+            value = value + x[j] * exp(-x[j + 1] * xv);
           }
           r[i] = value - row.back();
         }
@@ -2630,14 +3087,15 @@ ProblemReport run_problem(const std::filesystem::path &problem_dir) {
     } else if (corpus.model_id == "exp_sum" && corpus.m == 1024 &&
                corpus.n == 64) {
       auto residual_dynamic =
-          [&](ConstVectorView<std::dynamic_extent> x,
-              VectorView<std::dynamic_extent> r) -> ErrorOrVoid {
+          [&]<class Scalar>(
+              ConstVectorView<std::dynamic_extent, Scalar> x,
+              VectorView<std::dynamic_extent, Scalar> r) -> ErrorOrVoid {
         for (Index i = 0; i < corpus.m; ++i) {
           const auto &row = corpus.data[i];
           const double xv = row[0];
-          double value = 0.0;
+          auto value = x[0] * 0.0;
           for (Index j = 0; j < corpus.n; j += 2) {
-            value += x[j] * std::exp(-x[j + 1] * xv);
+            value = value + x[j] * exp(-x[j + 1] * xv);
           }
           r[i] = value - row.back();
         }
@@ -2658,14 +3116,15 @@ ProblemReport run_problem(const std::filesystem::path &problem_dir) {
         }
         return {};
       };
-      auto residual_static = [&](ConstVectorView<64> x,
-                                 VectorView<1024> r) -> ErrorOrVoid {
+      auto residual_static =
+          [&]<class Scalar>(ConstVectorView<64, Scalar> x,
+                            VectorView<1024, Scalar> r) -> ErrorOrVoid {
         for (Index i = 0; i < 1024; ++i) {
           const auto &row = corpus.data[i];
           const double xv = row[0];
-          double value = 0.0;
+          auto value = x[0] * 0.0;
           for (Index j = 0; j < 64; j += 2) {
-            value += x[j] * std::exp(-x[j + 1] * xv);
+            value = value + x[j] * exp(-x[j + 1] * xv);
           }
           r[i] = value - row.back();
         }
@@ -2772,6 +3231,9 @@ void print_problem_report(const ProblemReport &report) {
   if (report.central_difference_stats.count > 0) {
     print_stats_line("central_diff", report.central_difference_stats);
   }
+  for (const auto &failure : report.solver_failures) {
+    std::cout << "  solver_failure: " << failure << '\n';
+  }
 }
 
 void print_summary(const SummaryStats &summary) {
@@ -2868,6 +3330,27 @@ void print_summary(const SummaryStats &summary) {
   }
   if (summary.central_difference_stats.count > 0) {
     print_stats_line("central_diff", summary.central_difference_stats);
+  }
+  if (summary.solver_start_cases > 0) {
+    std::cout << "  solver_start_cases: passed="
+              << summary.solver_start_case_passes
+              << " failed=" << summary.solver_failures.size()
+              << " total=" << summary.solver_start_cases
+              << " dynamic_average_lre="
+              << summary.solver_dynamic_lre_sum / summary.solver_start_cases
+              << " static_average_lre="
+              << summary.solver_static_lre_sum / summary.solver_start_cases
+              << '\n';
+    if (summary.solver_dynamic_seconds > 0.0 ||
+        summary.solver_static_seconds > 0.0) {
+      std::cout << "  solver_seconds: dynamic_total="
+                << summary.solver_dynamic_seconds << " dynamic_mean="
+                << summary.solver_dynamic_seconds / summary.solver_start_cases
+                << " static_total=" << summary.solver_static_seconds
+                << " static_mean="
+                << summary.solver_static_seconds / summary.solver_start_cases
+                << '\n';
+    }
   }
 }
 
@@ -3127,6 +3610,83 @@ void write_csv_report(const std::filesystem::path &path,
             summary.forward_difference_stats, summary.central_difference_stats);
 }
 
+void write_solver_work_csv(const std::filesystem::path &path,
+                           const std::vector<ProblemReport> &analytic_reports,
+                           const std::vector<ProblemReport> &autodiff_reports,
+                           bool include_levmar) {
+  std::ofstream file(path);
+  if (!file) {
+    throw std::runtime_error("Failed to open solver work CSV path " +
+                             path.string());
+  }
+  file << "solver,derivative,problem,start,extent,m,n,elapsed_ms,termination,lre,"
+          "final_cost,lambda,gradient_inf_norm,step_norm,iterations,"
+          "function_evaluations,jacobian_evaluations,linear_solves,"
+          "accepted_steps,rejected_steps\n";
+  const auto write_levmar_reports =
+      [&](std::string_view derivative,
+          const std::vector<ProblemReport> &reports) {
+        for (const auto &report : reports) {
+          for (const auto &row : report.solver_work_rows) {
+            const auto &result = row.result;
+        file << "levmar," << derivative << ',' << report.name << ','
+             << row.start_label << ',' << row.extent << ',' << row.m << ','
+             << row.n << ',' << std::setprecision(17)
+             << milliseconds(row.elapsed_seconds) << ','
+             << termination_reason_name(result.termination) << ',' << row.lre << ','
+                 << result.final_cost << ',' << result.lambda << ','
+                 << result.gradient_inf_norm << ',' << result.step_norm << ','
+                 << result.iterations << ',' << result.function_evaluations
+                 << ',' << result.jacobian_evaluations << ','
+                 << result.linear_solves << ',' << result.accepted_steps << ','
+                 << result.rejected_steps << '\n';
+          }
+        }
+      };
+  if (include_levmar) {
+    write_levmar_reports("analytic", analytic_reports);
+    write_levmar_reports("autodiff", autodiff_reports);
+  }
+  const auto write_external_reports =
+      [&](const std::vector<ProblemReport> &reports) {
+        for (const auto &report : reports) {
+          for (const auto &result : report.external_solver_results) {
+            const bool finite_difference = result.solver.ends_with("lmdif");
+            const bool autodiff = result.solver.ends_with("autodiff");
+            file << result.solver << ','
+                 << (finite_difference ? "finite_difference"
+                     : autodiff        ? "autodiff"
+                                       : "analytic")
+                 << ',' << report.name << ',' << result.start_label << ','
+                 << (autodiff ? "static" : "dynamic") << ',' << result.m << ','
+                 << result.n << ',' << std::setprecision(17)
+                 << milliseconds(result.seconds) << ','
+                 << (result.usable ? "converged" : "failed") << ',' << result.lre
+                 << ",nan,nan,nan,nan," << result.iterations << ','
+                 << result.function_evaluations << ','
+                 << (result.has_jacobian_evaluations
+                         ? std::to_string(result.jacobian_evaluations)
+                         : "nan")
+                 << ','
+                 << (result.has_linear_solves
+                         ? std::to_string(result.linear_solves)
+                         : "nan")
+                 << ','
+                 << (result.has_accepted_steps
+                         ? std::to_string(result.accepted_steps)
+                         : "nan")
+                 << ','
+                 << (result.has_rejected_steps
+                         ? std::to_string(result.rejected_steps)
+                         : "nan")
+                 << '\n';
+          }
+        }
+      };
+  write_external_reports(analytic_reports);
+  write_external_reports(autodiff_reports);
+}
+
 void write_benchmark_csv_rows(std::ofstream &file, const std::string &scope,
                               const std::string &name, std::uint64_t iterations,
                               const TimingMoments &dynamic,
@@ -3301,7 +3861,8 @@ benchmark_summary(const std::vector<std::filesystem::path> &problem_dirs,
   for (std::uint64_t iteration = 0; iteration < iterations; ++iteration) {
     SummaryStats iteration_summary;
     for (Index i = 0; i < problem_dirs.size(); ++i) {
-      const auto report = run_problem(problem_dirs[i]);
+      const auto report =
+          run_problem<NistAnalyticSolverPolicy>(problem_dirs[i]);
       problem_benchmarks[i].name = report.name;
       problem_benchmarks[i].dynamic_timing.add(report.dynamic_timing);
       problem_benchmarks[i].static_timing.add(report.static_timing);
@@ -3314,6 +3875,312 @@ benchmark_summary(const std::vector<std::filesystem::path> &problem_dirs,
   return summary_benchmark;
 }
 
+template <class Policy>
+SolverBenchmark
+benchmark_solver(const std::vector<std::filesystem::path> &problem_dirs,
+                 std::uint64_t iterations,
+                 bool enable_relative_cost_termination = true) {
+  SolverBenchmark benchmark;
+  for (std::uint64_t iteration = 0; iteration < iterations; ++iteration) {
+    SummaryStats summary;
+    for (const auto &path : problem_dirs) {
+      merge_summary(summary, run_problem<Policy>(
+                                 path, true, true, iteration, false, false,
+                                 enable_relative_cost_termination));
+    }
+    benchmark.dynamic_total.add(summary.solver_dynamic_seconds);
+    benchmark.static_total.add(summary.solver_static_seconds);
+  }
+  return benchmark;
+}
+
+std::map<std::string, ExternalSolverBenchmark> benchmark_external_solvers(
+    const std::vector<std::filesystem::path> &problem_dirs,
+    std::uint64_t iterations) {
+  std::map<std::string, ExternalSolverBenchmark> benchmarks;
+
+  for (std::uint64_t iteration = 0; iteration < iterations; ++iteration) {
+    // Accumulate a complete-suite time for each solver.  This makes one
+    // ExternalSolverBenchmark::seconds sample directly comparable to one
+    // SolverBenchmark dynamic_total/static_total sample.
+    std::map<std::string, double> sweep_seconds;
+
+    for (const auto &path : problem_dirs) {
+      const auto report = run_problem<NistAnalyticSolverPolicy>(
+          path, true, false, iteration, true, false);
+      for (const auto &result : report.external_solver_results) {
+        sweep_seconds[result.solver] += result.seconds;
+
+        // Case-level statistics do not depend on timing repetition.  Record
+        // them only on the first sweep so passed/total is the actual NIST case
+        // count rather than case_count * benchmark_iterations.
+        if (iteration == 0) {
+          auto &benchmark = benchmarks[result.solver];
+          ++benchmark.cases;
+          benchmark.lre.add(result.lre);
+          benchmark.iterations.add(result.iterations);
+          benchmark.function_evaluations.add(result.function_evaluations);
+          if (result.has_jacobian_evaluations) {
+            benchmark.jacobian_evaluations.add(result.jacobian_evaluations);
+          }
+          if (result.has_linear_solves) {
+            benchmark.linear_solves.add(result.linear_solves);
+          }
+          if (result.has_accepted_steps) {
+            benchmark.accepted_steps.add(result.accepted_steps);
+          }
+          if (result.has_rejected_steps) {
+            benchmark.rejected_steps.add(result.rejected_steps);
+          }
+          if (result.usable) {
+            ++benchmark.usable;
+          }
+        }
+      }
+    }
+
+    for (const auto &[solver, seconds] : sweep_seconds) {
+      benchmarks[solver].seconds.add(seconds);
+    }
+  }
+  return benchmarks;
+}
+
+void print_solver_benchmark(const SolverBenchmark &benchmark,
+                            std::uint64_t iterations, Index start_cases) {
+  std::cout << std::fixed << std::setprecision(4);
+  std::cout << "solver_benchmark iterations=" << iterations
+            << " start_cases=" << start_cases << '\n';
+  print_timing_moment_line("solver_sweep", benchmark.dynamic_total,
+                           benchmark.static_total);
+}
+
+void print_solver_comparison(const SummaryStats &analytic_summary,
+                             const SolverBenchmark &analytic_benchmark,
+                             const SummaryStats &autodiff_summary,
+                             const SolverBenchmark &autodiff_benchmark,
+                             std::uint64_t iterations) {
+  const auto print_row = [](std::string_view name, std::string_view dynamic,
+                            std::string_view statik,
+                            const SummaryStats &summary,
+                            const SolverBenchmark &benchmark) {
+    const double cases = static_cast<double>(summary.solver_start_cases);
+    std::cout << "  " << name << " (" << dynamic << " / " << statik
+              << "): dynamic=" << milliseconds(benchmark.dynamic_total.mean())
+              << " +/- " << milliseconds(benchmark.dynamic_total.stddev())
+              << "ms static=" << milliseconds(benchmark.static_total.mean())
+              << " +/- " << milliseconds(benchmark.static_total.stddev())
+              << "ms dynamic_lre="
+              << summary.solver_dynamic_lre_sum / summary.solver_start_cases
+              << " static_lre="
+              << summary.solver_static_lre_sum / summary.solver_start_cases
+              << " passed=" << summary.solver_start_case_passes << '/'
+              << summary.solver_start_cases << " dynamic_function_evaluations="
+              << summary.solver_dynamic_function_evaluations / cases
+              << " static_function_evaluations="
+              << summary.solver_static_function_evaluations / cases
+              << " dynamic_jacobian_evaluations="
+              << summary.solver_dynamic_jacobian_evaluations / cases
+              << " static_jacobian_evaluations="
+              << summary.solver_static_jacobian_evaluations / cases
+              << " dynamic_linear_solves="
+              << summary.solver_dynamic_linear_solves / cases
+              << " static_linear_solves="
+              << summary.solver_static_linear_solves / cases
+              << " dynamic_accepted_steps="
+              << summary.solver_dynamic_accepted_steps / cases
+              << " static_accepted_steps="
+              << summary.solver_static_accepted_steps / cases
+              << " dynamic_rejected_steps="
+              << summary.solver_dynamic_rejected_steps / cases
+              << " static_rejected_steps="
+              << summary.solver_static_rejected_steps / cases << '\n';
+  };
+
+  std::cout << std::fixed << std::setprecision(4);
+  std::cout << "solver_comparison iterations=" << iterations << '\n';
+  print_row("analytic", "analytic", "analytic", analytic_summary,
+            analytic_benchmark);
+  print_row("autodiff", "graph", "dual", autodiff_summary, autodiff_benchmark);
+}
+
+void print_external_solver_benchmarks(
+    const std::map<std::string, ExternalSolverBenchmark> &benchmarks) {
+  const auto mean_or_nan = [](const ScalarMoments &moments) {
+    return moments.count == 0 ? std::numeric_limits<double>::quiet_NaN()
+                              : moments.mean();
+  };
+  std::cout << std::fixed << std::setprecision(4);
+  for (const auto &[name, benchmark] : benchmarks) {
+    std::cout << "  " << name
+              << ": mean=" << milliseconds(benchmark.seconds.mean()) << " +/- "
+              << milliseconds(benchmark.seconds.stddev())
+              << "ms lre=" << benchmark.lre.mean()
+              << " passed=" << benchmark.usable << '/' << benchmark.cases
+              << " timing_samples=" << benchmark.seconds.count
+              << " function_evaluations="
+              << benchmark.function_evaluations.mean()
+              << " jacobian_evaluations="
+              << mean_or_nan(benchmark.jacobian_evaluations)
+              << " linear_solves=" << mean_or_nan(benchmark.linear_solves)
+              << " accepted_steps=" << mean_or_nan(benchmark.accepted_steps)
+              << " rejected_steps=" << mean_or_nan(benchmark.rejected_steps)
+              << '\n';
+  }
+}
+
+void write_solver_benchmark_csv(const std::filesystem::path &path,
+                                const SolverBenchmark &benchmark,
+                                std::uint64_t iterations) {
+  std::ofstream file(path);
+  if (!file) {
+    throw std::runtime_error("Failed to open benchmark CSV path " +
+                             path.string());
+  }
+  file << "scope,name,iterations,metric,dynamic_mean_ms,dynamic_stddev_ms,"
+          "static_mean_ms,static_stddev_ms\n";
+  file << "summary,summary," << iterations << ",solver_sweep,"
+       << std::setprecision(17) << milliseconds(benchmark.dynamic_total.mean())
+       << ',' << milliseconds(benchmark.dynamic_total.stddev()) << ','
+       << milliseconds(benchmark.static_total.mean()) << ','
+       << milliseconds(benchmark.static_total.stddev()) << '\n';
+}
+
+void write_external_solver_benchmark_csv(
+    const std::filesystem::path &path,
+    const std::map<std::string, ExternalSolverBenchmark> &benchmarks,
+    std::uint64_t iterations) {
+  std::ofstream file(path, std::ios::app);
+  if (!file) {
+    throw std::runtime_error("Failed to open benchmark CSV path " +
+                             path.string());
+  }
+  for (const auto &[name, benchmark] : benchmarks) {
+    file << "external," << name << ',' << iterations << ",solver_sweep,"
+         << std::setprecision(17) << milliseconds(benchmark.seconds.mean())
+         << ',' << milliseconds(benchmark.seconds.stddev()) << ",nan,nan\n";
+  }
+}
+
+void write_solver_comparison_csv(
+    const std::filesystem::path &path, const SummaryStats &analytic_summary,
+    const SolverBenchmark &analytic_benchmark,
+    const SummaryStats &autodiff_summary,
+    const SolverBenchmark &autodiff_benchmark,
+    const std::map<std::string, ExternalSolverBenchmark> &external_benchmarks,
+    std::uint64_t iterations) {
+  std::ofstream file(path);
+  if (!file) {
+    throw std::runtime_error("Failed to open benchmark CSV path " +
+                             path.string());
+  }
+  file << "solver,derivative,iterations,samples,mean_ms,stddev_ms,mean_lre,"
+          "passed,total,mean_function_evaluations,"
+          "mean_jacobian_evaluations,mean_linear_solves,mean_accepted_steps,"
+          "mean_rejected_steps\n";
+  const auto write_levmar =
+      [&](std::string_view derivative, const ScalarMoments &timing, double lre,
+          Index passed, Index total, double mean_function_evaluations,
+          double mean_jacobian_evaluations, double mean_linear_solves,
+          double mean_accepted_steps, double mean_rejected_steps) {
+        file << "levmar," << derivative << ',' << iterations << ','
+             << timing.count << ',' << std::setprecision(17)
+             << milliseconds(timing.mean()) << ','
+             << milliseconds(timing.stddev()) << ',' << lre << ',' << passed
+             << ',' << total << ',' << mean_function_evaluations << ','
+             << mean_jacobian_evaluations << ',' << mean_linear_solves << ','
+             << mean_accepted_steps << ',' << mean_rejected_steps << '\n';
+      };
+  write_levmar(
+      "dynamic_analytic", analytic_benchmark.dynamic_total,
+      analytic_summary.solver_dynamic_lre_sum /
+          analytic_summary.solver_start_cases,
+      analytic_summary.solver_start_case_passes,
+      analytic_summary.solver_start_cases,
+      static_cast<double>(
+          analytic_summary.solver_dynamic_function_evaluations) /
+          analytic_summary.solver_start_cases,
+      static_cast<double>(
+          analytic_summary.solver_dynamic_jacobian_evaluations) /
+          analytic_summary.solver_start_cases,
+      static_cast<double>(analytic_summary.solver_dynamic_linear_solves) /
+          analytic_summary.solver_start_cases,
+      static_cast<double>(analytic_summary.solver_dynamic_accepted_steps) /
+          analytic_summary.solver_start_cases,
+      static_cast<double>(analytic_summary.solver_dynamic_rejected_steps) /
+          analytic_summary.solver_start_cases);
+  write_levmar(
+      "static_analytic", analytic_benchmark.static_total,
+      analytic_summary.solver_static_lre_sum /
+          analytic_summary.solver_start_cases,
+      analytic_summary.solver_start_case_passes,
+      analytic_summary.solver_start_cases,
+      static_cast<double>(analytic_summary.solver_static_function_evaluations) /
+          analytic_summary.solver_start_cases,
+      static_cast<double>(analytic_summary.solver_static_jacobian_evaluations) /
+          analytic_summary.solver_start_cases,
+      static_cast<double>(analytic_summary.solver_static_linear_solves) /
+          analytic_summary.solver_start_cases,
+      static_cast<double>(analytic_summary.solver_static_accepted_steps) /
+          analytic_summary.solver_start_cases,
+      static_cast<double>(analytic_summary.solver_static_rejected_steps) /
+          analytic_summary.solver_start_cases);
+  write_levmar(
+      "dynamic_graph_autodiff", autodiff_benchmark.dynamic_total,
+      autodiff_summary.solver_dynamic_lre_sum /
+          autodiff_summary.solver_start_cases,
+      autodiff_summary.solver_start_case_passes,
+      autodiff_summary.solver_start_cases,
+      static_cast<double>(
+          autodiff_summary.solver_dynamic_function_evaluations) /
+          autodiff_summary.solver_start_cases,
+      static_cast<double>(
+          autodiff_summary.solver_dynamic_jacobian_evaluations) /
+          autodiff_summary.solver_start_cases,
+      static_cast<double>(autodiff_summary.solver_dynamic_linear_solves) /
+          autodiff_summary.solver_start_cases,
+      static_cast<double>(autodiff_summary.solver_dynamic_accepted_steps) /
+          autodiff_summary.solver_start_cases,
+      static_cast<double>(autodiff_summary.solver_dynamic_rejected_steps) /
+          autodiff_summary.solver_start_cases);
+  write_levmar(
+      "static_dual_autodiff", autodiff_benchmark.static_total,
+      autodiff_summary.solver_static_lre_sum /
+          autodiff_summary.solver_start_cases,
+      autodiff_summary.solver_start_case_passes,
+      autodiff_summary.solver_start_cases,
+      static_cast<double>(autodiff_summary.solver_static_function_evaluations) /
+          autodiff_summary.solver_start_cases,
+      static_cast<double>(autodiff_summary.solver_static_jacobian_evaluations) /
+          autodiff_summary.solver_start_cases,
+      static_cast<double>(autodiff_summary.solver_static_linear_solves) /
+          autodiff_summary.solver_start_cases,
+      static_cast<double>(autodiff_summary.solver_static_accepted_steps) /
+          autodiff_summary.solver_start_cases,
+      static_cast<double>(autodiff_summary.solver_static_rejected_steps) /
+          autodiff_summary.solver_start_cases);
+  const auto mean_or_nan = [](const ScalarMoments &moments) {
+    return moments.count == 0 ? std::numeric_limits<double>::quiet_NaN()
+                              : moments.mean();
+  };
+  for (const auto &[solver, benchmark] : external_benchmarks) {
+    file << solver << ','
+         << (solver.ends_with("lmdif")      ? "finite_difference"
+             : solver.ends_with("lmder")    ? "analytic"
+             : solver.ends_with("autodiff") ? "autodiff"
+                                            : "analytic")
+         << ',' << iterations << ',' << benchmark.seconds.count << ','
+         << std::setprecision(17) << milliseconds(benchmark.seconds.mean())
+         << ',' << milliseconds(benchmark.seconds.stddev()) << ','
+         << benchmark.lre.mean() << ',' << benchmark.usable << ','
+         << benchmark.cases << ',' << benchmark.function_evaluations.mean()
+         << ',' << mean_or_nan(benchmark.jacobian_evaluations) << ','
+         << mean_or_nan(benchmark.linear_solves) << ','
+         << mean_or_nan(benchmark.accepted_steps) << ','
+         << mean_or_nan(benchmark.rejected_steps) << '\n';
+  }
+}
+
 } // namespace
 
 int main(int argc, char **argv) {
@@ -3321,6 +4188,7 @@ int main(int argc, char **argv) {
     std::filesystem::path corpus_dir;
     std::filesystem::path csv_path;
     std::filesystem::path benchmark_csv_path;
+    std::filesystem::path solver_work_csv_path;
     if (argc > 1) {
       corpus_dir = argv[1];
     } else {
@@ -3336,8 +4204,41 @@ int main(int argc, char **argv) {
     if (argc > 3) {
       benchmark_iterations = static_cast<std::uint64_t>(std::stoull(argv[3]));
     }
-    if (argc > 4) {
-      benchmark_csv_path = argv[4];
+    bool solve_all_starts = false;
+    bool solve_all_autodiff = false;
+    bool solve_all_external = false;
+    bool benchmark_solvers = false;
+    bool validation_only = false;
+    bool solver_work_external = false;
+    bool relative_cost_termination = true;
+    for (int i = 4; i < argc; ++i) {
+      if (std::string_view(argv[i]) == "--solve-all") {
+        solve_all_starts = true;
+      } else if (std::string_view(argv[i]) == "--solve-all-autodiff") {
+        solve_all_starts = true;
+        solve_all_autodiff = true;
+      } else if (std::string_view(argv[i]) == "--solve-all-external") {
+        solve_all_starts = true;
+        solve_all_external = true;
+      } else if (std::string_view(argv[i]) == "--benchmark-solvers") {
+        benchmark_solvers = true;
+        solve_all_autodiff = true;
+        solve_all_external = true;
+      } else if (std::string_view(argv[i]) == "--validate") {
+        validation_only = true;
+      } else if (std::string_view(argv[i]) == "--solver-work-csv") {
+        if (++i == argc) {
+          throw std::runtime_error("--solver-work-csv requires a path");
+        }
+        solver_work_csv_path = argv[i];
+      } else if (std::string_view(argv[i]) == "--solver-work-external") {
+        solver_work_external = true;
+      } else if (std::string_view(argv[i]) ==
+                 "--disable-relative-cost-termination") {
+        relative_cost_termination = false;
+      } else {
+        benchmark_csv_path = argv[i];
+      }
     }
 
     std::vector<std::filesystem::path> problem_dirs;
@@ -3346,18 +4247,126 @@ int main(int argc, char **argv) {
         problem_dirs.push_back(entry.path());
       }
     }
+
     std::ranges::sort(problem_dirs);
+
+    if (!solver_work_csv_path.empty()) {
+      std::vector<ProblemReport> analytic_reports;
+      std::vector<ProblemReport> autodiff_reports;
+      for (const auto &path : problem_dirs) {
+        auto analytic_report = run_problem<NistAnalyticSolverPolicy>(
+            path, true, false, 0, solver_work_external, false,
+            relative_cost_termination);
+        analytic_reports.push_back(std::move(analytic_report));
+        if (!solver_work_external) {
+          auto autodiff_report = run_problem<NistAutoDiffSolverPolicy>(
+              path, true, false, 0, false, false, relative_cost_termination);
+          autodiff_reports.push_back(std::move(autodiff_report));
+        }
+      }
+      write_solver_work_csv(solver_work_csv_path, analytic_reports,
+                            autodiff_reports, !solver_work_external);
+      return 0;
+    }
+
+    if (benchmark_solvers) {
+      SummaryStats analytic_summary;
+      SummaryStats autodiff_summary;
+      for (const auto &path : problem_dirs) {
+        merge_summary(analytic_summary, run_problem<NistAnalyticSolverPolicy>(
+                                            path, true, false, 0, false, false,
+                                            relative_cost_termination));
+        merge_summary(autodiff_summary, run_problem<NistAutoDiffSolverPolicy>(
+                                            path, true, false, 0, false, false,
+                                            relative_cost_termination));
+      }
+      const auto analytic_benchmark =
+          benchmark_solver<NistAnalyticSolverPolicy>(
+              problem_dirs, benchmark_iterations, relative_cost_termination);
+      const auto autodiff_benchmark =
+          benchmark_solver<NistAutoDiffSolverPolicy>(
+              problem_dirs, benchmark_iterations, relative_cost_termination);
+      print_solver_comparison(analytic_summary, analytic_benchmark,
+                              autodiff_summary, autodiff_benchmark,
+                              benchmark_iterations);
+      const auto external_benchmarks =
+          benchmark_external_solvers(problem_dirs, benchmark_iterations);
+      if (external_benchmarks.empty()) {
+        throw std::runtime_error(
+            "External solver benchmarks are unavailable; configure with "
+            "-DLEVMAR_BUILD_EXTERNAL_BENCHMARKS=ON and install Ceres or "
+            "CMinpack");
+      }
+      print_external_solver_benchmarks(external_benchmarks);
+      if (!benchmark_csv_path.empty()) {
+        write_solver_comparison_csv(benchmark_csv_path, analytic_summary,
+                                    analytic_benchmark, autodiff_summary,
+                                    autodiff_benchmark, external_benchmarks,
+                                    benchmark_iterations);
+      }
+      return 0;
+    }
 
     SummaryStats summary;
     std::vector<ProblemReport> reports;
     for (const auto &path : problem_dirs) {
-      const auto report = run_problem(path);
+      auto report = run_problem<NistAnalyticSolverPolicy>(
+          path, solve_all_starts, false, 0, false, true,
+          relative_cost_termination);
       print_problem_report(report);
       merge_summary(summary, report);
       reports.push_back(report);
     }
     print_summary(summary);
     write_csv_report(csv_path, reports, summary);
+    if (validation_only) {
+      std::cout << "all corpus checks passed\n";
+      return 0;
+    }
+    if (solve_all_starts) {
+      const auto solver_benchmark = benchmark_solver<NistAnalyticSolverPolicy>(
+          problem_dirs, benchmark_iterations);
+      print_solver_benchmark(solver_benchmark, benchmark_iterations,
+                             summary.solver_start_cases);
+      if (!benchmark_csv_path.empty()) {
+        write_solver_benchmark_csv(benchmark_csv_path, solver_benchmark,
+                                   benchmark_iterations);
+      }
+      if (solve_all_autodiff) {
+        SummaryStats autodiff_summary;
+        for (const auto &path : problem_dirs) {
+          merge_summary(autodiff_summary,
+                        run_problem<NistAutoDiffSolverPolicy>(path, true));
+        }
+        const auto autodiff_benchmark =
+            benchmark_solver<NistAutoDiffSolverPolicy>(problem_dirs,
+                                                       benchmark_iterations);
+        print_solver_comparison(summary, solver_benchmark, autodiff_summary,
+                                autodiff_benchmark, benchmark_iterations);
+        if (!autodiff_summary.solver_failures.empty()) {
+          return 1;
+        }
+      }
+      if (solve_all_external) {
+        const auto external_benchmarks =
+            benchmark_external_solvers(problem_dirs, benchmark_iterations);
+        if (external_benchmarks.empty()) {
+          throw std::runtime_error(
+              "External solver benchmarks are unavailable; configure with "
+              "-DLEVMAR_BUILD_EXTERNAL_BENCHMARKS=ON and install Ceres or "
+              "CMinpack");
+        }
+        print_external_solver_benchmarks(external_benchmarks);
+        if (!benchmark_csv_path.empty()) {
+          write_external_solver_benchmark_csv(
+              benchmark_csv_path, external_benchmarks, benchmark_iterations);
+        }
+      }
+      if (!summary.solver_failures.empty()) {
+        return 1;
+      }
+      return 0;
+    }
 
     std::vector<ProblemBenchmark> problem_benchmarks;
     const auto summary_benchmark = benchmark_summary(

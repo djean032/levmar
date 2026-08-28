@@ -114,6 +114,7 @@ struct Options {
   double gradient_tolerance = 1e-8;
   double step_tolerance = 1e-12;
   double cost_tolerance = 1e-12;
+  double relative_cost_tolerance = 0.0;
 
   double finite_difference_step = 0.0;
 

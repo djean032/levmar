@@ -1,5 +1,7 @@
 #pragma once
 
+#include <concepts>
+
 namespace levmar {
 
 struct UserJacobian {};
@@ -14,6 +16,12 @@ struct DampedQr {};
 struct SquaredLoss {};
 
 struct NoScaling {};
+
+struct JacobianColumnScaling {};
+
+template <class ScalingPolicy>
+inline constexpr bool kUsesJacobianColumnScaling =
+    std::same_as<ScalingPolicy, JacobianColumnScaling>;
 
 template <class Jacobian, class Strategy, class LinearAlgebra, class Loss,
           class Scaling>

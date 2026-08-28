@@ -29,15 +29,32 @@ Build and run the NIST conformance benchmark with the portable flags above:
 
 ```sh
 python3 scripts/benchmark.py
-python3 scripts/benchmark.py --iterations 100 --per-problem
+python3 scripts/benchmark.py --iterations 100 --require-external
 python3 scripts/benchmark.py --compiler icpx --env /path/to/compiler-env.sh
 ```
 
 The script configures a Release `build-benchmark/`, builds
 `levmar_nist_runner`, verifies the corpus, and writes `nist-validation.csv`,
-`nist-benchmark.csv`, and `nist-report.md` to `benchmark-results/` by default.
+`nist-solver-benchmark.csv`, and `nist-report.md` to `benchmark-results/` by
+default. The solver table compares levmar analytic, graph autodiff, and static
+dual autodiff paths with Ceres `DENSE_QR` analytic/autodiff and MINPACK
+`lmder`/`lmdif` when those optional dependencies are installed.
+It reports time, function and Jacobian evaluations, linear solves, and
+accepted/rejected steps; unavailable MINPACK counters are `nan`.
 Use `--build-dir` and `--output-dir` to select different locations. `--env`
 sources a shell setup file before CMake invokes the requested compiler.
+
+The runner exposes separate modes for direct use:
+
+```sh
+levmar_nist_runner conformance/nist_nls/corpus /tmp/validation.csv 1 --validate
+levmar_nist_runner conformance/nist_nls/corpus /tmp/validation.csv 40 \
+  /tmp/solvers.csv --benchmark-solvers
+```
+
+External solver benchmarks are optional. Enable them with
+`-DLEVMAR_BUILD_EXTERNAL_BENCHMARKS=ON`; CMake discovers `Ceres::ceres` and
+`cminpack::cminpack` independently.
 
 For manual CMake benchmark builds, pass the flags through the runner-only
 `LEVMAR_BENCHMARK_COMPILE_OPTIONS` cache variable:

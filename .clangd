@@ -1,2 +1,9 @@
 CompileFlags:
   Add: [-std=c++23]
+"clangd.arguments": [
+  "--malloc-trim",
+  "--limit-references=100",
+  "--limit-results=20",
+  "--header-insertion=never",
+  "-j=4"
+]

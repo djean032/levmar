@@ -7,6 +7,7 @@
 #include "levmar/internal/solver_workspace.h"
 #include <algorithm>
 #include <cmath>
+#include <concepts>
 #include <functional>
 #include <utility>
 
@@ -17,6 +18,14 @@
 
 namespace levmar::detail {
 
+template <Index M, Index N>
+void reset_parameter_scaling(NoScaling, LMWorkspace<M, N> &) {};
+
+template <Index M, Index N>
+void reset_parameter_scaling(JacobianColumnScaling, LMWorkspace<M, N> &work) {
+  work.scale.fill(0.0);
+};
+
 template <class Policy, Index M, Index N, ResidualCallable<M, N> Residual,
           class Jacobian>
   requires OptionalJacobianCallable<Jacobian, M, N>
@@ -26,6 +35,9 @@ initialize_solver(SolverContext<Policy, M, N, Residual, Jacobian> &context) {
       Policy, SolverContext<Policy, M, N, Residual, Jacobian>>();
 
   context.result = Result{};
+  reset_parameter_scaling(typename Policy::ScalingPolicy{},
+                          context.evaluation_context.work);
+  context.damping_multiplier = 2.0;
 
   auto &evaluation = context.evaluation_context;
   const auto &problem = evaluation.problem;
@@ -57,8 +69,38 @@ initialize_solver(SolverContext<Policy, M, N, Residual, Jacobian> &context) {
 template <class Policy, Index M, Index N, ResidualCallable<M, N> Residual,
           class Jacobian>
   requires OptionalJacobianCallable<Jacobian, M, N>
+[[nodiscard]] bool model_evaluation_budget_available(
+    SolverContext<Policy, M, N, Residual, Jacobian> &context) {
+  const auto &options = context.evaluation_context.options;
+  const Index used = context.result.function_evaluations;
+
+  Index needed = 1;
+  if constexpr (std::same_as<typename Policy::JacobianPolicy,
+                             ForwardDifferenceJacobian>) {
+    needed += context.evaluation_context.work.n;
+  } else if constexpr (std::same_as<typename Policy::JacobianPolicy,
+                                    CentralDifferenceJacobian>) {
+    needed += 2 * context.evaluation_context.work.n;
+  }
+
+  if (used > options.max_function_evaluations ||
+      needed > options.max_function_evaluations - used) {
+    context.result.termination = TerminationReason::MaxFunctionEvaluations;
+    context.result.message = "Maximum function evaluations reached";
+    return false;
+  }
+
+  return true;
+}
+
+template <class Policy, Index M, Index N, ResidualCallable<M, N> Residual,
+          class Jacobian>
+  requires OptionalJacobianCallable<Jacobian, M, N>
 [[nodiscard]] ErrorOrVoid evaluate_current_model(
     SolverContext<Policy, M, N, Residual, Jacobian> &context) {
+  if (!model_evaluation_budget_available<Policy>(context)) {
+    return {};
+  }
   auto &evaluation = context.evaluation_context;
 
   if constexpr (std::same_as<typename Policy::JacobianPolicy,
@@ -158,8 +200,8 @@ template <Index M, Index N>
   return true;
 }
 
-template <Index M, Index N>
-[[nodiscard]] bool solve_damped_qr(LMWorkspace<M, N> &work,
+template <class ScalingPolicy, Index M, Index N>
+[[nodiscard]] bool solve_damped_qr(ScalingPolicy, LMWorkspace<M, N> &work,
                                    DampedQrWorkspace<M, N> &qr, double lambda) {
   if (!std::isfinite(lambda) || lambda <= 0.0) {
     return false;
@@ -175,7 +217,11 @@ template <Index M, Index N>
 
   for (Index i = 0; i < work.m; ++i) {
     for (Index j = 0; j < work.n; ++j) {
-      qr.row[j] = work.J(i, j);
+      if constexpr (kUsesJacobianColumnScaling<ScalingPolicy>) {
+        qr.row[j] = work.J[i, j] / work.scale[j];
+      } else {
+        qr.row[j] = work.J[i, j];
+      }
     }
 
     double incoming_rhs = -work.r[i];
@@ -222,6 +268,219 @@ template <Index M, Index N>
     }
   }
 
+  if constexpr (kUsesJacobianColumnScaling<ScalingPolicy>) {
+    for (Index j = 0; j < n; ++j) {
+      work.step[j] /= work.scale[j];
+    }
+  }
+  return true;
+}
+
+template <Index M, Index N>
+[[nodiscard]] bool update_parameter_scaling(NoScaling,
+                                            LMWorkspace<M, N> &work) {
+  return true;
+}
+
+template <Index M, Index N>
+[[nodiscard]] bool update_parameter_scaling(JacobianColumnScaling,
+                                            LMWorkspace<M, N> &work) {
+  for (Index j = 0; j < work.n; ++j) {
+    double column_norm = 0.0;
+    for (Index i = 0; i < work.m; ++i) {
+      column_norm = std::hypot(column_norm, work.J(i, j));
+      if (!std::isfinite(column_norm)) {
+        return false;
+      }
+    }
+    work.scale[j] = std::max({work.scale[j], column_norm, 1.0});
+  }
+  return true;
+}
+
+template <class ScalingPolicy, Index M, Index N>
+[[nodiscard]] bool
+solve_linear_step(DampedQr, ScalingPolicy, LMWorkspace<M, N> &work,
+                  DampedQrWorkspace<M, N> &linear, double lambda) {
+  return solve_damped_qr(ScalingPolicy{}, work, linear, lambda);
+}
+
+template <class Policy, Index M, Index N, ResidualCallable<M, N> Residual,
+          class Jacobian>
+  requires OptionalJacobianCallable<Jacobian, M, N>
+[[nodiscard]] ErrorOr<bool>
+try_lm_step(SolverContext<Policy, M, N, Residual, Jacobian> &context) {
+  using LinearAlgebra = typename Policy::LinearAlgebraPolicy;
+  using Scaling = typename Policy::ScalingPolicy;
+  auto &work = context.evaluation_context.work;
+  auto &linear = context.workspace.linear;
+  auto &lm_opts = context.evaluation_context.options.lm;
+  ++context.result.linear_solves;
+
+  if (!solve_linear_step(LinearAlgebra{}, Scaling{}, work, linear,
+                         context.result.lambda)) {
+    context.result.termination = TerminationReason::NumericalFailure;
+    context.result.message = "Linear solve failed";
+    return false;
+  }
+
+  double step_squared_norm = 0.0;
+
+  for (Index j = 0; j < work.n; ++j) {
+    const double step = work.step[j];
+    work.x_trial[j] = work.x_current[j] + step;
+    step_squared_norm += step * step;
+
+    if (!std::isfinite(work.x_trial[j])) {
+      context.result.termination = TerminationReason::NumericalFailure;
+      context.result.message = "Non-finite trial parameter";
+      return false;
+    }
+  }
+
+  context.result.step_norm = std::sqrt(step_squared_norm);
+  if (!std::isfinite(step_squared_norm)) {
+    context.result.termination = TerminationReason::NumericalFailure;
+    context.result.message = "Non-finite step_squared_norm";
+    return false;
+  }
+
+  if (context.result.step_norm <=
+      context.evaluation_context.options.step_tolerance) {
+    context.result.termination = TerminationReason::SmallStep;
+    return false;
+  }
+
+  if (context.result.function_evaluations >=
+      context.evaluation_context.options.max_function_evaluations) {
+    context.result.termination = TerminationReason::MaxFunctionEvaluations;
+    context.result.message = "Maximum function evaluations reached";
+    return false;
+  }
+
+  if (auto trial = evaluate_residual_at(
+          context.evaluation_context, work.x_trial.view(), work.r_trial.view(),
+          "Trial residual evaluation");
+      !trial) {
+    return std::unexpected(trial.error());
+  }
+
+  const double trial_cost =
+      0.5 * std::transform_reduce(work.r_trial.view().begin(),
+                                  work.r_trial.view().end(), 0.0, std::plus<>{},
+                                  [](double ri) { return ri * ri; });
+  if (!std::isfinite(trial_cost)) {
+    if (context.result.lambda >= lm_opts.max_lambda) {
+      context.result.termination = TerminationReason::DampingLimit;
+      return false;
+    }
+    context.result.lambda = std::min(
+        lm_opts.max_lambda, context.result.lambda * context.damping_multiplier);
+    context.damping_multiplier *= 2.0;
+    if (!std::isfinite(context.damping_multiplier)) {
+      context.result.termination = TerminationReason::NumericalFailure;
+      context.result.message = "Non-finite damping multiplier";
+    }
+    return false;
+  }
+
+  /*
+  double model_squared_norm = 0.0;
+
+  for (Index i = 0; i < work.m; ++i) {
+    double model_residual = work.r[i];
+
+    for (Index j = 0; j < work.n; ++j) {
+      model_residual += work.J[i, j] * work.step[j];
+    }
+
+    model_squared_norm += model_residual * model_residual;
+  }
+
+  const double model_cost = 0.5 * model_squared_norm;
+  */
+  double predicted_reduction = 0.0;
+  for (Index j = 0; j < work.n; ++j) {
+    double scaled_step = work.step[j];
+    if constexpr (kUsesJacobianColumnScaling<Scaling>) {
+      scaled_step *= work.scale[j];
+    }
+
+    const double contribution =
+        std::fma(context.result.lambda * scaled_step, scaled_step,
+                 -work.step[j] * work.g[j]);
+    if (!std::isfinite(contribution)) {
+      context.result.termination = TerminationReason::NumericalFailure;
+      context.result.message = "Non-finite predicted reduction";
+      return false;
+    }
+    predicted_reduction += 0.5 * contribution;
+  }
+  if (!std::isfinite(predicted_reduction)) {
+    context.result.termination = TerminationReason::NumericalFailure;
+    context.result.message = "Non-finite predicted reduction";
+    return false;
+  }
+  const double actual_reduction = context.result.final_cost - trial_cost;
+  /*
+  const double predicted_reduction = context.result.final_cost - model_cost;
+  if (!std::isfinite(model_cost)) {
+    context.result.termination = TerminationReason::NumericalFailure;
+    context.result.message = "Non-finite values in model cost analysis";
+    return false;
+  }
+  */
+
+  if (predicted_reduction <= 0.0) {
+    if (context.result.lambda >= lm_opts.max_lambda) {
+      context.result.termination = TerminationReason::DampingLimit;
+      return false;
+    }
+    context.result.lambda = std::min(
+        lm_opts.max_lambda, context.result.lambda * context.damping_multiplier);
+    context.damping_multiplier *= 2.0;
+    if (!std::isfinite(context.damping_multiplier)) {
+      context.result.termination = TerminationReason::NumericalFailure;
+      context.result.message = "Non-finite damping multiplier";
+      return false;
+    }
+    return false;
+  }
+
+  const double rho = actual_reduction / predicted_reduction;
+  if (!std::isfinite(rho)) {
+    context.result.termination = TerminationReason::NumericalFailure;
+    context.result.message = "Non-finite rho";
+    return false;
+  }
+
+  if (rho <= 1e-3) {
+    if (context.result.lambda >= lm_opts.max_lambda) {
+      context.result.termination = TerminationReason::DampingLimit;
+      return false;
+    }
+    context.result.lambda = std::min(
+        lm_opts.max_lambda, context.result.lambda * context.damping_multiplier);
+    context.damping_multiplier *= 2.0;
+    if (!std::isfinite(context.damping_multiplier)) {
+      context.result.termination = TerminationReason::NumericalFailure;
+      context.result.message = "Non-finite damping multiplier";
+      return false;
+    }
+    return false;
+  } else {
+    const double t = 2.0 * rho - 1.0;
+    const double factor = std::max(1.0 / 3.0, 1.0 - t * t * t);
+
+    context.result.lambda = std::clamp(context.result.lambda * factor,
+                                       lm_opts.min_lambda, lm_opts.max_lambda);
+    context.damping_multiplier = 2.0;
+  }
+
+  std::ranges::copy(work.x_trial.view().begin(), work.x_trial.view().end(),
+                    work.x_current.view().begin());
+  std::ranges::copy(work.r_trial.view().begin(), work.r_trial.view().end(),
+                    work.r.view().begin());
   return true;
 }
 
@@ -244,6 +503,17 @@ solve(detail::SolverContext<Policy, M, N, Residual, Jacobian> &context) {
     return std::unexpected(evaluation.error());
   }
 
+  if (context.result.termination != TerminationReason::NotTerminated) {
+    return detail::finish_solver(context);
+  }
+
+  if (!detail::update_parameter_scaling(typename Policy::ScalingPolicy{},
+                                        context.evaluation_context.work)) {
+    context.result.termination = TerminationReason::NumericalFailure;
+    context.result.message = "Non-finite Jacobian column scale";
+    return detail::finish_solver(context);
+  }
+
   if (auto update = detail::update_cost_and_gradient(context); !update) {
     return std::unexpected(update.error());
   }
@@ -259,6 +529,76 @@ solve(detail::SolverContext<Policy, M, N, Residual, Jacobian> &context) {
     context.result.termination = TerminationReason::SmallGradient;
     return detail::finish_solver(context);
   }
+
+  for (Index iteration = 0;
+       iteration < context.evaluation_context.options.max_iterations;
+       iteration++) {
+    ++context.result.iterations;
+    const double previous_cost = context.result.final_cost;
+
+    auto accepted = detail::try_lm_step(context);
+
+    if (!accepted) {
+      return std::unexpected(accepted.error());
+    }
+
+    if (context.result.termination != TerminationReason::NotTerminated) {
+      return detail::finish_solver(context);
+    }
+
+    if (!*accepted) {
+      ++context.result.rejected_steps;
+      continue;
+    }
+    ++context.result.accepted_steps;
+
+    if (auto evaluation = detail::evaluate_current_model<Policy>(context);
+        !evaluation) {
+      return std::unexpected(evaluation.error());
+    }
+
+    if (context.result.termination != TerminationReason::NotTerminated) {
+      return detail::finish_solver(context);
+    }
+
+    if (!detail::update_parameter_scaling(typename Policy::ScalingPolicy{},
+                                          context.evaluation_context.work)) {
+      context.result.termination = TerminationReason::NumericalFailure;
+      context.result.message = "Non-finite Jacobian column scale";
+      return detail::finish_solver(context);
+    }
+
+    if (auto update = detail::update_cost_and_gradient(context); !update) {
+      return std::unexpected(update.error());
+    }
+
+    if (context.result.termination != TerminationReason::NotTerminated) {
+      return detail::finish_solver(context);
+    }
+
+    const double cost_reduction = previous_cost - context.result.final_cost;
+    const bool small_abs_reduction =
+        cost_reduction <= context.evaluation_context.options.cost_tolerance;
+    const bool small_rel_reduction =
+        context.evaluation_context.options.relative_cost_tolerance > 0.0 &&
+        previous_cost > 0.0 &&
+        cost_reduction <=
+            context.evaluation_context.options.relative_cost_tolerance *
+                previous_cost;
+
+    if (small_abs_reduction || small_rel_reduction) {
+      context.result.termination = TerminationReason::SmallCostReduction;
+      return detail::finish_solver(context);
+    }
+
+    if (context.result.gradient_inf_norm <=
+        context.evaluation_context.options.gradient_tolerance) {
+      context.result.termination = TerminationReason::SmallGradient;
+      return detail::finish_solver(context);
+    }
+  }
+
+  context.result.termination = TerminationReason::MaxIterations;
   return detail::finish_solver(context);
 }
 

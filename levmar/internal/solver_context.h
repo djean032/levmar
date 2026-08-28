@@ -7,6 +7,7 @@
 #include <utility>
 
 namespace levmar::detail {
+
 template <class Policy, Index M, Index N, ResidualCallable<M, N> Residual,
           class Jacobian>
   requires OptionalJacobianCallable<Jacobian, M, N>
@@ -17,6 +18,7 @@ struct SolverContext {
 
   Workspace &workspace;
   Result result;
+  double damping_multiplier = 2.0;
   EvaluationContext evaluation_context;
 
   template <class X>

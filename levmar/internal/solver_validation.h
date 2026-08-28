@@ -19,6 +19,11 @@ inline constexpr bool kInitialJacobianPolicy =
     std::same_as<JacobianPolicy, CentralDifferenceJacobian> ||
     std::same_as<JacobianPolicy, AutoDiffJacobian>;
 
+template <class ScalingPolicy>
+inline constexpr bool kInitialScalingPolicy =
+    std::same_as<ScalingPolicy, NoScaling> ||
+    kUsesJacobianColumnScaling<ScalingPolicy>;
+
 template <class Policy, class Context>
 consteval bool has_supported_autodiff_callback() {
   using Problem = typename Context::ProblemType;
@@ -64,7 +69,7 @@ inline constexpr bool kStaticSolverConfigurationValid = [] {
          std::same_as<StrategyPolicy, LevenbergMarquardt> &&
          std::same_as<LinearAlgebraPolicy, DampedQr> &&
          std::same_as<LossPolicy, SquaredLoss> &&
-         std::same_as<ScalingPolicy, NoScaling> && user_jacobian_is_valid &&
+         kInitialScalingPolicy<ScalingPolicy> && user_jacobian_is_valid &&
          has_supported_autodiff_callback<Policy, Context>() &&
          qr_static_shape_is_valid;
 }();
@@ -92,8 +97,8 @@ consteval void validate_static_solver_configuration() {
                 "Only DampedQr is currently implemented");
   static_assert(std::same_as<LossPolicy, SquaredLoss>,
                 "Only SquaredLoss is currently implemented");
-  static_assert(std::same_as<ScalingPolicy, NoScaling>,
-                "Only NoScaling is currently implemented");
+  static_assert(kInitialScalingPolicy<ScalingPolicy>,
+                "Unsupported Scaling Policy");
 
   if constexpr (std::same_as<JacobianPolicy, UserJacobian>) {
     static_assert(!std::same_as<Jacobian, NoJacobian>,
@@ -107,7 +112,7 @@ consteval void validate_static_solver_configuration() {
 
     if constexpr (kUsesDirectDualAutoDiff<N>) {
       static_assert(DualResidualCallable<Residual, M, N>,
-                    "AutoDiffJacobian for static N <= 16 requires a "
+                    "AutoDiffJacobian for fixed-size parameters requires a "
                     "residual compatible with Dual<N>");
     }
   }
@@ -150,6 +155,13 @@ ErrorOrVoid validate_runtime_options(const Options &options) {
     return std::unexpected(
         Error{ErrorCode::InvalidProblem,
               "cost_tolerance must be non-negative and finite"});
+  }
+
+  if (!std::isfinite(options.relative_cost_tolerance) ||
+      options.relative_cost_tolerance < 0.0) {
+    return std::unexpected(
+        Error{ErrorCode::InvalidProblem,
+              "relative_cost_tolerance must be non-negative and finite"});
   }
 
   if (options.max_function_evaluations == 0) {

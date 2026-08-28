@@ -11,7 +11,7 @@ namespace levmar::detail {
 
 template <Index N>
 inline constexpr bool kUsesDirectDualAutoDiff =
-    N != std::dynamic_extent && N <= 16;
+    N != std::dynamic_extent;
 
 struct GraphAutoDiffJacobian {
   template <class Context>

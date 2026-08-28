@@ -42,6 +42,13 @@ for functions and local variables, and descriptive template extents such as
 `M`, `N`, `Rows`, and `Cols`. Keep the public API header self-contained and
 avoid allocations in fixed-size paths.
 
+## Modification Authorization
+
+OpenCode may modify only tests, benchmarks, conformance harnesses, and their
+supporting documentation. Do not modify library implementation or public API
+files under `levmar/` unless the user explicitly authorizes that specific
+library change.
+
 ## Testing Guidelines
 
 No separate unit-test framework is configured. Add numerical coverage to
