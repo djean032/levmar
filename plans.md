@@ -8,6 +8,77 @@ is available through `scripts/benchmark.py`, using Clang or Intel with
 `-O3 -march=native -fno-fast-math -ffp-contract=off` as the baseline; GCC
 remains a valid reference compiler but is slower in current DAG results.
 
+## Solver Controller Investigation
+
+The policy-specialized damped-QR Levenberg-Marquardt loop is implemented and
+validated through the NIST runner. The current focus is controller trajectory
+quality rather than QR throughput. `scripts/benchmark.py` configures Ninja and
+can build separate levmar, Ceres, and CMinpack runners.
+
+### Completed Controller Work
+
+1. Added per-start solver-work export through `--solver-work`, including
+   iterations, evaluations, linear solves, accepted/rejected steps, termination,
+   final cost, lambda, gradient norm, and elapsed time.
+2. Added optional `--controller-trace` output for selected problematic NIST
+   trajectories. Each trial records costs, predicted/actual reduction, rho,
+   lambda/controller state, parameter and trial vectors, raw and scaled steps,
+   gradient, Jacobian column norms, coordinate scales, damping diagonal, and
+   decision.
+3. Added separate optional Ceres and CMinpack benchmark runners and CSV merge
+   support in `scripts/benchmark.py`.
+4. Diagnosed MGH10/start1 as the dominant levmar work outlier. The former
+   accumulated Jacobian-column scaling coupled coordinate normalization and
+   damping, allowing a historical extreme column norm to freeze a parameter.
+5. Split fixed coordinate scaling from damping scaling. Coordinate scales are
+   set from the first Jacobian; damping scales use the maximum of the fixed
+   coordinate scale and current Jacobian column norm.
+6. Added an upper physical damping-diagonal cap of `1e32`. Do not apply an
+   absolute lower damping-diagonal cap: MGH17 has a valid initial column norm
+   below that scale, and a `1e-6` lower cap caused a material regression.
+7. Fixed dynamic workspace allocation for the separate damping-scale vector and
+   preserved identity damping for `NoScaling` paths.
+
+### Current Findings
+
+1. The fixed-floor plus upper-cap scaling experiment changes MGH10/start1 from
+   a 10,000-attempt max-iteration failure with an exploding gradient to roughly
+   6,000 attempts ending at small step, cost about `43.97`, and gradient norm
+   around `1e-4`.
+2. This is a stability improvement, not convergence: MGH10 still terminates on
+   small step rather than gradient tolerance and takes about 17-24x as many
+   iterations as Ceres or MINPACK for that start.
+3. The full solver-work benchmark has no levmar max-iteration exits after the
+   scaling change. Excluding MGH10/start1 and failed external rows, levmar is
+   about 2.24x slower than Ceres on matched elapsed time.
+4. The large MGH10 trajectory gap is a controller issue. QR implementation cost
+   cannot explain thousands of accepted low-progress steps versus roughly 350
+   Ceres iterations.
+
+### Next Experiment: Scaled Trust-Region Controller
+
+Replace scalar lambda as the persistent controller state with a scaled trust
+radius while retaining the current scaling rule.
+
+1. Maintain `delta` in fixed coordinate-scale units:
+   `||parameter_scale * step||_2 <= delta`.
+2. Initialize `delta = 1e4` to match the Ceres adapter's initial trust-region
+   radius. Do not use MINPACK's `factor * ||D * x||` initialization for this
+   experiment because MGH10's scaled starting parameters make it effectively
+   unconstrained.
+3. Select lambda as a per-trial dual variable. Solve a near-Gauss-Newton step;
+   if it exceeds `delta`, bracket and bisect lambda until the scaled step is
+   near the radius boundary.
+4. Initially retain the existing `rho > 1e-3` acceptance threshold to isolate
+   radius selection. On rejection shrink `delta`; on a good boundary step
+   expand `delta`; otherwise retain it.
+5. Count all inner damped-QR solves in `linear_solves`, but evaluate the trial
+   residual only once for the selected step.
+6. Extend controller traces with radius before/after, selected lambda, inner
+   linear-solve count, and whether the radius bound was active.
+7. Validate with controller traces first, then `--solver-work`; compare MGH10,
+   MGH17, Gauss1, and Rat43 against the current scaling baseline.
+
 ## Current Focus: Finish the AD Foundation and Build the Solver
 
 Current direction:

@@ -4,9 +4,53 @@
 #include "levmar/internal/evaluation_state.h"
 #include "levmar/internal/problem.h"
 #include "levmar/internal/solver_workspace.h"
+#include <limits>
 #include <utility>
+#include <vector>
 
 namespace levmar::detail {
+
+enum class TrialDecision {
+  Accepted,
+  LinearSolveFailure,
+  NonFiniteTrialParameter,
+  DampingLimit,
+  SmallStep,
+  FunctionEvaluationLimit,
+  NonFiniteTrialCost,
+  NonFinitePredictedReduction,
+  NonPositivePredictedReduction,
+  SmallCostReduction,
+  NonFiniteRho,
+  LowRho,
+};
+
+struct LmTrialTrace {
+  Index inner_linear_solves = 0;
+  bool radius_bound_active = false;
+  double cost_before = std::numeric_limits<double>::quiet_NaN();
+  double trial_cost = std::numeric_limits<double>::quiet_NaN();
+  double actual_reduction = std::numeric_limits<double>::quiet_NaN();
+  double predicted_reduction = std::numeric_limits<double>::quiet_NaN();
+  double rho = std::numeric_limits<double>::quiet_NaN();
+  double lambda_before = std::numeric_limits<double>::quiet_NaN();
+  double lambda_after = std::numeric_limits<double>::quiet_NaN();
+  double gradient_inf_norm = std::numeric_limits<double>::quiet_NaN();
+  double raw_step_norm = std::numeric_limits<double>::quiet_NaN();
+  double scaled_step_norm = std::numeric_limits<double>::quiet_NaN();
+  double trust_radius_before = std::numeric_limits<double>::quiet_NaN();
+  double trust_radius_after = std::numeric_limits<double>::quiet_NaN();
+  double selected_lambda = std::numeric_limits<double>::quiet_NaN();
+  std::vector<double> current_parameters;
+  std::vector<double> trial_parameters;
+  std::vector<double> step;
+  std::vector<double> gradient;
+  std::vector<double> jacobian_column_norms;
+  std::vector<double> parameter_scales;
+  std::vector<double> effective_damping_diagonal;
+  TrialDecision decision = TrialDecision::LinearSolveFailure;
+  TerminationReason termination = TerminationReason::NotTerminated;
+};
 
 template <class Policy, Index M, Index N, ResidualCallable<M, N> Residual,
           class Jacobian>
@@ -18,7 +62,9 @@ struct SolverContext {
 
   Workspace &workspace;
   Result result;
-  double damping_multiplier = 2.0;
+  double trust_radius = 0.0;
+  double selected_lambda = 0.0;
+  std::vector<LmTrialTrace> *trial_trace = nullptr;
   EvaluationContext evaluation_context;
 
   template <class X>

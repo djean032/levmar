@@ -238,6 +238,46 @@ void test_runtime_option_validation() {
   valid_lambdas.lm.max_lambda = 1.0;
   expect_valid.template operator()<DefaultSolverPolicy>(valid_lambdas,
                                                         "ordered lambdas");
+
+  for (const double value : invalid_lambdas) {
+    Options options;
+    options.lm.min_trust_region_radius = value;
+    expect_invalid.template operator()<DefaultSolverPolicy>(
+        options, "invalid minimum trust-region radius");
+
+    options = {};
+    options.lm.initial_trust_region_radius = value;
+    expect_invalid.template operator()<DefaultSolverPolicy>(
+        options, "invalid initial trust-region radius");
+
+    options = {};
+    options.lm.max_trust_region_radius = value;
+    expect_invalid.template operator()<DefaultSolverPolicy>(
+        options, "invalid maximum trust-region radius");
+  }
+
+  Options minimum_above_initial_radius;
+  minimum_above_initial_radius.lm.min_trust_region_radius = 2.0;
+  minimum_above_initial_radius.lm.initial_trust_region_radius = 1.0;
+  minimum_above_initial_radius.lm.max_trust_region_radius = 3.0;
+  expect_invalid.template operator()<DefaultSolverPolicy>(
+      minimum_above_initial_radius,
+      "minimum trust-region radius above initial radius");
+
+  Options initial_above_maximum_radius;
+  initial_above_maximum_radius.lm.min_trust_region_radius = 1.0;
+  initial_above_maximum_radius.lm.initial_trust_region_radius = 3.0;
+  initial_above_maximum_radius.lm.max_trust_region_radius = 2.0;
+  expect_invalid.template operator()<DefaultSolverPolicy>(
+      initial_above_maximum_radius,
+      "initial trust-region radius above maximum radius");
+
+  Options valid_trust_region_radii;
+  valid_trust_region_radii.lm.min_trust_region_radius = 1e-6;
+  valid_trust_region_radii.lm.initial_trust_region_radius = 1e2;
+  valid_trust_region_radii.lm.max_trust_region_radius = 1e8;
+  expect_valid.template operator()<DefaultSolverPolicy>(
+      valid_trust_region_radii, "ordered trust-region radii");
 }
 
 void test_dual_arithmetic_and_math() {
@@ -1613,6 +1653,8 @@ void test_damped_qr_column_scaling_static() {
   work.r[2] = 3.0;
   work.scale[0] = 2.0;
   work.scale[1] = 4.0;
+  work.damping_scale[0] = 2.0;
+  work.damping_scale[1] = 4.0;
 
   constexpr double lambda = 1.0;
   expect_true(solve_damped_qr(JacobianColumnScaling{}, work, qr, lambda),
@@ -1621,6 +1663,117 @@ void test_damped_qr_column_scaling_static() {
                "scaled damped QR first step component");
   expect_close(work.step[1], -26.0 / 107.0, 1e-12, 1e-12,
                "scaled damped QR second step component");
+}
+
+void expect_first_inside_endpoint(const std::vector<LmTrialTrace> &trace,
+                                  const std::string &what) {
+  expect_equal(trace.size(), std::size_t{1}, what + " should record one trial");
+  const auto &trial = trace.front();
+  expect_equal(trial.inner_linear_solves, Index{5},
+               what + " should select the first inside lambda endpoint");
+  expect_equal(trial.selected_lambda, 1.6, what + " should select lambda 1.6");
+  expect_true(trial.radius_bound_active,
+              what + " should require lambda escalation");
+  expect_true(trial.scaled_step_norm <= 0.5,
+              what + " should stay inside the trust radius");
+  expect_true(trial.scaled_step_norm < 0.45,
+              what + " should not bisect into the old boundary band");
+}
+
+void test_first_inside_lambda_selection_static() {
+  auto residual = [](ConstVectorView<1> x, VectorView<1> r) {
+    r[0] = x[0];
+    return ErrorOrVoid{};
+  };
+  auto jacobian = [](ConstVectorView<1>, MatrixView<1, 1> J) {
+    J[0, 0] = 1.0;
+    return ErrorOrVoid{};
+  };
+  const auto problem = make_problem<1, 1>(residual, jacobian);
+  Options options;
+  options.max_iterations = 1;
+  options.lm.initial_lambda = 0.1;
+  options.lm.min_lambda = 0.1;
+  options.lm.initial_trust_region_radius = 0.5;
+  SolverWorkspace<DefaultSolverPolicy, 1, 1> workspace;
+  const std::array<double, 1> x0{1.0};
+  SolverContext<DefaultSolverPolicy, 1, 1, decltype(residual),
+                decltype(jacobian)>
+      context(problem, options, workspace, x0);
+  std::vector<LmTrialTrace> trace;
+  context.trial_trace = &trace;
+
+  const auto solved = solve<DefaultSolverPolicy>(context);
+  expect_true(solved.has_value(), "static first-inside solve should succeed");
+  expect_first_inside_endpoint(trace, "static first-inside solve");
+}
+
+void test_first_inside_lambda_selection_dynamic() {
+  auto residual = [](ConstVectorView<std::dynamic_extent> x,
+                     VectorView<std::dynamic_extent> r) {
+    r[0] = x[0];
+    return ErrorOrVoid{};
+  };
+  auto jacobian = [](ConstVectorView<std::dynamic_extent>,
+                     MatrixView<std::dynamic_extent, std::dynamic_extent> J) {
+    J[0, 0] = 1.0;
+    return ErrorOrVoid{};
+  };
+  const auto problem = make_dynamic_problem(1, 1, residual, jacobian);
+  Options options;
+  options.max_iterations = 1;
+  options.lm.initial_lambda = 0.1;
+  options.lm.min_lambda = 0.1;
+  options.lm.initial_trust_region_radius = 0.5;
+  SolverWorkspace<DefaultSolverPolicy, std::dynamic_extent, std::dynamic_extent>
+      workspace;
+  const std::vector<double> x0{1.0};
+  SolverContext<DefaultSolverPolicy, std::dynamic_extent, std::dynamic_extent,
+                decltype(residual), decltype(jacobian)>
+      context(problem, options, workspace, x0);
+  std::vector<LmTrialTrace> trace;
+  context.trial_trace = &trace;
+
+  const auto solved = solve<DefaultSolverPolicy>(context);
+  expect_true(solved.has_value(), "dynamic first-inside solve should succeed");
+  expect_first_inside_endpoint(trace, "dynamic first-inside solve");
+}
+
+void test_stable_predicted_reduction() {
+  auto residual = [](ConstVectorView<1> x, VectorView<1> r) {
+    r[0] = 1e16 + x[0];
+    return ErrorOrVoid{};
+  };
+  auto jacobian = [](ConstVectorView<1>, MatrixView<1, 1> J) {
+    J[0, 0] = 1.0;
+    return ErrorOrVoid{};
+  };
+  const auto problem = make_problem<1, 1>(residual, jacobian);
+  Options options;
+  options.max_iterations = 1;
+  options.lm.initial_lambda = 1e16;
+  options.lm.min_lambda = 1e16;
+  options.lm.max_lambda = 1e16;
+  options.lm.initial_trust_region_radius = 2.0;
+  SolverWorkspace<DefaultSolverPolicy, 1, 1> workspace;
+  const std::array<double, 1> x0{0.0};
+  SolverContext<DefaultSolverPolicy, 1, 1, decltype(residual),
+                decltype(jacobian)>
+      context(problem, options, workspace, x0);
+  std::vector<LmTrialTrace> trace;
+  context.trial_trace = &trace;
+
+  const auto solved = solve<DefaultSolverPolicy>(context);
+  expect_true(solved.has_value(), "stable reduction solve should succeed");
+  expect_equal(trace.size(), std::size_t{1},
+               "stable reduction solve should record one trial");
+  expect_equal(trace.front().actual_reduction, 0.0,
+               "trial cost should round to the current cost");
+  expect_true(std::isfinite(trace.front().predicted_reduction) &&
+                  trace.front().predicted_reduction > 0.0,
+              "stable model reduction should not cancel to zero");
+  expect_equal(trace.front().decision, TrialDecision::LowRho,
+               "positive stable reduction should reach gain-ratio rejection");
 }
 
 void test_solve_static_user_jacobian() {
@@ -2034,6 +2187,9 @@ int main() {
   test_damped_qr_static();
   test_damped_qr_dynamic();
   test_damped_qr_column_scaling_static();
+  test_first_inside_lambda_selection_static();
+  test_first_inside_lambda_selection_dynamic();
+  test_stable_predicted_reduction();
   test_solve_static_user_jacobian();
   test_solve_dynamic_user_jacobian();
   test_solve_forward_difference_evaluation_budget();

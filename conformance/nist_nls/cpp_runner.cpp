@@ -251,6 +251,62 @@ struct SolverWorkRow {
   Result result;
 };
 
+struct ControllerTraceRecord {
+  std::string problem;
+  std::string start;
+  std::string derivative;
+  std::string extent;
+  std::vector<LmTrialTrace> trials;
+};
+
+bool is_controller_trace_target(std::string_view problem,
+                                std::string_view start,
+                                std::string_view derivative,
+                                std::string_view extent) {
+  return (problem == "MGH10" && start == "start1" &&
+          ((derivative == "analytic" && extent == "dynamic") ||
+           (derivative == "autodiff" && extent == "static"))) ||
+         (problem == "Bennett5" && start == "start2" &&
+          ((derivative == "analytic" && extent == "dynamic") ||
+           (derivative == "autodiff" && extent == "static"))) ||
+         (derivative == "analytic" && extent == "dynamic" &&
+          ((problem == "Lanczos1" && start == "start1") ||
+           (problem == "MGH09" && start == "start1") ||
+           (problem == "Roszman1" && start == "start1") ||
+           (problem == "Gauss1" && start == "start2") ||
+           (problem == "MGH17" && start == "start1") ||
+           (problem == "Hahn1" && start == "start1") ||
+           (problem == "Thurber" && start == "start1"))) ||
+         (derivative == "autodiff" && extent == "static" &&
+          ((problem == "Rat43" && start == "start1") ||
+           (problem == "MGH10" && start == "start2") ||
+           (problem == "Kirby2" && start == "start1")));
+}
+
+std::vector<LmTrialTrace> *
+controller_trace_trials(std::vector<ControllerTraceRecord> *records,
+                        std::string_view problem, std::string_view start,
+                        std::string_view derivative, std::string_view extent) {
+  if (records == nullptr ||
+      !is_controller_trace_target(problem, start, derivative, extent)) {
+    return nullptr;
+  }
+  const auto existing =
+      std::ranges::find_if(*records, [&](const ControllerTraceRecord &record) {
+        return record.problem == problem && record.start == start &&
+               record.derivative == derivative && record.extent == extent;
+      });
+  if (existing != records->end()) {
+    return &existing->trials;
+  }
+  records->push_back({std::string(problem),
+                      std::string(start),
+                      std::string(derivative),
+                      std::string(extent),
+                      {}});
+  return &records->back().trials;
+}
+
 struct ProblemReport {
   std::string name;
   bool numerical_derivatives_skipped = false;
@@ -980,7 +1036,8 @@ Result solve_nist_variant(const CorpusProblem &corpus, ResidualFn residual,
                           JacobianFn jacobian, ConstVectorView<N> beta,
                           const std::string &what,
                           bool require_convergence = true,
-                          bool enable_relative_cost_termination = true) {
+                          bool enable_relative_cost_termination = true,
+                          std::vector<LmTrialTrace> *trial_trace = nullptr) {
   auto problem = [&]() {
     if constexpr (M == std::dynamic_extent && N == std::dynamic_extent) {
       return make_dynamic_problem(corpus.m, corpus.n, residual, jacobian);
@@ -1010,6 +1067,7 @@ Result solve_nist_variant(const CorpusProblem &corpus, ResidualFn residual,
   SolverWorkspace<Policy, M, N> workspace;
   SolverContext<Policy, M, N, decltype(residual), decltype(jacobian)> context(
       problem, options, workspace, beta);
+  context.trial_trace = trial_trace;
   auto solved = solve<Policy>(context);
   if (!solved) {
     throw std::runtime_error(what + ": " + solved.error().message);
@@ -1064,7 +1122,8 @@ run_problem(const std::filesystem::path &problem_dir,
             bool solve_all_starts = false, bool time_solvers = false,
             std::uint64_t solver_order_offset = 0,
             bool run_external_solvers = false, bool run_validation = true,
-            bool enable_relative_cost_termination = true) {
+            bool enable_relative_cost_termination = true,
+            std::vector<ControllerTraceRecord> *controller_traces = nullptr) {
   const auto corpus = load_problem(problem_dir);
   ProblemReport report;
   report.name = corpus.name;
@@ -1100,6 +1159,7 @@ run_problem(const std::filesystem::path &problem_dir,
     auto run_pair = [&]<Index SM, Index SN>(
                         auto dynamic_residual, auto dynamic_jacobian,
                         auto static_residual, auto static_jacobian) {
+#ifndef LEVMAR_NIST_EXTERNAL_ONLY
       if (run_validation) {
         run_kernel_variant<std::dynamic_extent, std::dynamic_extent>(
             corpus, dynamic_residual, dynamic_jacobian,
@@ -1123,13 +1183,66 @@ run_problem(const std::filesystem::path &problem_dir,
             &report.direct_dual_vs_analytic_stats, nullptr, nullptr,
             corpus.name + " static " + label);
       }
+#endif
 
       const bool solve_start =
           label.starts_with("start") &&
           (corpus.difficulty == "lower" || solve_all_starts);
+#ifdef LEVMAR_NIST_EXTERNAL_ONLY
+      if (solve_start && run_external_solvers) {
+        ++report.solver_start_cases;
+        auto run_external = [&](std::string_view solver_name, auto &&fn) {
+          try {
+            auto result = fn();
+            result.start_label = label;
+            result.m = corpus.m;
+            result.n = corpus.n;
+            report.external_solver_results.push_back(std::move(result));
+          } catch (const std::exception &error) {
+            ExternalSolverResult failed;
+            failed.solver = std::string(solver_name);
+            failed.start_label = label;
+            failed.m = corpus.m;
+            failed.n = corpus.n;
+            failed.lre = 0.0;
+            failed.usable = false;
+            report.external_solver_results.push_back(std::move(failed));
+            report.solver_failures.push_back(corpus.name + " " + label + " " +
+                                             std::string(solver_name) + ": " +
+                                             error.what());
+          }
+        };
+#ifdef LEVMAR_HAVE_CMINPACK
+        run_external("minpack_lmder", [&] {
+          return run_minpack_solver("minpack_lmder", corpus, dynamic_residual,
+                                    dynamic_jacobian, beta_storage,
+                                    certified_parameters->second, true);
+        });
+        run_external("minpack_lmdif", [&] {
+          return run_minpack_solver("minpack_lmdif", corpus, dynamic_residual,
+                                    dynamic_jacobian, beta_storage,
+                                    certified_parameters->second, false);
+        });
+#endif
+#ifdef LEVMAR_HAVE_CERES
+        run_external("ceres_analytic", [&] {
+          return run_ceres_analytic_solver(corpus, dynamic_residual,
+                                           dynamic_jacobian, beta_storage,
+                                           certified_parameters->second);
+        });
+        run_external("ceres_autodiff", [&] {
+          return run_ceres_autodiff_solver<SM, SN>(
+              static_residual, beta_storage, certified_parameters->second);
+        });
+#endif
+      }
+#else
       if (solve_start) {
         auto solve_pair = [&](bool require_convergence, double *dynamic_seconds,
                               double *static_seconds, bool static_first) {
+          constexpr std::string_view derivative =
+              std::is_same_v<Policy, NistAnalyticSolverPolicy> ? "analytic"
+                                                               : "autodiff";
           auto solve_dynamic = [&] {
             const auto start = Clock::now();
             auto solution = solve_nist_variant<Policy, std::dynamic_extent,
@@ -1138,7 +1251,9 @@ run_problem(const std::filesystem::path &problem_dir,
                 ConstVectorView<std::dynamic_extent>(beta_storage.data(),
                                                      beta_storage.size()),
                 corpus.name + " dynamic " + label + " solve",
-                require_convergence, enable_relative_cost_termination);
+                require_convergence, enable_relative_cost_termination,
+                controller_trace_trials(controller_traces, corpus.name, label,
+                                        derivative, "dynamic"));
             if (dynamic_seconds != nullptr) {
               *dynamic_seconds += elapsed_seconds(start, Clock::now());
             }
@@ -1150,7 +1265,9 @@ run_problem(const std::filesystem::path &problem_dir,
                 corpus, static_residual, static_jacobian,
                 ConstVectorView<SN>(beta_storage.data(), beta_storage.size()),
                 corpus.name + " static " + label + " solve",
-                require_convergence, enable_relative_cost_termination);
+                require_convergence, enable_relative_cost_termination,
+                controller_trace_trials(controller_traces, corpus.name, label,
+                                        derivative, "static"));
             if (static_seconds != nullptr) {
               *static_seconds += elapsed_seconds(start, Clock::now());
             }
@@ -1276,13 +1393,11 @@ run_problem(const std::filesystem::path &problem_dir,
             const double static_lre = log_relative_error(
                 static_solution.parameters, certified_parameters->second);
             report.solver_work_rows.push_back({label, "dynamic", corpus.m,
-                                                corpus.n, dynamic_seconds,
-                                                dynamic_lre,
-                                                dynamic_solution});
+                                               corpus.n, dynamic_seconds,
+                                               dynamic_lre, dynamic_solution});
             report.solver_work_rows.push_back({label, "static", corpus.m,
-                                                corpus.n, static_seconds,
-                                                static_lre,
-                                                static_solution});
+                                               corpus.n, static_seconds,
+                                               static_lre, static_solution});
             report.solver_dynamic_lre_sum += dynamic_lre;
             report.solver_static_lre_sum += static_lre;
             if (dynamic_lre >= 4.0) {
@@ -1301,6 +1416,7 @@ run_problem(const std::filesystem::path &problem_dir,
           }
         }
       }
+#endif
     };
 
     if (corpus.model_id == "bennett5") {
@@ -3619,7 +3735,8 @@ void write_solver_work_csv(const std::filesystem::path &path,
     throw std::runtime_error("Failed to open solver work CSV path " +
                              path.string());
   }
-  file << "solver,derivative,problem,start,extent,m,n,elapsed_ms,termination,lre,"
+  file << "solver,derivative,problem,start,extent,m,n,elapsed_ms,termination,"
+          "lre,"
           "final_cost,lambda,gradient_inf_norm,step_norm,iterations,"
           "function_evaluations,jacobian_evaluations,linear_solves,"
           "accepted_steps,rejected_steps\n";
@@ -3629,17 +3746,18 @@ void write_solver_work_csv(const std::filesystem::path &path,
         for (const auto &report : reports) {
           for (const auto &row : report.solver_work_rows) {
             const auto &result = row.result;
-        file << "levmar," << derivative << ',' << report.name << ','
-             << row.start_label << ',' << row.extent << ',' << row.m << ','
-             << row.n << ',' << std::setprecision(17)
-             << milliseconds(row.elapsed_seconds) << ','
-             << termination_reason_name(result.termination) << ',' << row.lre << ','
-                 << result.final_cost << ',' << result.lambda << ','
-                 << result.gradient_inf_norm << ',' << result.step_norm << ','
-                 << result.iterations << ',' << result.function_evaluations
-                 << ',' << result.jacobian_evaluations << ','
-                 << result.linear_solves << ',' << result.accepted_steps << ','
-                 << result.rejected_steps << '\n';
+            file << "levmar," << derivative << ',' << report.name << ','
+                 << row.start_label << ',' << row.extent << ',' << row.m << ','
+                 << row.n << ',' << std::setprecision(17)
+                 << milliseconds(row.elapsed_seconds) << ','
+                 << termination_reason_name(result.termination) << ','
+                 << row.lre << ',' << result.final_cost << ',' << result.lambda
+                 << ',' << result.gradient_inf_norm << ',' << result.step_norm
+                 << ',' << result.iterations << ','
+                 << result.function_evaluations << ','
+                 << result.jacobian_evaluations << ',' << result.linear_solves
+                 << ',' << result.accepted_steps << ',' << result.rejected_steps
+                 << '\n';
           }
         }
       };
@@ -3661,9 +3779,9 @@ void write_solver_work_csv(const std::filesystem::path &path,
                  << (autodiff ? "static" : "dynamic") << ',' << result.m << ','
                  << result.n << ',' << std::setprecision(17)
                  << milliseconds(result.seconds) << ','
-                 << (result.usable ? "converged" : "failed") << ',' << result.lre
-                 << ",nan,nan,nan,nan," << result.iterations << ','
-                 << result.function_evaluations << ','
+                 << (result.usable ? "converged" : "failed") << ','
+                 << result.lre << ",nan,nan,nan,nan," << result.iterations
+                 << ',' << result.function_evaluations << ','
                  << (result.has_jacobian_evaluations
                          ? std::to_string(result.jacobian_evaluations)
                          : "nan")
@@ -3685,6 +3803,92 @@ void write_solver_work_csv(const std::filesystem::path &path,
       };
   write_external_reports(analytic_reports);
   write_external_reports(autodiff_reports);
+}
+
+std::string_view trial_decision_name(TrialDecision decision) {
+  switch (decision) {
+  case TrialDecision::Accepted:
+    return "accepted";
+  case TrialDecision::LinearSolveFailure:
+    return "linear_solve_failure";
+  case TrialDecision::DampingLimit:
+    return "damping_limit";
+  case TrialDecision::NonFiniteTrialParameter:
+    return "nonfinite_trial_parameter";
+  case TrialDecision::SmallStep:
+    return "small_step";
+  case TrialDecision::FunctionEvaluationLimit:
+    return "function_evaluation_limit";
+  case TrialDecision::NonFiniteTrialCost:
+    return "nonfinite_trial_cost";
+  case TrialDecision::NonFinitePredictedReduction:
+    return "nonfinite_predicted_reduction";
+  case TrialDecision::NonPositivePredictedReduction:
+    return "nonpositive_predicted_reduction";
+  case TrialDecision::SmallCostReduction:
+    return "small_cost_reduction";
+  case TrialDecision::NonFiniteRho:
+    return "nonfinite_rho";
+  case TrialDecision::LowRho:
+    return "low_rho";
+  }
+  return "unknown";
+}
+
+void write_controller_trace_csv(
+    const std::filesystem::path &path,
+    const std::vector<ControllerTraceRecord> &records) {
+  std::ofstream file(path);
+  if (!file) {
+    throw std::runtime_error("Failed to open controller trace CSV path " +
+                             path.string());
+  }
+  file << "problem,start,derivative,extent,attempt,cost_before,trial_cost,"
+          "actual_reduction,predicted_reduction,rho,lambda_before,lambda_after,"
+          "trust_radius_before,trust_radius_after,selected_lambda,inner_linear_"
+          "solves,radius_bound_active,gradient_inf_norm,"
+          "raw_step_norm,scaled_step_norm,current_parameters,trial_parameters,"
+          "step,gradient,jacobian_column_norms,parameter_scales,"
+          "effective_damping_diagonal,decision,termination\n";
+  const auto write_vector = [&](const std::vector<double> &values) {
+    for (std::size_t i = 0; i < values.size(); ++i) {
+      if (i != 0) {
+        file << ';';
+      }
+      file << values[i];
+    }
+  };
+  file << std::setprecision(17);
+  for (const auto &record : records) {
+    for (std::size_t attempt = 0; attempt < record.trials.size(); ++attempt) {
+      const auto &trial = record.trials[attempt];
+      file << record.problem << ',' << record.start << ',' << record.derivative
+           << ',' << record.extent << ',' << attempt + 1 << ','
+           << trial.cost_before << ',' << trial.trial_cost << ','
+           << trial.actual_reduction << ',' << trial.predicted_reduction << ','
+           << trial.rho << ',' << trial.lambda_before << ','
+           << trial.lambda_after << ',' << trial.trust_radius_before << ','
+           << trial.trust_radius_after << ',' << trial.selected_lambda << ','
+           << trial.inner_linear_solves << ',' << trial.radius_bound_active
+           << ',' << trial.gradient_inf_norm << ',' << trial.raw_step_norm
+           << ',' << trial.scaled_step_norm << ',';
+      write_vector(trial.current_parameters);
+      file << ',';
+      write_vector(trial.trial_parameters);
+      file << ',';
+      write_vector(trial.step);
+      file << ',';
+      write_vector(trial.gradient);
+      file << ',';
+      write_vector(trial.jacobian_column_norms);
+      file << ',';
+      write_vector(trial.parameter_scales);
+      file << ',';
+      write_vector(trial.effective_damping_diagonal);
+      file << ',' << trial_decision_name(trial.decision) << ','
+           << termination_reason_name(trial.termination) << '\n';
+    }
+  }
 }
 
 void write_benchmark_csv_rows(std::ofstream &file, const std::string &scope,
@@ -4189,6 +4393,7 @@ int main(int argc, char **argv) {
     std::filesystem::path csv_path;
     std::filesystem::path benchmark_csv_path;
     std::filesystem::path solver_work_csv_path;
+    std::filesystem::path controller_trace_csv_path;
     if (argc > 1) {
       corpus_dir = argv[1];
     } else {
@@ -4233,6 +4438,11 @@ int main(int argc, char **argv) {
         solver_work_csv_path = argv[i];
       } else if (std::string_view(argv[i]) == "--solver-work-external") {
         solver_work_external = true;
+      } else if (std::string_view(argv[i]) == "--controller-trace") {
+        if (++i == argc) {
+          throw std::runtime_error("--controller-trace requires a path");
+        }
+        controller_trace_csv_path = argv[i];
       } else if (std::string_view(argv[i]) ==
                  "--disable-relative-cost-termination") {
         relative_cost_termination = false;
@@ -4249,6 +4459,37 @@ int main(int argc, char **argv) {
     }
 
     std::ranges::sort(problem_dirs);
+
+#ifdef LEVMAR_NIST_EXTERNAL_ONLY
+    if (!controller_trace_csv_path.empty()) {
+      throw std::runtime_error(
+          "Controller traces are available only in levmar_nist_runner");
+    }
+    if (solver_work_csv_path.empty()) {
+      throw std::runtime_error(
+          "External runners support only --solver-work-csv export");
+    }
+    std::vector<ProblemReport> external_reports;
+    for (const auto &path : problem_dirs) {
+      external_reports.push_back(run_problem<NistAnalyticSolverPolicy>(
+          path, true, false, 0, true, false, relative_cost_termination));
+    }
+    write_solver_work_csv(solver_work_csv_path, external_reports, {}, false);
+    return 0;
+#else
+    if (!controller_trace_csv_path.empty()) {
+      std::vector<ControllerTraceRecord> controller_traces;
+      for (const auto &path : problem_dirs) {
+        run_problem<NistAnalyticSolverPolicy>(path, true, false, 0, false,
+                                              false, relative_cost_termination,
+                                              &controller_traces);
+        run_problem<NistAutoDiffSolverPolicy>(path, true, false, 0, false,
+                                              false, relative_cost_termination,
+                                              &controller_traces);
+      }
+      write_controller_trace_csv(controller_trace_csv_path, controller_traces);
+      return 0;
+    }
 
     if (!solver_work_csv_path.empty()) {
       std::vector<ProblemReport> analytic_reports;
@@ -4379,6 +4620,7 @@ int main(int argc, char **argv) {
       write_benchmark_csv(benchmark_csv_path, summary_benchmark,
                           problem_benchmarks, benchmark_iterations);
     }
+#endif
   } catch (const std::exception &error) {
     std::cerr << error.what() << '\n';
     return 1;

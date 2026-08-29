@@ -180,6 +180,18 @@ ErrorOrVoid validate_runtime_options(const Options &options) {
         Error{ErrorCode::InvalidProblem, "Invalid lambda configuration"});
   }
 
+  if (!std::isfinite(options.lm.initial_trust_region_radius) ||
+      !std::isfinite(options.lm.min_trust_region_radius) ||
+      !std::isfinite(options.lm.max_trust_region_radius) ||
+      options.lm.min_trust_region_radius <= 0.0 ||
+      options.lm.min_trust_region_radius >
+          options.lm.initial_trust_region_radius ||
+      options.lm.initial_trust_region_radius >
+          options.lm.max_trust_region_radius) {
+    return std::unexpected(Error{ErrorCode::InvalidProblem,
+                                 "Invalid trust-region radius configuration"});
+  }
+
   return {};
 }
 

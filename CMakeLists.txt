@@ -46,12 +46,14 @@ if(LEVMAR_BUILD_CONFORMANCE_RUNNER)
   function(levmar_add_external_nist_runner target library definition)
     levmar_add_nist_runner(${target})
     target_link_libraries(${target} PRIVATE ${library})
-    target_compile_definitions(${target} PRIVATE ${definition})
+    target_compile_definitions(${target} PRIVATE ${definition}
+                                               LEVMAR_NIST_EXTERNAL_ONLY=1)
 
     add_library(${target}_pch OBJECT
                 conformance/nist_nls/external_benchmark_support.cpp)
     target_link_libraries(${target}_pch PRIVATE levmar::levmar ${library})
-    target_compile_definitions(${target}_pch PRIVATE ${definition})
+    target_compile_definitions(${target}_pch PRIVATE ${definition}
+                                                   LEVMAR_NIST_EXTERNAL_ONLY=1)
     if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
       target_compile_options(${target}_pch PRIVATE -ffp-contract=off)
     endif()

@@ -65,6 +65,7 @@ template <Index M, Index N> struct LMWorkspace {
   VectorStorage<N> step;
 
   VectorStorage<N> scale;
+  VectorStorage<N> damping_scale;
   VectorStorage<M> weights;
 
   LMWorkspace() {
@@ -97,6 +98,7 @@ template <Index M, Index N> struct LMWorkspace {
       g.resize(n);
       step.resize(n);
       scale.resize(n);
+      damping_scale.resize(n);
     } else if constexpr (M == std::dynamic_extent) {
       J.resize(m);
       r.resize(m);
@@ -110,9 +112,11 @@ template <Index M, Index N> struct LMWorkspace {
       g.resize(n);
       step.resize(n);
       scale.resize(n);
+      damping_scale.resize(n);
     }
 
     scale.fill(1.0);
+    damping_scale.fill(1.0);
     weights.fill(1.0);
   }
 };

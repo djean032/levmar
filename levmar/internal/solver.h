@@ -18,12 +18,17 @@
 
 namespace levmar::detail {
 
+inline constexpr double kMaxLMDampingDiagonal = 1e32;
+
 template <Index M, Index N>
-void reset_parameter_scaling(NoScaling, LMWorkspace<M, N> &) {};
+void reset_parameter_scaling(NoScaling, LMWorkspace<M, N> &work) {
+  work.damping_scale.fill(1.0);
+};
 
 template <Index M, Index N>
 void reset_parameter_scaling(JacobianColumnScaling, LMWorkspace<M, N> &work) {
   work.scale.fill(0.0);
+  work.damping_scale.fill(0.0);
 };
 
 template <class Policy, Index M, Index N, ResidualCallable<M, N> Residual,
@@ -37,7 +42,6 @@ initialize_solver(SolverContext<Policy, M, N, Residual, Jacobian> &context) {
   context.result = Result{};
   reset_parameter_scaling(typename Policy::ScalingPolicy{},
                           context.evaluation_context.work);
-  context.damping_multiplier = 2.0;
 
   auto &evaluation = context.evaluation_context;
   const auto &problem = evaluation.problem;
@@ -50,6 +54,10 @@ initialize_solver(SolverContext<Policy, M, N, Residual, Jacobian> &context) {
       !validation) {
     return validation;
   }
+
+  context.trust_radius = evaluation.options.lm.initial_trust_region_radius;
+  context.selected_lambda = evaluation.options.lm.initial_lambda;
+  context.result.lambda = context.selected_lambda;
 
   if constexpr (std::same_as<typename Policy::LinearAlgebraPolicy, DampedQr>) {
     if (problem.num_residuals < problem.num_parameters) {
@@ -232,7 +240,15 @@ template <class ScalingPolicy, Index M, Index N>
 
   for (Index i = 0; i < n; ++i) {
     qr.row.fill(0.0);
-    qr.row[i] = sqrt_lambda;
+    if constexpr (kUsesJacobianColumnScaling<ScalingPolicy>) {
+      const double current_diagonal =
+          work.damping_scale[i] * work.damping_scale[i];
+      const double damping_diagonal =
+          std::min(current_diagonal, kMaxLMDampingDiagonal);
+      qr.row[i] = sqrt_lambda * std::sqrt(damping_diagonal) / work.scale[i];
+    } else {
+      qr.row[i] = sqrt_lambda;
+    }
 
     double incoming_rhs = 0.0;
     if (!append_row_with_givens(qr, n, incoming_rhs)) {
@@ -293,7 +309,13 @@ template <Index M, Index N>
         return false;
       }
     }
-    work.scale[j] = std::max({work.scale[j], column_norm, 1.0});
+    if (work.scale[j] == 0.0) {
+      work.scale[j] = column_norm == 0.0 ? 1.0 : column_norm;
+    } /* else {
+       work.scale[j] = std::max(work.scale[j], column_norm);
+     }
+     */
+    work.damping_scale[j] = std::max(work.scale[j], column_norm);
   }
   return true;
 }
@@ -315,39 +337,216 @@ try_lm_step(SolverContext<Policy, M, N, Residual, Jacobian> &context) {
   auto &work = context.evaluation_context.work;
   auto &linear = context.workspace.linear;
   auto &lm_opts = context.evaluation_context.options.lm;
-  ++context.result.linear_solves;
+  LmTrialTrace trace;
+  trace.cost_before = context.result.final_cost;
+  trace.lambda_before = context.result.lambda;
+  trace.gradient_inf_norm = context.result.gradient_inf_norm;
+  trace.trust_radius_before = context.trust_radius;
+  Index inner_linear_solves = 0;
+  bool radius_bound_active = false;
 
-  if (!solve_linear_step(LinearAlgebra{}, Scaling{}, work, linear,
-                         context.result.lambda)) {
+  const auto record_trace = [&](TrialDecision decision) {
+    if (context.trial_trace == nullptr) {
+      return;
+    }
+    trace.lambda_after = context.result.lambda;
+    trace.decision = decision;
+    trace.cost_before = context.result.final_cost;
+    trace.trust_radius_after = context.trust_radius;
+    trace.selected_lambda = context.selected_lambda;
+    trace.inner_linear_solves = inner_linear_solves;
+    trace.radius_bound_active = radius_bound_active;
+    trace.termination = context.result.termination;
+    context.trial_trace->push_back(std::move(trace));
+  };
+
+  const auto solve_at_lambda = [&](double lambda) -> bool {
+    ++context.result.linear_solves;
+    ++inner_linear_solves;
+    return solve_linear_step(LinearAlgebra{}, Scaling{}, work, linear, lambda);
+  };
+
+  const auto step_norms = [&]() -> std::pair<double, double> {
+    double raw_squared_norm = 0.0;
+    double scaled_squared_norm = 0.0;
+
+    for (Index j = 0; j < work.n; ++j) {
+      const double step = work.step[j];
+      double scale = 1.0;
+      if constexpr (kUsesJacobianColumnScaling<Scaling>) {
+        scale = work.scale[j];
+      }
+      raw_squared_norm += step * step;
+      scaled_squared_norm += (scale * step) * (scale * step);
+    }
+
+    return {std::sqrt(raw_squared_norm), std::sqrt(scaled_squared_norm)};
+  };
+
+  const auto reject_and_shrink_radius =
+      [&](double trial_scaled_step_norm) -> bool {
+    const double next_radius = 0.25 * trial_scaled_step_norm;
+    if (next_radius < lm_opts.min_trust_region_radius) {
+      context.result.termination = TerminationReason::DampingLimit;
+      return false;
+    }
+
+    context.trust_radius =
+        std::max(lm_opts.min_trust_region_radius, next_radius);
+    return true;
+  };
+
+  if (!solve_at_lambda(lm_opts.min_lambda)) {
     context.result.termination = TerminationReason::NumericalFailure;
     context.result.message = "Linear solve failed";
+    record_trace(TrialDecision::LinearSolveFailure);
     return false;
   }
 
-  double step_squared_norm = 0.0;
+  auto [raw_step_norm, scaled_step_norm] = step_norms();
+
+  double selected_lambda = lm_opts.min_lambda;
+
+  if (scaled_step_norm > context.trust_radius) {
+    radius_bound_active = true;
+    double lambda_low = lm_opts.min_lambda;
+    double lambda_high = std::max(context.selected_lambda, lambda_low);
+
+    if (lambda_high == lambda_low) {
+      if (lambda_high == lm_opts.max_lambda) {
+        context.result.termination = TerminationReason::DampingLimit;
+        record_trace(TrialDecision::DampingLimit);
+        return false;
+      }
+      lambda_high = std::min(2.0 * lambda_high, lm_opts.max_lambda);
+    }
+
+    if (!solve_at_lambda(lambda_high)) {
+      context.result.termination = TerminationReason::NumericalFailure;
+      context.result.message = "Linear solve failed";
+      record_trace(TrialDecision::LinearSolveFailure);
+      return false;
+    }
+
+    std::tie(raw_step_norm, scaled_step_norm) = step_norms();
+
+    while (scaled_step_norm > context.trust_radius) {
+      if (lambda_high >= lm_opts.max_lambda) {
+        context.result.termination = TerminationReason::DampingLimit;
+        record_trace(TrialDecision::DampingLimit);
+        return false;
+      }
+
+      lambda_low = lambda_high;
+      lambda_high = std::min(2.0 * lambda_high, lm_opts.max_lambda);
+
+      if (!solve_at_lambda(lambda_high)) {
+        context.result.termination = TerminationReason::NumericalFailure;
+        context.result.message = "Linear solve failed";
+        record_trace(TrialDecision::LinearSolveFailure);
+        return false;
+      }
+      std::tie(raw_step_norm, scaled_step_norm) = step_norms();
+    }
+
+    while (scaled_step_norm < 0.9 * context.trust_radius) {
+      const double lambda_mid =
+          std::exp(0.5 * (std::log(lambda_low) + std::log(lambda_high)));
+
+      if (lambda_mid == lambda_low || lambda_mid == lambda_high) {
+        break;
+      }
+
+      if (!solve_at_lambda(lambda_mid)) {
+        context.result.termination = TerminationReason::NumericalFailure;
+        context.result.message = "Linear solve failed";
+        record_trace(TrialDecision::LinearSolveFailure);
+        return false;
+      }
+
+      const auto [raw_mid_norm, scaled_mid_norm] = step_norms();
+      if (scaled_mid_norm > context.trust_radius) {
+        lambda_low = lambda_mid;
+      } else {
+        lambda_high = lambda_mid;
+        raw_step_norm = raw_mid_norm;
+        scaled_step_norm = scaled_mid_norm;
+      }
+    }
+
+    if (!solve_at_lambda(lambda_high)) {
+      context.result.termination = TerminationReason::NumericalFailure;
+      context.result.message = "Linear solve failed";
+      record_trace(TrialDecision::LinearSolveFailure);
+      return false;
+    }
+
+    std::tie(raw_step_norm, scaled_step_norm) = step_norms();
+    selected_lambda = lambda_high;
+  }
+
+  context.selected_lambda = selected_lambda;
+  context.result.lambda = selected_lambda;
+  context.result.step_norm = raw_step_norm;
+  trace.raw_step_norm = raw_step_norm;
+  trace.scaled_step_norm = scaled_step_norm;
 
   for (Index j = 0; j < work.n; ++j) {
     const double step = work.step[j];
     work.x_trial[j] = work.x_current[j] + step;
-    step_squared_norm += step * step;
 
     if (!std::isfinite(work.x_trial[j])) {
       context.result.termination = TerminationReason::NumericalFailure;
       context.result.message = "Non-finite trial parameter";
+      record_trace(TrialDecision::NonFiniteTrialParameter);
       return false;
     }
   }
 
-  context.result.step_norm = std::sqrt(step_squared_norm);
-  if (!std::isfinite(step_squared_norm)) {
+  if (context.trial_trace != nullptr) {
+    trace.current_parameters.reserve(work.n);
+    trace.trial_parameters.reserve(work.n);
+    trace.step.reserve(work.n);
+    trace.gradient.reserve(work.n);
+    trace.jacobian_column_norms.reserve(work.n);
+    trace.parameter_scales.reserve(work.n);
+    trace.effective_damping_diagonal.reserve(work.n);
+    for (Index j = 0; j < work.n; ++j) {
+      double scale = 1.0;
+      if constexpr (kUsesJacobianColumnScaling<Scaling>) {
+        scale = work.scale[j];
+      }
+      double column_squared_norm = 0.0;
+      for (Index i = 0; i < work.m; ++i) {
+        column_squared_norm += work.J[i, j] * work.J[i, j];
+      }
+      trace.current_parameters.push_back(work.x_current[j]);
+      trace.trial_parameters.push_back(work.x_trial[j]);
+      trace.step.push_back(work.step[j]);
+      trace.gradient.push_back(work.g[j]);
+      trace.jacobian_column_norms.push_back(std::sqrt(column_squared_norm));
+      trace.parameter_scales.push_back(scale);
+      double damping_diagonal = 1.0;
+      if constexpr (kUsesJacobianColumnScaling<Scaling>) {
+        damping_diagonal =
+            std::min(work.damping_scale[j] * work.damping_scale[j],
+                     kMaxLMDampingDiagonal);
+      }
+      trace.effective_damping_diagonal.push_back(context.result.lambda *
+                                                 damping_diagonal);
+    }
+  }
+  if (!std::isfinite(raw_step_norm) || !std::isfinite(scaled_step_norm)) {
     context.result.termination = TerminationReason::NumericalFailure;
-    context.result.message = "Non-finite step_squared_norm";
+    context.result.message = "Non-finite step norm";
+    record_trace(TrialDecision::NonFiniteTrialParameter);
     return false;
   }
 
   if (context.result.step_norm <=
       context.evaluation_context.options.step_tolerance) {
     context.result.termination = TerminationReason::SmallStep;
+    record_trace(TrialDecision::SmallStep);
     return false;
   }
 
@@ -355,6 +554,7 @@ try_lm_step(SolverContext<Policy, M, N, Residual, Jacobian> &context) {
       context.evaluation_context.options.max_function_evaluations) {
     context.result.termination = TerminationReason::MaxFunctionEvaluations;
     context.result.message = "Maximum function evaluations reached";
+    record_trace(TrialDecision::FunctionEvaluationLimit);
     return false;
   }
 
@@ -369,22 +569,13 @@ try_lm_step(SolverContext<Policy, M, N, Residual, Jacobian> &context) {
       0.5 * std::transform_reduce(work.r_trial.view().begin(),
                                   work.r_trial.view().end(), 0.0, std::plus<>{},
                                   [](double ri) { return ri * ri; });
+  trace.trial_cost = trial_cost;
   if (!std::isfinite(trial_cost)) {
-    if (context.result.lambda >= lm_opts.max_lambda) {
-      context.result.termination = TerminationReason::DampingLimit;
-      return false;
-    }
-    context.result.lambda = std::min(
-        lm_opts.max_lambda, context.result.lambda * context.damping_multiplier);
-    context.damping_multiplier *= 2.0;
-    if (!std::isfinite(context.damping_multiplier)) {
-      context.result.termination = TerminationReason::NumericalFailure;
-      context.result.message = "Non-finite damping multiplier";
-    }
+    reject_and_shrink_radius(scaled_step_norm);
+    record_trace(TrialDecision::NonFiniteTrialCost);
     return false;
   }
 
-  /*
   double model_squared_norm = 0.0;
 
   for (Index i = 0; i < work.m; ++i) {
@@ -398,7 +589,7 @@ try_lm_step(SolverContext<Policy, M, N, Residual, Jacobian> &context) {
   }
 
   const double model_cost = 0.5 * model_squared_norm;
-  */
+  /*
   double predicted_reduction = 0.0;
   for (Index j = 0; j < work.n; ++j) {
     double scaled_step = work.step[j];
@@ -421,61 +612,60 @@ try_lm_step(SolverContext<Policy, M, N, Residual, Jacobian> &context) {
     context.result.message = "Non-finite predicted reduction";
     return false;
   }
+  */
   const double actual_reduction = context.result.final_cost - trial_cost;
-  /*
   const double predicted_reduction = context.result.final_cost - model_cost;
+  trace.actual_reduction = actual_reduction;
+  trace.predicted_reduction = predicted_reduction;
   if (!std::isfinite(model_cost)) {
     context.result.termination = TerminationReason::NumericalFailure;
     context.result.message = "Non-finite values in model cost analysis";
+    record_trace(TrialDecision::NonFinitePredictedReduction);
     return false;
   }
-  */
 
   if (predicted_reduction <= 0.0) {
-    if (context.result.lambda >= lm_opts.max_lambda) {
-      context.result.termination = TerminationReason::DampingLimit;
+    const auto &options = context.evaluation_context.options;
+    const double cost_change = std::abs(actual_reduction);
+    const bool small_abs_change = cost_change <= options.cost_tolerance;
+    const bool small_rel_change =
+        options.relative_cost_tolerance > 0.0 &&
+        context.result.final_cost > 0.0 &&
+        cost_change <=
+            options.relative_cost_tolerance * context.result.final_cost;
+
+    if (small_abs_change || small_rel_change) {
+      context.result.termination = TerminationReason::SmallCostReduction;
+      record_trace(TrialDecision::SmallCostReduction);
       return false;
     }
-    context.result.lambda = std::min(
-        lm_opts.max_lambda, context.result.lambda * context.damping_multiplier);
-    context.damping_multiplier *= 2.0;
-    if (!std::isfinite(context.damping_multiplier)) {
-      context.result.termination = TerminationReason::NumericalFailure;
-      context.result.message = "Non-finite damping multiplier";
-      return false;
-    }
+
+    reject_and_shrink_radius(scaled_step_norm);
+    record_trace(TrialDecision::NonPositivePredictedReduction);
     return false;
   }
 
   const double rho = actual_reduction / predicted_reduction;
+  trace.rho = rho;
   if (!std::isfinite(rho)) {
     context.result.termination = TerminationReason::NumericalFailure;
     context.result.message = "Non-finite rho";
+    record_trace(TrialDecision::NonFiniteRho);
     return false;
   }
 
   if (rho <= 1e-3) {
-    if (context.result.lambda >= lm_opts.max_lambda) {
-      context.result.termination = TerminationReason::DampingLimit;
-      return false;
-    }
-    context.result.lambda = std::min(
-        lm_opts.max_lambda, context.result.lambda * context.damping_multiplier);
-    context.damping_multiplier *= 2.0;
-    if (!std::isfinite(context.damping_multiplier)) {
-      context.result.termination = TerminationReason::NumericalFailure;
-      context.result.message = "Non-finite damping multiplier";
-      return false;
-    }
+    reject_and_shrink_radius(scaled_step_norm);
+    record_trace(TrialDecision::LowRho);
     return false;
   } else {
-    const double t = 2.0 * rho - 1.0;
-    const double factor = std::max(1.0 / 3.0, 1.0 - t * t * t);
-
-    context.result.lambda = std::clamp(context.result.lambda * factor,
-                                       lm_opts.min_lambda, lm_opts.max_lambda);
-    context.damping_multiplier = 2.0;
+    if (rho > 0.75 && scaled_step_norm >= 0.9 * context.trust_radius) {
+      context.trust_radius =
+          std::min(lm_opts.max_trust_region_radius, 2.0 * context.trust_radius);
+    }
   }
+
+  record_trace(TrialDecision::Accepted);
 
   std::ranges::copy(work.x_trial.view().begin(), work.x_trial.view().end(),
                     work.x_current.view().begin());

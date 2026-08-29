@@ -44,6 +44,46 @@ accepted/rejected steps; unavailable MINPACK counters are `nan`.
 Use `--build-dir` and `--output-dir` to select different locations. `--env`
 sources a shell setup file before CMake invokes the requested compiler.
 
+For per-start solver work across levmar and optional external solvers:
+
+```sh
+python3 scripts/benchmark.py \
+  --solver-work \
+  --iterations 1 \
+  --build-dir build-external-ninja \
+  --output-dir /tmp/levmar-work
+```
+
+This writes `nist-solver-work.csv`, including termination, cost, evaluation,
+linear-solve, accepted-step, and rejected-step counters. For targeted internal
+LM diagnostics:
+
+```sh
+python3 scripts/benchmark.py \
+  --controller-trace \
+  --iterations 1 \
+  --build-dir build-external-ninja \
+  --output-dir /tmp/levmar-controller-trace
+```
+
+The resulting `nist-controller-trace.csv` records selected NIST trajectories,
+including trial costs, gain ratio, lambda, parameter and damping scales, step
+vectors, parameter vectors, gradients, and Jacobian column norms.
+
+The solver-work workflow can target one independent runner while iterating on
+one backend:
+
+```sh
+python3 scripts/benchmark.py --solver-work --runner levmar
+python3 scripts/benchmark.py --solver-work --runner ceres
+python3 scripts/benchmark.py --solver-work --runner minpack
+```
+
+`--runner all` is the default and builds all three runners before merging their
+rows. The Ceres and MINPACK runners compile and execute only their respective
+adapter paths; the levmar runner contains the conformance and controller-trace
+paths without external solver dependencies.
+
 The runner exposes separate modes for direct use:
 
 ```sh
@@ -78,9 +118,11 @@ must be scalar-generic so they operate on internal autodiff views as well as
 standard double-based views. `levmar/lm.h` is the public umbrella header; the
 implementation headers under `levmar/internal/` are not public API.
 
-A top-level `solve(...)` entry point is not implemented yet. The current focus
-is expanding autodiff coverage, implementing a minimal Levenberg-Marquardt
-solve loop, and validating it against the NIST corpus.
+The internal policy-templated Levenberg-Marquardt solve path is implemented and
+is exercised by the NIST runner. Its current experiment uses fixed first-Jacobian
+coordinate scales, damping scales floored by those coordinate scales, and an
+upper damping-diagonal cap. The public solver API remains experimental; see
+`plans.md` for the active trust-region controller work.
 
 ## Install
 
