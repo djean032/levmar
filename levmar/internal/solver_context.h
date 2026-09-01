@@ -27,6 +27,8 @@ enum class TrialDecision {
 
 struct LmTrialTrace {
   Index inner_linear_solves = 0;
+  Index max_correlation_col_i = 0;
+  Index max_correlation_col_j = 0;
   bool radius_bound_active = false;
   double cost_before = std::numeric_limits<double>::quiet_NaN();
   double trial_cost = std::numeric_limits<double>::quiet_NaN();
@@ -41,6 +43,7 @@ struct LmTrialTrace {
   double trust_radius_before = std::numeric_limits<double>::quiet_NaN();
   double trust_radius_after = std::numeric_limits<double>::quiet_NaN();
   double selected_lambda = std::numeric_limits<double>::quiet_NaN();
+  double max_abs_column_correlation = std::numeric_limits<double>::quiet_NaN();
   std::vector<double> current_parameters;
   std::vector<double> trial_parameters;
   std::vector<double> step;

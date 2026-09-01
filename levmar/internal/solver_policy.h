@@ -12,6 +12,17 @@ struct AutoDiffJacobian {};
 struct LevenbergMarquardt {};
 
 struct DampedQr {};
+struct PivotedHouseholderQr {};
+
+template <class LinearAlgebra>
+inline constexpr bool kSupportedLinearAlgebra =
+    std::same_as<LinearAlgebra, DampedQr> ||
+    std::same_as<LinearAlgebra, PivotedHouseholderQr>;
+
+template <class LinearAlgebra>
+inline constexpr bool kRequiresTallQr =
+    std::same_as<LinearAlgebra, DampedQr> ||
+    std::same_as<LinearAlgebra, PivotedHouseholderQr>;
 
 struct SquaredLoss {};
 

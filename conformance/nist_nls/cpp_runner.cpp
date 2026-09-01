@@ -38,6 +38,15 @@ using NistAutoDiffSolverPolicy =
     SolverPolicy<AutoDiffJacobian, LevenbergMarquardt, DampedQr, SquaredLoss,
                  JacobianColumnScaling>;
 
+template <class LinearAlgebra>
+using NistAnalyticSolverPolicyFor =
+    SolverPolicy<UserJacobian, LevenbergMarquardt, LinearAlgebra, SquaredLoss,
+                 JacobianColumnScaling>;
+template <class LinearAlgebra>
+using NistAutoDiffSolverPolicyFor =
+    SolverPolicy<AutoDiffJacobian, LevenbergMarquardt, LinearAlgebra,
+                 SquaredLoss, JacobianColumnScaling>;
+
 struct CorpusProblem {
   std::string name;
   std::string model_id;
@@ -1060,7 +1069,6 @@ Result solve_nist_variant(const CorpusProblem &corpus, ResidualFn residual,
   options.cost_tolerance = 0.0;
   options.relative_cost_tolerance =
       enable_relative_cost_termination ? tolerance : 0.0;
-  options.lm.initial_lambda = 1e-4;
   options.lm.min_lambda = 1e-16;
   options.lm.max_lambda = 1e32;
 
@@ -1241,8 +1249,9 @@ run_problem(const std::filesystem::path &problem_dir,
         auto solve_pair = [&](bool require_convergence, double *dynamic_seconds,
                               double *static_seconds, bool static_first) {
           constexpr std::string_view derivative =
-              std::is_same_v<Policy, NistAnalyticSolverPolicy> ? "analytic"
-                                                               : "autodiff";
+              std::same_as<typename Policy::JacobianPolicy, UserJacobian>
+                  ? "analytic"
+                  : "autodiff";
           auto solve_dynamic = [&] {
             const auto start = Clock::now();
             auto solution = solve_nist_variant<Policy, std::dynamic_extent,
@@ -3729,26 +3738,31 @@ void write_csv_report(const std::filesystem::path &path,
 void write_solver_work_csv(const std::filesystem::path &path,
                            const std::vector<ProblemReport> &analytic_reports,
                            const std::vector<ProblemReport> &autodiff_reports,
-                           bool include_levmar) {
+                           bool include_levmar,
+                           std::string_view linear_algebra = "damped_qr") {
   std::ofstream file(path);
   if (!file) {
     throw std::runtime_error("Failed to open solver work CSV path " +
                              path.string());
   }
-  file << "solver,derivative,problem,start,extent,m,n,elapsed_ms,termination,"
+  file << "solver,linear_algebra,derivative,problem,start,extent,m,n,elapsed_"
+          "ms,termination,"
           "lre,"
           "final_cost,lambda,gradient_inf_norm,step_norm,iterations,"
           "function_evaluations,jacobian_evaluations,linear_solves,"
-          "accepted_steps,rejected_steps\n";
+          "factorization_count,accepted_steps,rejected_steps\n";
   const auto write_levmar_reports =
       [&](std::string_view derivative,
           const std::vector<ProblemReport> &reports) {
         for (const auto &report : reports) {
           for (const auto &row : report.solver_work_rows) {
             const auto &result = row.result;
-            file << "levmar," << derivative << ',' << report.name << ','
-                 << row.start_label << ',' << row.extent << ',' << row.m << ','
-                 << row.n << ',' << std::setprecision(17)
+            const Index factorization_count = linear_algebra == "damped_qr"
+                                                  ? result.linear_solves
+                                                  : result.factorization_count;
+            file << "levmar," << linear_algebra << ',' << derivative << ','
+                 << report.name << ',' << row.start_label << ',' << row.extent
+                 << ',' << row.m << ',' << row.n << ',' << std::setprecision(17)
                  << milliseconds(row.elapsed_seconds) << ','
                  << termination_reason_name(result.termination) << ','
                  << row.lre << ',' << result.final_cost << ',' << result.lambda
@@ -3756,8 +3770,8 @@ void write_solver_work_csv(const std::filesystem::path &path,
                  << ',' << result.iterations << ','
                  << result.function_evaluations << ','
                  << result.jacobian_evaluations << ',' << result.linear_solves
-                 << ',' << result.accepted_steps << ',' << result.rejected_steps
-                 << '\n';
+                 << ',' << factorization_count << ',' << result.accepted_steps
+                 << ',' << result.rejected_steps << '\n';
           }
         }
       };
@@ -3771,7 +3785,7 @@ void write_solver_work_csv(const std::filesystem::path &path,
           for (const auto &result : report.external_solver_results) {
             const bool finite_difference = result.solver.ends_with("lmdif");
             const bool autodiff = result.solver.ends_with("autodiff");
-            file << result.solver << ','
+            file << result.solver << ",external,"
                  << (finite_difference ? "finite_difference"
                      : autodiff        ? "autodiff"
                                        : "analytic")
@@ -3789,7 +3803,7 @@ void write_solver_work_csv(const std::filesystem::path &path,
                  << (result.has_linear_solves
                          ? std::to_string(result.linear_solves)
                          : "nan")
-                 << ','
+                 << ",nan,"
                  << (result.has_accepted_steps
                          ? std::to_string(result.accepted_steps)
                          : "nan")
@@ -3849,7 +3863,9 @@ void write_controller_trace_csv(
           "solves,radius_bound_active,gradient_inf_norm,"
           "raw_step_norm,scaled_step_norm,current_parameters,trial_parameters,"
           "step,gradient,jacobian_column_norms,parameter_scales,"
-          "effective_damping_diagonal,decision,termination\n";
+          "effective_damping_diagonal,max_abs_column_correlation,"
+          "max_correlation_col_i,max_correlation_col_j,"
+          "decision,termination\n";
   const auto write_vector = [&](const std::vector<double> &values) {
     for (std::size_t i = 0; i < values.size(); ++i) {
       if (i != 0) {
@@ -3885,7 +3901,9 @@ void write_controller_trace_csv(
       write_vector(trial.parameter_scales);
       file << ',';
       write_vector(trial.effective_damping_diagonal);
-      file << ',' << trial_decision_name(trial.decision) << ','
+      file << ',' << trial.max_abs_column_correlation << ','
+           << trial.max_correlation_col_i << ',' << trial.max_correlation_col_j
+           << ',' << trial_decision_name(trial.decision) << ','
            << termination_reason_name(trial.termination) << '\n';
     }
   }
@@ -4385,6 +4403,93 @@ void write_solver_comparison_csv(
   }
 }
 
+double frozen_linearization_objective(
+    const LMWorkspace<std::dynamic_extent, std::dynamic_extent> &work,
+    double lambda) {
+  double objective = 0.0;
+  for (Index i = 0; i < work.m; ++i) {
+    double residual = work.r[i];
+    for (Index j = 0; j < work.n; ++j) {
+      residual += work.J(i, j) * work.step[j];
+    }
+    objective += residual * residual;
+  }
+  for (Index j = 0; j < work.n; ++j) {
+    const double damping = std::min(
+        work.damping_scale[j] * work.damping_scale[j], kMaxLMDampingDiagonal);
+    objective += lambda * damping * work.step[j] * work.step[j];
+  }
+  return objective;
+}
+
+void run_frozen_linearization(const std::filesystem::path &problem_dir) {
+  const auto corpus = load_problem(problem_dir);
+  const auto jacobian = read_numeric_csv(problem_dir / "jacobian_start1.csv");
+  const auto residuals = read_numeric_csv(problem_dir / "residuals_start1.csv");
+  if (jacobian.size() != corpus.m || residuals.size() != corpus.m) {
+    throw std::runtime_error("frozen linearization fixture shape mismatch");
+  }
+
+  LMWorkspace<std::dynamic_extent, std::dynamic_extent> damped_work(corpus.m,
+                                                                    corpus.n);
+  LMWorkspace<std::dynamic_extent, std::dynamic_extent> pivoted_work(corpus.m,
+                                                                     corpus.n);
+  DampedQrWorkspace<std::dynamic_extent, std::dynamic_extent> damped_qr;
+  PivotedHouseholderQrWorkspace<std::dynamic_extent, std::dynamic_extent>
+      pivoted_qr;
+  damped_qr.resize(corpus.m, corpus.n);
+  pivoted_qr.resize(corpus.m, corpus.n);
+
+  for (auto *work : {&damped_work, &pivoted_work}) {
+    for (Index i = 0; i < corpus.m; ++i) {
+      if (jacobian[i].size() != corpus.n || residuals[i].size() != 1) {
+        throw std::runtime_error("frozen linearization CSV row shape mismatch");
+      }
+      work->r[i] = residuals[i][0];
+      for (Index j = 0; j < corpus.n; ++j) {
+        work->J(i, j) = jacobian[i][j];
+      }
+    }
+    if (!update_parameter_scaling(JacobianColumnScaling{}, *work)) {
+      throw std::runtime_error("frozen linearization scaling failed");
+    }
+  }
+
+  if (!prepare_pivoted_householder_qr(JacobianColumnScaling{}, pivoted_work,
+                                      pivoted_qr, 32.0)) {
+    throw std::runtime_error(
+        "frozen linearization cached factorization failed");
+  }
+
+  std::cout << "problem,lambda,max_abs_step_error,max_rel_step_error,"
+               "objective_abs_error\n";
+  for (double lambda : {1e-16, 1e-12, 1e-8, 1e-4, 1.0}) {
+    if (!solve_damped_qr(JacobianColumnScaling{}, damped_work, damped_qr,
+                         lambda) ||
+        !solve_pivoted_householder_qr(JacobianColumnScaling{}, pivoted_work,
+                                      pivoted_qr, lambda)) {
+      throw std::runtime_error("frozen linearization solve failed");
+    }
+
+    double max_abs_step_error = 0.0;
+    double max_rel_step_error = 0.0;
+    for (Index j = 0; j < corpus.n; ++j) {
+      const double abs_error =
+          std::abs(pivoted_work.step[j] - damped_work.step[j]);
+      max_abs_step_error = std::max(max_abs_step_error, abs_error);
+      max_rel_step_error =
+          std::max(max_rel_step_error,
+                   abs_error / std::max(std::abs(damped_work.step[j]), 1e-16));
+    }
+    const double objective_abs_error =
+        std::abs(frozen_linearization_objective(pivoted_work, lambda) -
+                 frozen_linearization_objective(damped_work, lambda));
+    std::cout << corpus.name << ',' << std::setprecision(17) << lambda << ','
+              << max_abs_step_error << ',' << max_rel_step_error << ','
+              << objective_abs_error << '\n';
+  }
+}
+
 } // namespace
 
 int main(int argc, char **argv) {
@@ -4416,6 +4521,12 @@ int main(int argc, char **argv) {
     bool validation_only = false;
     bool solver_work_external = false;
     bool relative_cost_termination = true;
+    std::filesystem::path frozen_linearization_problem_dir;
+#ifdef LEVMAR_NIST_DEFAULT_PIVOTED_HOUSEHOLDER_QR
+    std::string_view linear_algebra = "pivoted-householder-qr";
+#else
+    std::string_view linear_algebra = "damped-qr";
+#endif
     for (int i = 4; i < argc; ++i) {
       if (std::string_view(argv[i]) == "--solve-all") {
         solve_all_starts = true;
@@ -4443,9 +4554,27 @@ int main(int argc, char **argv) {
           throw std::runtime_error("--controller-trace requires a path");
         }
         controller_trace_csv_path = argv[i];
+      } else if (std::string_view(argv[i]) == "--frozen-linearization") {
+        if (++i == argc) {
+          throw std::runtime_error(
+              "--frozen-linearization requires a problem directory");
+        }
+        frozen_linearization_problem_dir = argv[i];
+      } else if (std::string_view(argv[i]) == "--linear-algebra") {
+        if (++i == argc) {
+          throw std::runtime_error("--linear-algebra requires a backend");
+        }
+        linear_algebra = argv[i];
+        if (linear_algebra != "damped-qr" &&
+            linear_algebra != "pivoted-householder-qr") {
+          throw std::runtime_error(
+              "--linear-algebra must be damped-qr or pivoted-householder-qr");
+        }
       } else if (std::string_view(argv[i]) ==
                  "--disable-relative-cost-termination") {
         relative_cost_termination = false;
+      } else if (std::string_view(argv[i]).starts_with("--")) {
+        throw std::runtime_error("Unknown option " + std::string(argv[i]));
       } else {
         benchmark_csv_path = argv[i];
       }
@@ -4461,6 +4590,10 @@ int main(int argc, char **argv) {
     std::ranges::sort(problem_dirs);
 
 #ifdef LEVMAR_NIST_EXTERNAL_ONLY
+    if (linear_algebra != "damped-qr") {
+      throw std::runtime_error(
+          "--linear-algebra is available only in levmar_nist_runner");
+    }
     if (!controller_trace_csv_path.empty()) {
       throw std::runtime_error(
           "Controller traces are available only in levmar_nist_runner");
@@ -4477,15 +4610,27 @@ int main(int argc, char **argv) {
     write_solver_work_csv(solver_work_csv_path, external_reports, {}, false);
     return 0;
 #else
+    if (!frozen_linearization_problem_dir.empty()) {
+      run_frozen_linearization(frozen_linearization_problem_dir);
+      return 0;
+    }
+
     if (!controller_trace_csv_path.empty()) {
       std::vector<ControllerTraceRecord> controller_traces;
-      for (const auto &path : problem_dirs) {
-        run_problem<NistAnalyticSolverPolicy>(path, true, false, 0, false,
-                                              false, relative_cost_termination,
-                                              &controller_traces);
-        run_problem<NistAutoDiffSolverPolicy>(path, true, false, 0, false,
-                                              false, relative_cost_termination,
-                                              &controller_traces);
+      const auto run_controller_trace = [&]<class LinearAlgebra>() {
+        for (const auto &path : problem_dirs) {
+          run_problem<NistAnalyticSolverPolicyFor<LinearAlgebra>>(
+              path, true, false, 0, false, false, relative_cost_termination,
+              &controller_traces);
+          run_problem<NistAutoDiffSolverPolicyFor<LinearAlgebra>>(
+              path, true, false, 0, false, false, relative_cost_termination,
+              &controller_traces);
+        }
+      };
+      if (linear_algebra == "pivoted-householder-qr") {
+        run_controller_trace.template operator()<PivotedHouseholderQr>();
+      } else {
+        run_controller_trace.template operator()<DampedQr>();
       }
       write_controller_trace_csv(controller_trace_csv_path, controller_traces);
       return 0;
@@ -4494,19 +4639,32 @@ int main(int argc, char **argv) {
     if (!solver_work_csv_path.empty()) {
       std::vector<ProblemReport> analytic_reports;
       std::vector<ProblemReport> autodiff_reports;
-      for (const auto &path : problem_dirs) {
-        auto analytic_report = run_problem<NistAnalyticSolverPolicy>(
-            path, true, false, 0, solver_work_external, false,
-            relative_cost_termination);
-        analytic_reports.push_back(std::move(analytic_report));
-        if (!solver_work_external) {
-          auto autodiff_report = run_problem<NistAutoDiffSolverPolicy>(
-              path, true, false, 0, false, false, relative_cost_termination);
-          autodiff_reports.push_back(std::move(autodiff_report));
+      const auto run_solver_work = [&]<class LinearAlgebra>() {
+        for (const auto &path : problem_dirs) {
+          auto analytic_report =
+              run_problem<NistAnalyticSolverPolicyFor<LinearAlgebra>>(
+                  path, true, false, 0, solver_work_external, false,
+                  relative_cost_termination);
+          analytic_reports.push_back(std::move(analytic_report));
+          if (!solver_work_external) {
+            auto autodiff_report =
+                run_problem<NistAutoDiffSolverPolicyFor<LinearAlgebra>>(
+                    path, true, false, 0, false, false,
+                    relative_cost_termination);
+            autodiff_reports.push_back(std::move(autodiff_report));
+          }
         }
+      };
+      if (linear_algebra == "pivoted-householder-qr") {
+        run_solver_work.template operator()<PivotedHouseholderQr>();
+      } else {
+        run_solver_work.template operator()<DampedQr>();
       }
       write_solver_work_csv(solver_work_csv_path, analytic_reports,
-                            autodiff_reports, !solver_work_external);
+                            autodiff_reports, !solver_work_external,
+                            linear_algebra == "pivoted-householder-qr"
+                                ? "pivoted_householder_qr"
+                                : "damped_qr");
       return 0;
     }
 

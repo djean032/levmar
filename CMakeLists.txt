@@ -66,7 +66,12 @@ if(LEVMAR_BUILD_CONFORMANCE_RUNNER)
   endfunction()
 
   levmar_add_nist_runner(levmar_nist_runner)
-  set(levmar_nist_benchmark_runners levmar_nist_runner)
+  levmar_add_nist_runner(levmar_nist_householder_runner)
+  target_compile_definitions(
+    levmar_nist_householder_runner
+    PRIVATE LEVMAR_NIST_DEFAULT_PIVOTED_HOUSEHOLDER_QR=1)
+  set(levmar_nist_benchmark_runners levmar_nist_runner
+                                    levmar_nist_householder_runner)
 
   if(LEVMAR_BUILD_EXTERNAL_BENCHMARKS)
     find_package(Ceres CONFIG QUIET)

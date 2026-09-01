@@ -62,16 +62,16 @@ inline constexpr bool kStaticSolverConfigurationValid = [] {
       !std::same_as<JacobianPolicy, UserJacobian> ||
       !std::same_as<Jacobian, NoJacobian>;
 
-  constexpr bool qr_static_shape_is_valid =
-      M == std::dynamic_extent || N == std::dynamic_extent || M >= N;
+  constexpr bool shape_is_valid = !kRequiresTallQr<LinearAlgebraPolicy> ||
+                                  M == std::dynamic_extent ||
+                                  N == std::dynamic_extent || M >= N;
 
   return kInitialJacobianPolicy<JacobianPolicy> &&
          std::same_as<StrategyPolicy, LevenbergMarquardt> &&
-         std::same_as<LinearAlgebraPolicy, DampedQr> &&
+         kSupportedLinearAlgebra<LinearAlgebraPolicy> &&
          std::same_as<LossPolicy, SquaredLoss> &&
          kInitialScalingPolicy<ScalingPolicy> && user_jacobian_is_valid &&
-         has_supported_autodiff_callback<Policy, Context>() &&
-         qr_static_shape_is_valid;
+         has_supported_autodiff_callback<Policy, Context>() && shape_is_valid;
 }();
 
 template <class Policy, class Context>
@@ -93,8 +93,8 @@ consteval void validate_static_solver_configuration() {
                 "Unsupported Jacobian policy");
   static_assert(std::same_as<StrategyPolicy, LevenbergMarquardt>,
                 "Only LevenbergMarquardt is currently implemented");
-  static_assert(std::same_as<LinearAlgebraPolicy, DampedQr>,
-                "Only DampedQr is currently implemented");
+  static_assert(kSupportedLinearAlgebra<LinearAlgebraPolicy>,
+                "Unsupported linear-algebra policy");
   static_assert(std::same_as<LossPolicy, SquaredLoss>,
                 "Only SquaredLoss is currently implemented");
   static_assert(kInitialScalingPolicy<ScalingPolicy>,
@@ -117,10 +117,10 @@ consteval void validate_static_solver_configuration() {
     }
   }
 
-  if constexpr (std::same_as<LinearAlgebraPolicy, DampedQr> &&
+  if constexpr (kRequiresTallQr<LinearAlgebraPolicy> &&
                 M != std::dynamic_extent && N != std::dynamic_extent) {
-    static_assert(M >= N, "DampedQr requires residuals >= parameters for "
-                          "static-extent problems");
+    static_assert(M >= N,
+                  "QR requires residuals >= parameters for static problems");
   }
 }
 
@@ -169,15 +169,19 @@ ErrorOrVoid validate_runtime_options(const Options &options) {
                                  "max_function_evaluations must be positive"});
   }
 
-  if (!std::isfinite(options.lm.initial_lambda) ||
-      !std::isfinite(options.lm.min_lambda) ||
+  if (!std::isfinite(options.lm.min_lambda) ||
       !std::isfinite(options.lm.max_lambda) || options.lm.min_lambda <= 0.0 ||
       options.lm.max_lambda <= 0.0 ||
-      options.lm.min_lambda > options.lm.max_lambda ||
-      options.lm.initial_lambda < options.lm.min_lambda ||
-      options.lm.initial_lambda > options.lm.max_lambda) {
+      options.lm.min_lambda > options.lm.max_lambda) {
     return std::unexpected(
         Error{ErrorCode::InvalidProblem, "Invalid lambda configuration"});
+  }
+
+  if (!std::isfinite(options.lm.initial_trust_region_factor) ||
+      options.lm.initial_trust_region_factor <= 0.0) {
+    return std::unexpected(
+        Error{ErrorCode::InvalidProblem,
+              "initial_trust_region_factor must be finite and positive"});
   }
 
   if (!std::isfinite(options.lm.initial_trust_region_radius) ||
@@ -190,6 +194,13 @@ ErrorOrVoid validate_runtime_options(const Options &options) {
           options.lm.max_trust_region_radius) {
     return std::unexpected(Error{ErrorCode::InvalidProblem,
                                  "Invalid trust-region radius configuration"});
+  }
+
+  if (!std::isfinite(options.lm.rank_tolerance_multiplier) ||
+      options.lm.rank_tolerance_multiplier <= 0.0) {
+    return std::unexpected(
+        Error{ErrorCode::InvalidProblem,
+              "rank_tolerance_multiplier must be finite and positive"});
   }
 
   return {};

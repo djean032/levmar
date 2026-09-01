@@ -5,10 +5,13 @@
 #include "levmar/internal/problem.h"
 #include "levmar/internal/solver_policy.h"
 #include "levmar/internal/solver_workspace.h"
+#include "levmar/internal/storage.h"
 #include <algorithm>
 #include <cmath>
 #include <concepts>
 #include <functional>
+#include <limits>
+#include <span>
 #include <utility>
 
 #include <expected>
@@ -55,23 +58,80 @@ initialize_solver(SolverContext<Policy, M, N, Residual, Jacobian> &context) {
     return validation;
   }
 
-  context.trust_radius = evaluation.options.lm.initial_trust_region_radius;
-  context.selected_lambda = evaluation.options.lm.initial_lambda;
-  context.result.lambda = context.selected_lambda;
+  context.trust_radius = 0.0;
+  context.selected_lambda = 0.0;
+  context.result.lambda = 0.0;
+  if constexpr (std::same_as<typename Policy::LinearAlgebraPolicy,
+                             PivotedHouseholderQr>) {
+    context.workspace.linear.invalidate();
+  }
 
-  if constexpr (std::same_as<typename Policy::LinearAlgebraPolicy, DampedQr>) {
+  if constexpr (kRequiresTallQr<typename Policy::LinearAlgebraPolicy>) {
     if (problem.num_residuals < problem.num_parameters) {
-      return std::unexpected(
-          Error{ErrorCode::InvalidProblem,
-                "DampedQr requires residuals >= parameters"});
+      return std::unexpected(Error{ErrorCode::InvalidProblem,
+                                   "QR requires residuals >= parameters"});
     }
   }
 
   std::ranges::copy(evaluation.x,
                     context.evaluation_context.work.x_current.view().begin());
 
-  context.result.lambda = evaluation.options.lm.initial_lambda;
   return {};
+}
+
+template <Index Rows, Index Cols>
+[[nodiscard]] bool
+matrix_column_tail_l2_norm(const MatrixStorage<Rows, Cols> &matrix,
+                           Index first_row, Index column, double &norm) {
+  double max_abs = 0.0;
+  const Index rows = matrix.rows();
+
+  for (Index i = first_row; i < rows; ++i) {
+    const double value = std::abs(matrix[i, column]);
+    if (!std::isfinite(value)) {
+      return false;
+    }
+
+    max_abs = std::max(max_abs, value);
+  }
+
+  if (max_abs == 0.0) {
+    norm = 0.0;
+    return true;
+  }
+
+  double sum0 = 0.0;
+  double sum1 = 0.0;
+  double sum2 = 0.0;
+  double sum3 = 0.0;
+  Index i = first_row;
+
+  for (; i + 3 < rows; i += 4) {
+    const double x0 = matrix[i, column] / max_abs;
+    const double x1 = matrix[i + 1, column] / max_abs;
+    const double x2 = matrix[i + 2, column] / max_abs;
+    const double x3 = matrix[i + 3, column] / max_abs;
+
+    sum0 = std::fma(x0, x0, sum0);
+    sum1 = std::fma(x1, x1, sum1);
+    sum2 = std::fma(x2, x2, sum2);
+    sum3 = std::fma(x3, x3, sum3);
+  }
+
+  double sum = (sum0 + sum1) + (sum2 + sum3);
+  for (; i < rows; ++i) {
+    const double scaled = matrix[i, column] / max_abs;
+    sum = std::fma(scaled, scaled, sum);
+  }
+
+  norm = max_abs * std::sqrt(sum);
+  return std::isfinite(norm);
+}
+
+template <Index M, Index N>
+[[nodiscard]] bool update_parameter_scaling(NoScaling,
+                                            LMWorkspace<M, N> &work) {
+  return true;
 }
 
 template <class Policy, Index M, Index N, ResidualCallable<M, N> Residual,
@@ -142,9 +202,22 @@ template <class Policy, Index M, Index N, ResidualCallable<M, N> Residual,
 
   double gradient_inf_norm = 0.0;
   for (Index j = 0; j < work.n; ++j) {
-    double gj = 0.0;
-    for (Index i = 0; i < work.m; ++i) {
-      gj += work.J(i, j) * work.r[i];
+    double sum0 = 0.0;
+    double sum1 = 0.0;
+    double sum2 = 0.0;
+    double sum3 = 0.0;
+    Index i = 0;
+
+    for (; i + 3 < work.m; i += 4) {
+      sum0 = std::fma(work.J[i, j], work.r[i], sum0);
+      sum1 = std::fma(work.J[i + 1, j], work.r[i + 1], sum1);
+      sum2 = std::fma(work.J[i + 2, j], work.r[i + 2], sum2);
+      sum3 = std::fma(work.J[i + 3, j], work.r[i + 3], sum3);
+    }
+
+    double gj = (sum0 + sum1) + (sum2 + sum3);
+    for (; i < work.m; ++i) {
+      gj = std::fma(work.J[i, j], work.r[i], gj);
     }
 
     if (!std::isfinite(gj)) {
@@ -174,12 +247,188 @@ finish_solver(SolverContext<Policy, M, N, Residual, Jacobian> &context) {
   return std::move(context.result);
 }
 
-template <Index M, Index N>
-[[nodiscard]] bool append_row_with_givens(DampedQrWorkspace<M, N> &qr, Index n,
-                                          double &incoming_rhs) {
+[[nodiscard]] bool
+apply_householder_reflector(ConstVectorView<std::dynamic_extent> reflector_tail,
+                            double tau,
+                            VectorView<std::dynamic_extent> target) {
+  double sum0 = 0.0;
+  double sum1 = 0.0;
+  double sum2 = 0.0;
+  double sum3 = 0.0;
+  Index i = 0;
+
+  for (; i + 3 < reflector_tail.size(); i += 4) {
+    sum0 = std::fma(reflector_tail[i], target[i + 1], sum0);
+    sum1 = std::fma(reflector_tail[i + 1], target[i + 2], sum1);
+    sum2 = std::fma(reflector_tail[i + 2], target[i + 3], sum2);
+    sum3 = std::fma(reflector_tail[i + 3], target[i + 4], sum3);
+  }
+
+  double dot = target[0] + (sum0 + sum1) + (sum2 + sum3);
+  for (; i < reflector_tail.size(); ++i) {
+    dot = std::fma(reflector_tail[i], target[i + 1], dot);
+  }
+
+  if (!std::isfinite(dot)) {
+    return false;
+  }
+
+  const double coefficient = tau * dot;
+  if (!std::isfinite(coefficient)) {
+    return false;
+  }
+
+  target[0] -= coefficient;
+  for (i = 0; i < reflector_tail.size(); ++i) {
+    target[i + 1] = std::fma(-reflector_tail[i], coefficient, target[i + 1]);
+  }
+
+  return true;
+}
+
+template <class ScalingPolicy, Index M, Index N>
+[[nodiscard]] bool
+prepare_pivoted_householder_qr(ScalingPolicy, const LMWorkspace<M, N> &work,
+                               PivotedHouseholderQrWorkspace<M, N> &qr,
+                               double rank_tolerance_multiplier) {
+  qr.invalidate();
+  for (Index i = 0; i < work.m; ++i) {
+    qr.transformed_rhs[i] = -work.r[i];
+  }
+  for (Index j = 0; j < work.n; ++j) {
+    qr.permutation[j] = j;
+    for (Index i = 0; i < work.m; ++i) {
+      if constexpr (kUsesJacobianColumnScaling<ScalingPolicy>) {
+        qr.packed_qr[i, j] = work.J[i, j] / work.scale[j];
+      } else {
+        qr.packed_qr[i, j] = work.J[i, j];
+      }
+    }
+  }
+
+  for (Index k = 0; k < work.n; ++k) {
+    Index pivot = k;
+    double pivot_norm = 0.0;
+
+    for (Index j = k; j < work.n; ++j) {
+      double norm = 0.0;
+      if (!matrix_column_tail_l2_norm(qr.packed_qr, k, j, norm)) {
+        return false;
+      }
+
+      if (norm > pivot_norm) {
+        pivot = j;
+        pivot_norm = norm;
+      }
+    }
+
+    if (pivot != k) {
+      for (Index i = 0; i < work.m; ++i) {
+        std::swap(qr.packed_qr[i, k], qr.packed_qr[i, pivot]);
+      }
+      std::swap(qr.permutation[k], qr.permutation[pivot]);
+    }
+
+    if (pivot_norm == 0.0) {
+      qr.tau[k] = 0.0;
+      continue;
+    }
+
+    const double x0 = qr.packed_qr[k, k];
+    const double alpha = -std::copysign(pivot_norm, x0);
+    const double leading_value = x0 - alpha;
+
+    if (!std::isfinite(alpha) || !std::isfinite(leading_value) ||
+        leading_value == 0.0) {
+      return false;
+    }
+
+    qr.packed_qr[k, k] = alpha;
+    qr.tau[k] = (alpha - x0) / alpha;
+
+    if (!std::isfinite(qr.tau[k])) {
+      return false;
+    }
+
+    for (Index i = k + 1; i < work.m; ++i) {
+      qr.packed_qr[i, k] /= leading_value;
+
+      if (!std::isfinite(qr.packed_qr[i, k])) {
+        return false;
+      }
+    }
+
+    const auto reflector_tail = ConstVectorView<std::dynamic_extent>(
+        qr.packed_qr.data() + (k + 1) + k * work.m, work.m - k - 1);
+
+    for (Index j = k + 1; j < work.n; ++j) {
+      auto target = VectorView<std::dynamic_extent>(
+          qr.packed_qr.data() + k + j * work.m, work.m - k);
+
+      if (!apply_householder_reflector(reflector_tail, qr.tau[k], target)) {
+        return false;
+      }
+    }
+    auto rhs_target = VectorView<std::dynamic_extent>(
+        qr.transformed_rhs.data() + k, work.m - k);
+
+    if (!apply_householder_reflector(reflector_tail, qr.tau[k], rhs_target)) {
+      return false;
+    }
+  }
+
+  for (Index j = 0; j < work.n; ++j) {
+    for (Index i = 0; i <= j; ++i) {
+      const double value = qr.packed_qr[i, j];
+      if (!std::isfinite(value)) {
+        return false;
+      }
+      qr.r_base[i, j] = value;
+    }
+  }
+
+  for (Index k = 0; k < work.n; ++k) {
+    const Index original_column = qr.permutation[k];
+
+    if constexpr (kUsesJacobianColumnScaling<ScalingPolicy>) {
+      const double scale = work.damping_scale[original_column];
+      const double diagonal = std::min(scale * scale, kMaxLMDampingDiagonal);
+
+      if (!std::isfinite(diagonal)) {
+        return false;
+      }
+      qr.damping_diagonal[k] = diagonal;
+    } else {
+      qr.damping_diagonal[k] = 1.0;
+    }
+  }
+
+  const double leading_diagonal = std::abs(qr.r_base[0, 0]);
+  qr.rank_threshold =
+      rank_tolerance_multiplier * std::numeric_limits<double>::epsilon() *
+      static_cast<double>(std::max(work.m, work.n)) * leading_diagonal;
+
+  if (!std::isfinite(qr.rank_threshold)) {
+    return false;
+  }
+
+  qr.numerical_rank = 0;
+  for (Index k = 0; k < work.n; ++k) {
+    if (std::abs(qr.r_base[k, k]) > qr.rank_threshold) {
+      ++qr.numerical_rank;
+    }
+  }
+  qr.factor_valid = true;
+  return true;
+}
+
+template <Index N>
+[[nodiscard]] bool
+append_row_with_givens(MatrixStorage<N, N> &upper, VectorStorage<N> &rhs,
+                       VectorStorage<N> &row, Index n, double &incoming_rhs) {
   for (Index k = 0; k < n; ++k) {
-    const double diagonal = qr.qr_ut[k, k];
-    const double incoming = qr.row[k];
+    const double diagonal = upper[k, k];
+    const double incoming = row[k];
     const double magnitude = std::hypot(diagonal, incoming);
 
     if (!std::isfinite(magnitude)) {
@@ -194,16 +443,93 @@ template <Index M, Index N>
     const double s = incoming / magnitude;
 
     for (Index j = k; j < n; ++j) {
-      const double upper = qr.qr_ut[k, j];
-      const double row_value = qr.row[j];
+      const double upper_value = upper[k, j];
+      const double row_value = row[j];
 
-      qr.qr_ut[k, j] = c * upper + s * row_value;
-      qr.row[j] = -s * upper + c * row_value;
+      upper[k, j] = c * upper_value + s * row_value;
+      row[j] = -s * upper_value + c * row_value;
     }
 
-    const double upper_rhs = qr.rhs[k];
-    qr.rhs[k] = c * upper_rhs + s * incoming_rhs;
+    const double upper_rhs = rhs[k];
+    rhs[k] = c * upper_rhs + s * incoming_rhs;
     incoming_rhs = -s * upper_rhs + c * incoming_rhs;
+  }
+  return true;
+}
+
+template <class ScalingPolicy, Index M, Index N>
+[[nodiscard]] bool
+solve_pivoted_householder_qr(ScalingPolicy, LMWorkspace<M, N> &work,
+                             PivotedHouseholderQrWorkspace<M, N> &qr,
+                             double lambda) {
+  if (!qr.factor_valid || !std::isfinite(lambda) || lambda <= 0.0) {
+    return false;
+  }
+
+  const Index n = work.n;
+  const double sqrt_lambda = std::sqrt(lambda);
+  if (!std::isfinite(sqrt_lambda)) {
+    return false;
+  }
+
+  for (Index j = 0; j < n; ++j) {
+    qr.rhs[j] = qr.transformed_rhs[j];
+
+    for (Index i = 0; i <= j; ++i) {
+      qr.r_work[i, j] = qr.r_base[i, j];
+    }
+  }
+
+  for (Index k = 0; k < n; ++k) {
+    qr.row.fill(0.0);
+
+    if constexpr (kUsesJacobianColumnScaling<ScalingPolicy>) {
+      const Index original_column = qr.permutation[k];
+      qr.row[k] = sqrt_lambda * std::sqrt(qr.damping_diagonal[k]) /
+                  work.scale[original_column];
+    } else {
+      qr.row[k] = sqrt_lambda;
+    }
+
+    if (!std::isfinite(qr.row[k])) {
+      return false;
+    }
+
+    double incoming_rhs = 0.0;
+    if (!append_row_with_givens(qr.r_work, qr.rhs, qr.row, n, incoming_rhs)) {
+      return false;
+    }
+  }
+
+  for (Index i = n; i-- > 0;) {
+    const double diagonal = qr.r_work[i, i];
+    if (!std::isfinite(diagonal) || diagonal == 0.0) {
+      return false;
+    }
+
+    double sum = qr.rhs[i];
+    for (Index j = i + 1; j < n; ++j) {
+      sum -= qr.r_work[i, j] * qr.rhs[j];
+    }
+
+    qr.rhs[i] = sum / diagonal;
+
+    if (!std::isfinite(qr.rhs[i])) {
+      return false;
+    }
+  }
+
+  for (Index k = 0; k < n; ++k) {
+    const Index original_column = qr.permutation[k];
+
+    if constexpr (kUsesJacobianColumnScaling<ScalingPolicy>) {
+      work.step[original_column] = qr.rhs[k] / work.scale[original_column];
+    } else {
+      work.step[original_column] = qr.rhs[k];
+    }
+    if (!std::isfinite(work.step[original_column])) {
+      return false;
+    }
   }
   return true;
 }
@@ -233,7 +559,7 @@ template <class ScalingPolicy, Index M, Index N>
     }
 
     double incoming_rhs = -work.r[i];
-    if (!append_row_with_givens(qr, n, incoming_rhs)) {
+    if (!append_row_with_givens(qr.qr_ut, qr.rhs, qr.row, n, incoming_rhs)) {
       return false;
     }
   }
@@ -251,7 +577,7 @@ template <class ScalingPolicy, Index M, Index N>
     }
 
     double incoming_rhs = 0.0;
-    if (!append_row_with_givens(qr, n, incoming_rhs)) {
+    if (!append_row_with_givens(qr.qr_ut, qr.rhs, qr.row, n, incoming_rhs)) {
       return false;
     }
   }
@@ -293,31 +619,47 @@ template <class ScalingPolicy, Index M, Index N>
 }
 
 template <Index M, Index N>
-[[nodiscard]] bool update_parameter_scaling(NoScaling,
-                                            LMWorkspace<M, N> &work) {
-  return true;
-}
-
-template <Index M, Index N>
 [[nodiscard]] bool update_parameter_scaling(JacobianColumnScaling,
                                             LMWorkspace<M, N> &work) {
   for (Index j = 0; j < work.n; ++j) {
     double column_norm = 0.0;
-    for (Index i = 0; i < work.m; ++i) {
-      column_norm = std::hypot(column_norm, work.J(i, j));
-      if (!std::isfinite(column_norm)) {
-        return false;
-      }
+    if (!matrix_column_tail_l2_norm(work.J, 0, j, column_norm)) {
+      return false;
     }
+
     if (work.scale[j] == 0.0) {
       work.scale[j] = column_norm == 0.0 ? 1.0 : column_norm;
-    } /* else {
-       work.scale[j] = std::max(work.scale[j], column_norm);
-     }
-     */
+    }
     work.damping_scale[j] = std::max(work.scale[j], column_norm);
   }
+
   return true;
+}
+
+template <Index M, Index N>
+[[nodiscard]] double
+initial_scaled_parameter_norm(NoScaling, const LMWorkspace<M, N> &work) {
+  double squared_norm = 0.0;
+
+  for (Index j = 0; j < work.n; ++j) {
+    const double value = work.x_current[j];
+    squared_norm = std::fma(value, value, squared_norm);
+  }
+  return std::sqrt(squared_norm);
+}
+
+template <Index M, Index N>
+[[nodiscard]] double
+initial_scaled_parameter_norm(JacobianColumnScaling,
+                              const LMWorkspace<M, N> &work) {
+  double squared_norm = 0.0;
+
+  for (Index j = 0; j < work.n; ++j) {
+    const double scaled = work.scale[j] * work.x_current[j];
+    squared_norm = std::fma(scaled, scaled, squared_norm);
+  }
+
+  return std::sqrt(squared_norm);
 }
 
 template <class ScalingPolicy, Index M, Index N>
@@ -325,6 +667,13 @@ template <class ScalingPolicy, Index M, Index N>
 solve_linear_step(DampedQr, ScalingPolicy, LMWorkspace<M, N> &work,
                   DampedQrWorkspace<M, N> &linear, double lambda) {
   return solve_damped_qr(ScalingPolicy{}, work, linear, lambda);
+}
+
+template <class ScalingPolicy, Index M, Index N>
+[[nodiscard]] bool
+solve_linear_step(PivotedHouseholderQr, ScalingPolicy, LMWorkspace<M, N> &work,
+                  PivotedHouseholderQrWorkspace<M, N> &linear, double lambda) {
+  return solve_pivoted_householder_qr(ScalingPolicy{}, work, linear, lambda);
 }
 
 template <class Policy, Index M, Index N, ResidualCallable<M, N> Residual,
@@ -412,13 +761,8 @@ try_lm_step(SolverContext<Policy, M, N, Residual, Jacobian> &context) {
     double lambda_low = lm_opts.min_lambda;
     double lambda_high = std::max(context.selected_lambda, lambda_low);
 
-    if (lambda_high == lambda_low) {
-      if (lambda_high == lm_opts.max_lambda) {
-        context.result.termination = TerminationReason::DampingLimit;
-        record_trace(TrialDecision::DampingLimit);
-        return false;
-      }
-      lambda_high = std::min(2.0 * lambda_high, lm_opts.max_lambda);
+    if (lambda_high <= lambda_low) {
+      lambda_high = std::min(2.0 * lambda_low, lm_opts.max_lambda);
     }
 
     if (!solve_at_lambda(lambda_high)) {
@@ -535,6 +879,33 @@ try_lm_step(SolverContext<Policy, M, N, Residual, Jacobian> &context) {
       trace.effective_damping_diagonal.push_back(context.result.lambda *
                                                  damping_diagonal);
     }
+
+    trace.max_abs_column_correlation = 0.0;
+
+    for (Index j = 0; j < work.n; ++j) {
+      for (Index k = j + 1; k < work.n; ++k) {
+        const double norm_j = trace.jacobian_column_norms[j];
+        const double norm_k = trace.jacobian_column_norms[k];
+
+        if (norm_j == 0.0 || norm_k == 0.0) {
+          continue;
+        }
+
+        double dot = 0.0;
+
+        for (Index i = 0; i < work.m; ++i) {
+          dot += work.J[i, j] * work.J[i, k];
+        }
+
+        const double abs_corr = std::abs(dot / (norm_j * norm_k));
+
+        if (abs_corr > trace.max_abs_column_correlation) {
+          trace.max_abs_column_correlation = abs_corr;
+          trace.max_correlation_col_i = j;
+          trace.max_correlation_col_j = k;
+        }
+      }
+    }
   }
   if (!std::isfinite(raw_step_norm) || !std::isfinite(scaled_step_norm)) {
     context.result.termination = TerminationReason::NumericalFailure;
@@ -576,47 +947,30 @@ try_lm_step(SolverContext<Policy, M, N, Residual, Jacobian> &context) {
     return false;
   }
 
-  double model_squared_norm = 0.0;
+  std::ranges::copy(work.r.view().begin(), work.r.view().end(),
+                    work.r_trial_minus.view().begin());
 
-  for (Index i = 0; i < work.m; ++i) {
-    double model_residual = work.r[i];
+  double *model_residual = work.r_trial_minus.data();
+  for (Index j = 0; j < work.n; ++j) {
+    const double step = work.step[j];
 
-    for (Index j = 0; j < work.n; ++j) {
-      model_residual += work.J[i, j] * work.step[j];
+    for (Index i = 0; i < work.m; ++i) {
+      model_residual[i] = std::fma(work.J[i, j], step, model_residual[i]);
     }
-
-    model_squared_norm += model_residual * model_residual;
   }
+
+  const double model_squared_norm = std::transform_reduce(
+      model_residual, model_residual + work.m, 0.0, std::plus<>{},
+      [](double value) { return value * value; });
 
   const double model_cost = 0.5 * model_squared_norm;
-  /*
-  double predicted_reduction = 0.0;
-  for (Index j = 0; j < work.n; ++j) {
-    double scaled_step = work.step[j];
-    if constexpr (kUsesJacobianColumnScaling<Scaling>) {
-      scaled_step *= work.scale[j];
-    }
 
-    const double contribution =
-        std::fma(context.result.lambda * scaled_step, scaled_step,
-                 -work.step[j] * work.g[j]);
-    if (!std::isfinite(contribution)) {
-      context.result.termination = TerminationReason::NumericalFailure;
-      context.result.message = "Non-finite predicted reduction";
-      return false;
-    }
-    predicted_reduction += 0.5 * contribution;
-  }
-  if (!std::isfinite(predicted_reduction)) {
-    context.result.termination = TerminationReason::NumericalFailure;
-    context.result.message = "Non-finite predicted reduction";
-    return false;
-  }
-  */
   const double actual_reduction = context.result.final_cost - trial_cost;
   const double predicted_reduction = context.result.final_cost - model_cost;
+
   trace.actual_reduction = actual_reduction;
   trace.predicted_reduction = predicted_reduction;
+
   if (!std::isfinite(model_cost)) {
     context.result.termination = TerminationReason::NumericalFailure;
     context.result.message = "Non-finite values in model cost analysis";
@@ -654,15 +1008,20 @@ try_lm_step(SolverContext<Policy, M, N, Residual, Jacobian> &context) {
     return false;
   }
 
-  if (rho <= 1e-3) {
-    reject_and_shrink_radius(scaled_step_norm);
-    record_trace(TrialDecision::LowRho);
-    return false;
+  if (rho <= 0.25) {
+    context.trust_radius =
+        std::max(lm_opts.min_trust_region_radius, 0.25 * context.trust_radius);
   } else {
     if (rho > 0.75 && scaled_step_norm >= 0.9 * context.trust_radius) {
       context.trust_radius =
           std::min(lm_opts.max_trust_region_radius, 2.0 * context.trust_radius);
     }
+  }
+
+  if (rho <= 0.1) {
+    reject_and_shrink_radius(scaled_step_norm);
+    record_trace(TrialDecision::LowRho);
+    return false;
   }
 
   record_trace(TrialDecision::Accepted);
@@ -712,6 +1071,18 @@ solve(detail::SolverContext<Policy, M, N, Residual, Jacobian> &context) {
     return detail::finish_solver(context);
   }
 
+  const double scaled_x_norm = detail::initial_scaled_parameter_norm(
+      typename Policy::ScalingPolicy{}, context.workspace.work);
+  const double factor =
+      context.evaluation_context.options.lm.initial_trust_region_factor;
+
+  context.trust_radius = factor * (scaled_x_norm > 0.0 ? scaled_x_norm : 1.0);
+
+  context.trust_radius =
+      std::clamp(context.trust_radius,
+                 context.evaluation_context.options.lm.min_trust_region_radius,
+                 context.evaluation_context.options.lm.max_trust_region_radius);
+
   context.result.initial_cost = context.result.final_cost;
 
   if (context.result.gradient_inf_norm <=
@@ -725,6 +1096,26 @@ solve(detail::SolverContext<Policy, M, N, Residual, Jacobian> &context) {
        iteration++) {
     ++context.result.iterations;
     const double previous_cost = context.result.final_cost;
+
+    if constexpr (std::same_as<typename Policy::LinearAlgebraPolicy,
+                               PivotedHouseholderQr>) {
+      detail::PivotedHouseholderQrWorkspace<M, N> &linear =
+          context.workspace.linear;
+
+      if (!linear.factor_valid) {
+        if (!detail::prepare_pivoted_householder_qr(
+                typename Policy::ScalingPolicy{}, context.workspace.work,
+                linear,
+                context.evaluation_context.options.lm
+                    .rank_tolerance_multiplier)) {
+          context.result.termination = TerminationReason::NumericalFailure;
+          context.result.message =
+              "Pivoted Householder QR factorization failed";
+          return detail::finish_solver(context);
+        }
+        ++context.result.factorization_count;
+      }
+    }
 
     auto accepted = detail::try_lm_step(context);
 
@@ -756,6 +1147,11 @@ solve(detail::SolverContext<Policy, M, N, Residual, Jacobian> &context) {
       context.result.termination = TerminationReason::NumericalFailure;
       context.result.message = "Non-finite Jacobian column scale";
       return detail::finish_solver(context);
+    }
+
+    if constexpr (std::same_as<typename Policy::LinearAlgebraPolicy,
+                               PivotedHouseholderQr>) {
+      context.workspace.linear.invalidate();
     }
 
     if (auto update = detail::update_cost_and_gradient(context); !update) {

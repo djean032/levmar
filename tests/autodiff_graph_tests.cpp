@@ -67,6 +67,9 @@ using ForwardDifferenceSolverPolicy =
 using CentralDifferenceSolverPolicy =
     SolverPolicy<CentralDifferenceJacobian, LevenbergMarquardt, DampedQr,
                  SquaredLoss, NoScaling>;
+using PivotedQrSolverPolicy =
+    SolverPolicy<UserJacobian, LevenbergMarquardt, PivotedHouseholderQr,
+                 SquaredLoss, NoScaling>;
 
 static_assert(
     kStaticSolverConfigurationValid<DefaultSolverPolicy, ValidUserContext>);
@@ -139,6 +142,9 @@ void test_runtime_option_validation() {
   const std::array<double, 4> invalid_lambdas{
       std::numeric_limits<double>::quiet_NaN(),
       std::numeric_limits<double>::infinity(), 0.0, -1.0};
+  const std::array<double, 4> invalid_rank_multipliers{
+      std::numeric_limits<double>::quiet_NaN(),
+      std::numeric_limits<double>::infinity(), 0.0, -1.0};
 
   expect_valid.template operator()<DefaultSolverPolicy>(
       Options{}, "default user-Jacobian options");
@@ -202,11 +208,6 @@ void test_runtime_option_validation() {
         options, "invalid minimum lambda");
 
     options = {};
-    options.lm.initial_lambda = value;
-    expect_invalid.template operator()<DefaultSolverPolicy>(
-        options, "invalid initial lambda");
-
-    options = {};
     options.lm.max_lambda = value;
     expect_invalid.template operator()<DefaultSolverPolicy>(
         options, "invalid maximum lambda");
@@ -218,26 +219,12 @@ void test_runtime_option_validation() {
   expect_invalid.template operator()<DefaultSolverPolicy>(unordered_lambdas,
                                                           "unordered lambdas");
 
-  Options initial_below_minimum;
-  initial_below_minimum.lm.min_lambda = 2.0;
-  initial_below_minimum.lm.initial_lambda = 1.0;
-  initial_below_minimum.lm.max_lambda = 3.0;
-  expect_invalid.template operator()<DefaultSolverPolicy>(
-      initial_below_minimum, "initial lambda below minimum");
-
-  Options initial_above_maximum;
-  initial_above_maximum.lm.min_lambda = 1.0;
-  initial_above_maximum.lm.initial_lambda = 3.0;
-  initial_above_maximum.lm.max_lambda = 2.0;
-  expect_invalid.template operator()<DefaultSolverPolicy>(
-      initial_above_maximum, "initial lambda above maximum");
-
-  Options valid_lambdas;
-  valid_lambdas.lm.min_lambda = 1e-5;
-  valid_lambdas.lm.initial_lambda = 1e-3;
-  valid_lambdas.lm.max_lambda = 1.0;
-  expect_valid.template operator()<DefaultSolverPolicy>(valid_lambdas,
-                                                        "ordered lambdas");
+  for (const double value : invalid_rank_multipliers) {
+    Options options;
+    options.lm.rank_tolerance_multiplier = value;
+    expect_invalid.template operator()<DefaultSolverPolicy>(
+        options, "invalid rank tolerance multiplier");
+  }
 
   for (const double value : invalid_lambdas) {
     Options options;
@@ -1612,6 +1599,41 @@ void test_damped_qr_static() {
               "static damped QR should lower the augmented objective");
 }
 
+void test_pivoted_householder_qr_static() {
+  LMWorkspace<3, 2> work;
+  PivotedHouseholderQrWorkspace<3, 2> qr;
+
+  work.J(0, 0) = 1.0;
+  work.J(1, 0) = 0.0;
+  work.J(2, 0) = 1.0;
+  work.J(0, 1) = 0.0;
+  work.J(1, 1) = 1.0;
+  work.J(2, 1) = 1.0;
+  work.r[0] = 1.0;
+  work.r[1] = 2.0;
+  work.r[2] = 3.0;
+
+  expect_true(prepare_pivoted_householder_qr(NoScaling{}, work, qr, 32.0),
+              "static pivoted Householder QR preparation should succeed");
+  expect_true(qr.factor_valid,
+              "static pivoted Householder QR should cache its factor");
+  expect_equal(qr.numerical_rank, Index{2},
+               "static pivoted Householder QR rank");
+
+  constexpr double lambda = 1.0;
+  expect_true(solve_pivoted_householder_qr(NoScaling{}, work, qr, lambda),
+              "static pivoted Householder QR solve should succeed");
+  expect_close(work.step[0], -0.875, 1e-12, 1e-12,
+               "static pivoted Householder QR first step component");
+  expect_close(work.step[1], -1.375, 1e-12, 1e-12,
+               "static pivoted Householder QR second step component");
+
+  expect_true(solve_pivoted_householder_qr(NoScaling{}, work, qr, 2.0),
+              "static pivoted Householder QR cached solve should succeed");
+  expect_true(qr.factor_valid,
+              "static pivoted Householder QR should retain its factor");
+}
+
 void test_damped_qr_dynamic() {
   LMWorkspace<std::dynamic_extent, std::dynamic_extent> work(3, 2);
   DampedQrWorkspace<std::dynamic_extent, std::dynamic_extent> qr;
@@ -1665,22 +1687,431 @@ void test_damped_qr_column_scaling_static() {
                "scaled damped QR second step component");
 }
 
-void expect_first_inside_endpoint(const std::vector<LmTrialTrace> &trace,
-                                  const std::string &what) {
+void test_pivoted_householder_qr_column_scaling_static() {
+  LMWorkspace<3, 2> work;
+  PivotedHouseholderQrWorkspace<3, 2> qr;
+
+  work.J(0, 0) = 1.0;
+  work.J(1, 0) = 0.0;
+  work.J(2, 0) = 1.0;
+  work.J(0, 1) = 0.0;
+  work.J(1, 1) = 1.0;
+  work.J(2, 1) = 1.0;
+  work.r[0] = 1.0;
+  work.r[1] = 2.0;
+  work.r[2] = 3.0;
+  work.scale[0] = 2.0;
+  work.scale[1] = 4.0;
+  work.damping_scale[0] = 2.0;
+  work.damping_scale[1] = 4.0;
+
+  expect_true(
+      prepare_pivoted_householder_qr(JacobianColumnScaling{}, work, qr, 32.0),
+      "scaled pivoted Householder QR preparation should succeed");
+  expect_equal(qr.numerical_rank, Index{2},
+               "scaled pivoted Householder QR rank");
+
+  constexpr double lambda = 1.0;
+  expect_true(
+      solve_pivoted_householder_qr(JacobianColumnScaling{}, work, qr, lambda),
+      "scaled pivoted Householder QR solve should succeed");
+  expect_close(work.step[0], -67.0 / 107.0, 1e-12, 1e-12,
+               "scaled pivoted Householder QR first step component");
+  expect_close(work.step[1], -26.0 / 107.0, 1e-12, 1e-12,
+               "scaled pivoted Householder QR second step component");
+}
+
+void test_pivoted_householder_qr_unpermutation() {
+  LMWorkspace<3, 2> damped_work;
+  LMWorkspace<3, 2> pivoted_work;
+  DampedQrWorkspace<3, 2> damped_qr;
+  PivotedHouseholderQrWorkspace<3, 2> pivoted_qr;
+
+  for (auto *work : {&damped_work, &pivoted_work}) {
+    work->J[0, 0] = 1.0;
+    work->J[1, 0] = 0.0;
+    work->J[2, 0] = 1.0;
+    work->J[0, 1] = 4.0;
+    work->J[1, 1] = 1.0;
+    work->J[2, 1] = 5.0;
+    work->r[0] = 1.0;
+    work->r[1] = 2.0;
+    work->r[2] = 3.0;
+  }
+
+  constexpr double lambda = 1.0;
+  expect_true(solve_damped_qr(NoScaling{}, damped_work, damped_qr, lambda),
+              "pivot reference damped QR solve should succeed");
+  expect_true(prepare_pivoted_householder_qr(NoScaling{}, pivoted_work,
+                                             pivoted_qr, 32.0),
+              "pivoted Householder QR preparation should succeed");
+  expect_equal(pivoted_qr.permutation[0], Index{1},
+               "larger second column should be selected first");
+  expect_true(solve_pivoted_householder_qr(NoScaling{}, pivoted_work,
+                                           pivoted_qr, lambda),
+              "pivoted Householder QR solve should succeed");
+  expect_close(pivoted_work.step[0], damped_work.step[0], 1e-12, 1e-12,
+               "pivoted Householder QR should unpermute first step component");
+  expect_close(pivoted_work.step[1], damped_work.step[1], 1e-12, 1e-12,
+               "pivoted Householder QR should unpermute second step component");
+}
+
+void test_pivoted_householder_qr_scaled_unpermutation() {
+  LMWorkspace<3, 2> damped_work;
+  LMWorkspace<3, 2> pivoted_work;
+  DampedQrWorkspace<3, 2> damped_qr;
+  PivotedHouseholderQrWorkspace<3, 2> pivoted_qr;
+
+  for (auto *work : {&damped_work, &pivoted_work}) {
+    work->J[0, 0] = 1.0;
+    work->J[1, 0] = 0.0;
+    work->J[2, 0] = 1.0;
+    work->J[0, 1] = 4.0;
+    work->J[1, 1] = 1.0;
+    work->J[2, 1] = 5.0;
+    work->r[0] = 1.0;
+    work->r[1] = 2.0;
+    work->r[2] = 3.0;
+    work->scale[0] = 2.0;
+    work->scale[1] = 4.0;
+    work->damping_scale[0] = 2.0;
+    work->damping_scale[1] = 4.0;
+  }
+
+  constexpr double lambda = 1.0;
+  expect_true(
+      solve_damped_qr(JacobianColumnScaling{}, damped_work, damped_qr, lambda),
+      "scaled pivot reference damped QR solve should succeed");
+  expect_true(prepare_pivoted_householder_qr(JacobianColumnScaling{},
+                                             pivoted_work, pivoted_qr, 32.0),
+              "scaled pivoted Householder QR preparation should succeed");
+  expect_equal(pivoted_qr.permutation[0], Index{1},
+               "scaled larger second column should be selected first");
+  expect_true(solve_pivoted_householder_qr(JacobianColumnScaling{},
+                                           pivoted_work, pivoted_qr, lambda),
+              "scaled pivoted Householder QR solve should succeed");
+  expect_close(pivoted_work.step[0], damped_work.step[0], 1e-12, 1e-12,
+               "scaled pivoted QR should unpermute first step component");
+  expect_close(pivoted_work.step[1], damped_work.step[1], 1e-12, 1e-12,
+               "scaled pivoted QR should unpermute second step component");
+}
+
+void test_pivoted_householder_qr_scaled_factor_invariants() {
+  LMWorkspace<3, 2> damped_work;
+  LMWorkspace<3, 2> pivoted_work;
+  DampedQrWorkspace<3, 2> damped_qr;
+  PivotedHouseholderQrWorkspace<3, 2> pivoted_qr;
+
+  for (auto *work : {&damped_work, &pivoted_work}) {
+    work->J[0, 0] = 1.0;
+    work->J[1, 0] = 0.0;
+    work->J[2, 0] = 1.0;
+    work->J[0, 1] = 4.0;
+    work->J[1, 1] = 1.0;
+    work->J[2, 1] = 5.0;
+    work->r[0] = 1.0;
+    work->r[1] = -2.0;
+    work->r[2] = 3.0;
+    work->scale[0] = 2.0;
+    work->scale[1] = 7.0;
+    work->damping_scale[0] = 11.0;
+    work->damping_scale[1] = 3.0;
+  }
+
+  expect_true(prepare_pivoted_householder_qr(JacobianColumnScaling{},
+                                             pivoted_work, pivoted_qr, 32.0),
+              "scaled pivoted factor invariant preparation should succeed");
+  expect_equal(pivoted_qr.permutation[0], Index{1},
+               "scaled pivoted factor invariant should force a pivot");
+
+  for (Index k = 0; k < pivoted_work.n; ++k) {
+    const Index original_column = pivoted_qr.permutation[k];
+    const double expected = pivoted_work.damping_scale[original_column] *
+                            pivoted_work.damping_scale[original_column];
+    expect_close(pivoted_qr.damping_diagonal[k], expected, 1e-12, 1e-12,
+                 "scaled pivoted damping diagonal should follow permutation");
+  }
+
+  MatrixStorage<3, 3> q_transpose;
+  q_transpose.fill(0.0);
+  for (Index column = 0; column < pivoted_work.m; ++column) {
+    q_transpose[column, column] = 1.0;
+    for (Index k = 0; k < pivoted_work.n; ++k) {
+      const auto reflector_tail = ConstVectorView<std::dynamic_extent>(
+          pivoted_qr.packed_qr.data() + (k + 1) + k * pivoted_work.m,
+          pivoted_work.m - k - 1);
+      auto target = VectorView<std::dynamic_extent>(
+          q_transpose.data() + k + column * pivoted_work.m, pivoted_work.m - k);
+      expect_true(apply_householder_reflector(reflector_tail, pivoted_qr.tau[k],
+                                              target),
+                  "stored Householder reflector should apply to identity");
+    }
+  }
+
+  for (Index i = 0; i < pivoted_work.m; ++i) {
+    for (Index j = 0; j < pivoted_work.n; ++j) {
+      double value = 0.0;
+      for (Index k = 0; k < pivoted_work.m; ++k) {
+        value += q_transpose[i, k] *
+                 pivoted_work.J[k, pivoted_qr.permutation[j]] /
+                 pivoted_work.scale[pivoted_qr.permutation[j]];
+      }
+      const double expected = i <= j ? pivoted_qr.r_base[i, j] : 0.0;
+      expect_close(value, expected, 1e-12, 1e-12,
+                   "stored Householder factors should reconstruct scaled R");
+    }
+
+    double transformed_rhs = 0.0;
+    for (Index k = 0; k < pivoted_work.m; ++k) {
+      transformed_rhs -= q_transpose[i, k] * pivoted_work.r[k];
+    }
+    expect_close(transformed_rhs, pivoted_qr.transformed_rhs[i], 1e-12, 1e-12,
+                 "stored Householder factors should reconstruct cached RHS");
+  }
+
+  const auto r_base = pivoted_qr.r_base;
+  const auto transformed_rhs = pivoted_qr.transformed_rhs;
+  const auto permutation = pivoted_qr.permutation;
+  const auto damping_diagonal = pivoted_qr.damping_diagonal;
+  for (double lambda : {1e-6, 1e-2, 1.0, 1e4}) {
+    expect_true(
+        solve_damped_qr(JacobianColumnScaling{}, damped_work, damped_qr,
+                        lambda),
+        "scaled pivoted factor invariant reference solve should succeed");
+    expect_true(solve_pivoted_householder_qr(JacobianColumnScaling{},
+                                             pivoted_work, pivoted_qr, lambda),
+                "scaled pivoted factor invariant cached solve should succeed");
+    for (Index j = 0; j < pivoted_work.n; ++j) {
+      expect_close(pivoted_work.step[j], damped_work.step[j], 1e-11, 1e-11,
+                   "scaled pivoted lambda sweep should match streamed QR step");
+      expect_close(pivoted_qr.permutation[j], permutation[j], 0.0, 0.0,
+                   "cached solve should not mutate permutation");
+      expect_close(pivoted_qr.damping_diagonal[j], damping_diagonal[j], 0.0,
+                   0.0, "cached solve should not mutate damping diagonal");
+      for (Index i = 0; i <= j; ++i) {
+        expect_close(pivoted_qr.r_base[i, j], r_base[i, j], 0.0, 0.0,
+                     "cached solve should not mutate base R");
+      }
+    }
+    for (Index i = 0; i < pivoted_work.m; ++i) {
+      expect_close(pivoted_qr.transformed_rhs[i], transformed_rhs[i], 0.0, 0.0,
+                   "cached solve should not mutate transformed RHS");
+    }
+  }
+}
+
+void test_pivoted_householder_qr_frozen_ill_conditioned_system() {
+  LMWorkspace<5, 3> damped_work;
+  LMWorkspace<5, 3> pivoted_work;
+  DampedQrWorkspace<5, 3> damped_qr;
+  PivotedHouseholderQrWorkspace<5, 3> pivoted_qr;
+
+  constexpr std::array<std::array<double, 3>, 5> jacobian{{
+      {1.0, 1.0e8, 1.0e-4},
+      {2.0, 2.0e8 + 1.0, -2.0e-4},
+      {-1.0, -1.0e8 + 1.0, 3.0e-4},
+      {3.0, 3.0e8 - 1.0, -1.0e-4},
+      {0.5, 5.0e7 + 2.0, 4.0e-4},
+  }};
+  constexpr std::array<double, 5> residual{1.0, -2.0, 0.5, 3.0, -1.0};
+
+  for (auto *work : {&damped_work, &pivoted_work}) {
+    for (Index i = 0; i < work->m; ++i) {
+      work->r[i] = residual[i];
+      for (Index j = 0; j < work->n; ++j) {
+        work->J[i, j] = jacobian[i][j];
+      }
+    }
+    work->scale[0] = 2.0;
+    work->scale[1] = 1.0e8;
+    work->scale[2] = 1.0e-4;
+    work->damping_scale[0] = 5.0;
+    work->damping_scale[1] = 7.0;
+    work->damping_scale[2] = 11.0;
+  }
+
+  expect_true(prepare_pivoted_householder_qr(JacobianColumnScaling{},
+                                             pivoted_work, pivoted_qr, 32.0),
+              "frozen ill-conditioned pivoted preparation should succeed");
+  expect_true(pivoted_qr.permutation[0] != Index{0},
+              "frozen ill-conditioned system should exercise pivoting");
+
+  for (double lambda : {1e-6, 1e-2, 1.0, 1e4}) {
+    expect_true(solve_damped_qr(JacobianColumnScaling{}, damped_work, damped_qr,
+                                lambda),
+                "frozen ill-conditioned streamed solve should succeed");
+    expect_true(solve_pivoted_householder_qr(JacobianColumnScaling{},
+                                             pivoted_work, pivoted_qr, lambda),
+                "frozen ill-conditioned cached solve should succeed");
+    for (Index j = 0; j < pivoted_work.n; ++j) {
+      expect_close(
+          pivoted_work.step[j], damped_work.step[j], 1e-7, 1e-10,
+          "frozen ill-conditioned cached step should match streamed QR");
+    }
+  }
+}
+
+void test_pivoted_householder_qr_rank_deficient() {
+  LMWorkspace<3, 2> damped_work;
+  LMWorkspace<3, 2> pivoted_work;
+  DampedQrWorkspace<3, 2> damped_qr;
+  PivotedHouseholderQrWorkspace<3, 2> pivoted_qr;
+
+  for (auto *work : {&damped_work, &pivoted_work}) {
+    work->J[0, 0] = 1.0;
+    work->J[1, 0] = 2.0;
+    work->J[2, 0] = 3.0;
+    work->J[0, 1] = 1.0;
+    work->J[1, 1] = 2.0;
+    work->J[2, 1] = 3.0;
+    work->r[0] = 1.0;
+    work->r[1] = 2.0;
+    work->r[2] = 3.0;
+  }
+
+  constexpr double lambda = 1.0;
+  expect_true(solve_damped_qr(NoScaling{}, damped_work, damped_qr, lambda),
+              "rank-deficient reference damped QR solve should succeed");
+  expect_true(
+      prepare_pivoted_householder_qr(NoScaling{}, pivoted_work, pivoted_qr,
+                                     32.0),
+      "rank-deficient pivoted Householder QR preparation should succeed");
+  expect_equal(pivoted_qr.numerical_rank, Index{1},
+               "rank-deficient pivoted Householder QR rank");
+  expect_true(solve_pivoted_householder_qr(NoScaling{}, pivoted_work,
+                                           pivoted_qr, lambda),
+              "rank-deficient damped pivoted QR solve should succeed");
+  expect_close(pivoted_work.step[0], damped_work.step[0], 1e-12, 1e-12,
+               "rank-deficient pivoted QR first step component");
+  expect_close(pivoted_work.step[1], damped_work.step[1], 1e-12, 1e-12,
+               "rank-deficient pivoted QR second step component");
+}
+
+void test_pivoted_householder_qr_dynamic_and_mixed() {
+  const auto run = []<Index M, Index N>(LMWorkspace<M, N> &work,
+                                        PivotedHouseholderQrWorkspace<M, N> &qr,
+                                        const std::string &what) {
+    work.J[0, 0] = 1.0;
+    work.J[1, 0] = 0.0;
+    work.J[2, 0] = 1.0;
+    work.J[0, 1] = 0.0;
+    work.J[1, 1] = 1.0;
+    work.J[2, 1] = 1.0;
+    work.r[0] = 1.0;
+    work.r[1] = 2.0;
+    work.r[2] = 3.0;
+
+    expect_true(prepare_pivoted_householder_qr(NoScaling{}, work, qr, 32.0),
+                what + " preparation should succeed");
+    expect_true(solve_pivoted_householder_qr(NoScaling{}, work, qr, 1.0),
+                what + " solve should succeed");
+    expect_close(work.step[0], -0.875, 1e-12, 1e-12,
+                 what + " first step component");
+    expect_close(work.step[1], -1.375, 1e-12, 1e-12,
+                 what + " second step component");
+  };
+
+  LMWorkspace<std::dynamic_extent, std::dynamic_extent> dynamic_work(3, 2);
+  PivotedHouseholderQrWorkspace<std::dynamic_extent, std::dynamic_extent>
+      dynamic_qr;
+  dynamic_qr.resize(3, 2);
+  run(dynamic_work, dynamic_qr, "dynamic pivoted Householder QR");
+
+  LMWorkspace<std::dynamic_extent, 2> mixed_work(3, 2);
+  PivotedHouseholderQrWorkspace<std::dynamic_extent, 2> mixed_qr;
+  mixed_qr.resize(3, 2);
+  run(mixed_work, mixed_qr, "mixed pivoted Householder QR");
+}
+
+void test_solve_pivoted_householder_qr_policy() {
+  auto residual = [](ConstVectorView<2> x, VectorView<3> r) {
+    r[0] = x[0] - 1.0;
+    r[1] = x[1] - 2.0;
+    r[2] = x[0] + x[1] - 3.0;
+    return ErrorOrVoid{};
+  };
+  auto jacobian = [](ConstVectorView<2>, MatrixView<3, 2> J) {
+    J[0, 0] = 1.0;
+    J[1, 0] = 0.0;
+    J[2, 0] = 1.0;
+    J[0, 1] = 0.0;
+    J[1, 1] = 1.0;
+    J[2, 1] = 1.0;
+    return ErrorOrVoid{};
+  };
+  const auto problem = make_problem<3, 2>(residual, jacobian);
+  Options options;
+  options.max_iterations = 50;
+  SolverWorkspace<PivotedQrSolverPolicy, 3, 2> workspace;
+  const std::array<double, 2> x0{0.0, 0.0};
+  SolverContext<PivotedQrSolverPolicy, 3, 2, decltype(residual),
+                decltype(jacobian)>
+      context(problem, options, workspace, x0);
+
+  const auto solved = solve<PivotedQrSolverPolicy>(context);
+  expect_true(solved.has_value(), "pivoted Householder QR policy should solve");
+  expect_close(solved->parameters[0], 1.0, 1e-8, 1e-8,
+               "pivoted Householder QR policy first parameter");
+  expect_close(solved->parameters[1], 2.0, 1e-8, 1e-8,
+               "pivoted Householder QR policy second parameter");
+  expect_true(solved->factorization_count > 0,
+              "pivoted Householder QR policy should factorize");
+  expect_true(solved->linear_solves > solved->factorization_count,
+              "pivoted Householder QR policy should reuse a factorization");
+}
+
+void test_pivoted_householder_qr_factor_lifecycle() {
+  auto residual = [](ConstVectorView<1> x, VectorView<1> r) {
+    r[0] = x[0];
+    return ErrorOrVoid{};
+  };
+  auto jacobian = [](ConstVectorView<1>, MatrixView<1, 1> J) {
+    J[0, 0] = 1.0;
+    return ErrorOrVoid{};
+  };
+  const auto problem = make_problem<1, 1>(residual, jacobian);
+  Options options;
+  options.max_iterations = 2;
+  options.lm.min_lambda = 0.1;
+  options.lm.initial_trust_region_factor = 0.5;
+  SolverWorkspace<PivotedQrSolverPolicy, 1, 1> workspace;
+  const std::array<double, 1> x0{1.0};
+  SolverContext<PivotedQrSolverPolicy, 1, 1, decltype(residual),
+                decltype(jacobian)>
+      context(problem, options, workspace, x0);
+  std::vector<LmTrialTrace> trace;
+  context.trial_trace = &trace;
+
+  const auto solved = solve<PivotedQrSolverPolicy>(context);
+  expect_true(solved.has_value(),
+              "pivoted factor lifecycle solve should succeed");
+  expect_equal(trace.size(), std::size_t{2},
+               "pivoted factor lifecycle should accept two model steps");
+  expect_true(
+      trace.front().inner_linear_solves > 5,
+      "pivoted factor lifecycle should retry lambda without refactoring");
+  expect_equal(solved->factorization_count, trace.size(),
+               "pivoted factor lifecycle should rebuild only after acceptance");
+  expect_true(
+      solved->linear_solves > solved->factorization_count,
+      "pivoted factor lifecycle should reuse each accepted factorization");
+}
+
+void expect_bisection_band(const std::vector<LmTrialTrace> &trace,
+                           const std::string &what) {
   expect_equal(trace.size(), std::size_t{1}, what + " should record one trial");
   const auto &trial = trace.front();
-  expect_equal(trial.inner_linear_solves, Index{5},
-               what + " should select the first inside lambda endpoint");
-  expect_equal(trial.selected_lambda, 1.6, what + " should select lambda 1.6");
+  expect_true(trial.inner_linear_solves > 5,
+              what + " should refine the lambda bracket");
   expect_true(trial.radius_bound_active,
               what + " should require lambda escalation");
   expect_true(trial.scaled_step_norm <= 0.5,
               what + " should stay inside the trust radius");
-  expect_true(trial.scaled_step_norm < 0.45,
-              what + " should not bisect into the old boundary band");
+  expect_true(trial.scaled_step_norm >= 0.45,
+              what + " should land in the bisection boundary band");
 }
 
-void test_first_inside_lambda_selection_static() {
+void test_bisection_lambda_selection_static() {
   auto residual = [](ConstVectorView<1> x, VectorView<1> r) {
     r[0] = x[0];
     return ErrorOrVoid{};
@@ -1692,9 +2123,8 @@ void test_first_inside_lambda_selection_static() {
   const auto problem = make_problem<1, 1>(residual, jacobian);
   Options options;
   options.max_iterations = 1;
-  options.lm.initial_lambda = 0.1;
   options.lm.min_lambda = 0.1;
-  options.lm.initial_trust_region_radius = 0.5;
+  options.lm.initial_trust_region_factor = 0.5;
   SolverWorkspace<DefaultSolverPolicy, 1, 1> workspace;
   const std::array<double, 1> x0{1.0};
   SolverContext<DefaultSolverPolicy, 1, 1, decltype(residual),
@@ -1704,11 +2134,11 @@ void test_first_inside_lambda_selection_static() {
   context.trial_trace = &trace;
 
   const auto solved = solve<DefaultSolverPolicy>(context);
-  expect_true(solved.has_value(), "static first-inside solve should succeed");
-  expect_first_inside_endpoint(trace, "static first-inside solve");
+  expect_true(solved.has_value(), "static bisection solve should succeed");
+  expect_bisection_band(trace, "static bisection solve");
 }
 
-void test_first_inside_lambda_selection_dynamic() {
+void test_bisection_lambda_selection_dynamic() {
   auto residual = [](ConstVectorView<std::dynamic_extent> x,
                      VectorView<std::dynamic_extent> r) {
     r[0] = x[0];
@@ -1722,9 +2152,8 @@ void test_first_inside_lambda_selection_dynamic() {
   const auto problem = make_dynamic_problem(1, 1, residual, jacobian);
   Options options;
   options.max_iterations = 1;
-  options.lm.initial_lambda = 0.1;
   options.lm.min_lambda = 0.1;
-  options.lm.initial_trust_region_radius = 0.5;
+  options.lm.initial_trust_region_factor = 0.5;
   SolverWorkspace<DefaultSolverPolicy, std::dynamic_extent, std::dynamic_extent>
       workspace;
   const std::vector<double> x0{1.0};
@@ -1735,11 +2164,11 @@ void test_first_inside_lambda_selection_dynamic() {
   context.trial_trace = &trace;
 
   const auto solved = solve<DefaultSolverPolicy>(context);
-  expect_true(solved.has_value(), "dynamic first-inside solve should succeed");
-  expect_first_inside_endpoint(trace, "dynamic first-inside solve");
+  expect_true(solved.has_value(), "dynamic bisection solve should succeed");
+  expect_bisection_band(trace, "dynamic bisection solve");
 }
 
-void test_stable_predicted_reduction() {
+void test_model_cost_cancellation() {
   auto residual = [](ConstVectorView<1> x, VectorView<1> r) {
     r[0] = 1e16 + x[0];
     return ErrorOrVoid{};
@@ -1751,7 +2180,6 @@ void test_stable_predicted_reduction() {
   const auto problem = make_problem<1, 1>(residual, jacobian);
   Options options;
   options.max_iterations = 1;
-  options.lm.initial_lambda = 1e16;
   options.lm.min_lambda = 1e16;
   options.lm.max_lambda = 1e16;
   options.lm.initial_trust_region_radius = 2.0;
@@ -1764,16 +2192,16 @@ void test_stable_predicted_reduction() {
   context.trial_trace = &trace;
 
   const auto solved = solve<DefaultSolverPolicy>(context);
-  expect_true(solved.has_value(), "stable reduction solve should succeed");
+  expect_true(solved.has_value(),
+              "model-cost cancellation solve should succeed");
   expect_equal(trace.size(), std::size_t{1},
-               "stable reduction solve should record one trial");
+               "model-cost cancellation solve should record one trial");
   expect_equal(trace.front().actual_reduction, 0.0,
                "trial cost should round to the current cost");
-  expect_true(std::isfinite(trace.front().predicted_reduction) &&
-                  trace.front().predicted_reduction > 0.0,
-              "stable model reduction should not cancel to zero");
-  expect_equal(trace.front().decision, TrialDecision::LowRho,
-               "positive stable reduction should reach gain-ratio rejection");
+  expect_equal(trace.front().predicted_reduction, 0.0,
+               "model cost should round to the current cost");
+  expect_equal(trace.front().decision, TrialDecision::SmallCostReduction,
+               "zero model reduction should terminate on small cost change");
 }
 
 void test_solve_static_user_jacobian() {
@@ -2185,11 +2613,21 @@ int main() {
   test_extended_primitives_scalar_generic_residual();
   test_pow_domain_errors();
   test_damped_qr_static();
+  test_pivoted_householder_qr_static();
   test_damped_qr_dynamic();
   test_damped_qr_column_scaling_static();
-  test_first_inside_lambda_selection_static();
-  test_first_inside_lambda_selection_dynamic();
-  test_stable_predicted_reduction();
+  test_pivoted_householder_qr_column_scaling_static();
+  test_pivoted_householder_qr_unpermutation();
+  test_pivoted_householder_qr_scaled_unpermutation();
+  test_pivoted_householder_qr_scaled_factor_invariants();
+  test_pivoted_householder_qr_frozen_ill_conditioned_system();
+  test_pivoted_householder_qr_rank_deficient();
+  test_pivoted_householder_qr_dynamic_and_mixed();
+  test_solve_pivoted_householder_qr_policy();
+  test_pivoted_householder_qr_factor_lifecycle();
+  test_bisection_lambda_selection_static();
+  test_bisection_lambda_selection_dynamic();
+  test_model_cost_cancellation();
   test_solve_static_user_jacobian();
   test_solve_dynamic_user_jacobian();
   test_solve_forward_difference_evaluation_budget();

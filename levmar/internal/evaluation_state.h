@@ -22,6 +22,7 @@ struct Result {
   Index function_evaluations = 0;
   Index jacobian_evaluations = 0;
   Index linear_solves = 0;
+  Index factorization_count = 0;
   Index accepted_steps = 0;
   Index rejected_steps = 0;
 

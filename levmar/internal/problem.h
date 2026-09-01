@@ -102,12 +102,13 @@ template <Index M, ResidualCallable<M, std::dynamic_extent> Residual,
 }
 
 struct LMOptions {
-  double initial_lambda = 1e-3;
   double min_lambda = 1e-15;
   double max_lambda = 1e15;
+  double initial_trust_region_factor = 1.0;
   double initial_trust_region_radius = 1e4;
   double min_trust_region_radius = 1e-12;
   double max_trust_region_radius = 1e16;
+  double rank_tolerance_multiplier = 32.0;
 };
 
 struct Options {
