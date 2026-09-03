@@ -2088,8 +2088,8 @@ void test_pivoted_householder_qr_factor_lifecycle() {
   expect_equal(trace.size(), std::size_t{2},
                "pivoted factor lifecycle should accept two model steps");
   expect_true(
-      trace.front().inner_linear_solves > 5,
-      "pivoted factor lifecycle should retry lambda without refactoring");
+      trace.front().inner_linear_solves > 1,
+      "pivoted factor lifecycle should select lambda without refactoring");
   expect_equal(solved->factorization_count, trace.size(),
                "pivoted factor lifecycle should rebuild only after acceptance");
   expect_true(
@@ -2166,6 +2166,87 @@ void test_bisection_lambda_selection_dynamic() {
   const auto solved = solve<DefaultSolverPolicy>(context);
   expect_true(solved.has_value(), "dynamic bisection solve should succeed");
   expect_bisection_band(trace, "dynamic bisection solve");
+}
+
+void expect_pivoted_lmpar_band(const Result &result,
+                               const std::vector<LmTrialTrace> &trace,
+                               const std::string &what) {
+  expect_equal(trace.size(), std::size_t{1}, what + " should record one trial");
+  const auto &trial = trace.front();
+  expect_true(trial.radius_bound_active,
+              what + " should require lambda selection");
+  expect_true(trial.scaled_step_norm <= 0.5,
+              what + " should stay inside the trust radius");
+  expect_true(trial.scaled_step_norm >= 0.45,
+              what + " should approach the trust-radius boundary");
+  expect_true(trial.selected_lambda > 0.1,
+              what + " should select damping above the lower bound");
+  expect_close(result.lambda, trial.selected_lambda, 0.0, 0.0,
+               what + " should report the selected lambda");
+  expect_equal(result.factorization_count, Index{1},
+               what + " should reuse one cached factorization");
+  expect_true(result.linear_solves > result.factorization_count,
+              what + " should reuse the cached factorization across lambdas");
+  expect_true(trial.inner_linear_solves < 6,
+              what + " should improve on bisection lambda selection");
+}
+
+void test_pivoted_lmpar_lambda_selection_static() {
+  auto residual = [](ConstVectorView<1> x, VectorView<1> r) {
+    r[0] = x[0];
+    return ErrorOrVoid{};
+  };
+  auto jacobian = [](ConstVectorView<1>, MatrixView<1, 1> J) {
+    J[0, 0] = 1.0;
+    return ErrorOrVoid{};
+  };
+  const auto problem = make_problem<1, 1>(residual, jacobian);
+  Options options;
+  options.max_iterations = 1;
+  options.lm.min_lambda = 0.1;
+  options.lm.initial_trust_region_factor = 0.5;
+  SolverWorkspace<PivotedQrSolverPolicy, 1, 1> workspace;
+  const std::array<double, 1> x0{1.0};
+  SolverContext<PivotedQrSolverPolicy, 1, 1, decltype(residual),
+                decltype(jacobian)>
+      context(problem, options, workspace, x0);
+  std::vector<LmTrialTrace> trace;
+  context.trial_trace = &trace;
+
+  const auto solved = solve<PivotedQrSolverPolicy>(context);
+  expect_true(solved.has_value(), "static pivoted lmpar solve should succeed");
+  expect_pivoted_lmpar_band(*solved, trace, "static pivoted lmpar solve");
+}
+
+void test_pivoted_lmpar_lambda_selection_dynamic() {
+  auto residual = [](ConstVectorView<std::dynamic_extent> x,
+                     VectorView<std::dynamic_extent> r) {
+    r[0] = x[0];
+    return ErrorOrVoid{};
+  };
+  auto jacobian = [](ConstVectorView<std::dynamic_extent>,
+                     MatrixView<std::dynamic_extent, std::dynamic_extent> J) {
+    J[0, 0] = 1.0;
+    return ErrorOrVoid{};
+  };
+  const auto problem = make_dynamic_problem(1, 1, residual, jacobian);
+  Options options;
+  options.max_iterations = 1;
+  options.lm.min_lambda = 0.1;
+  options.lm.initial_trust_region_factor = 0.5;
+  SolverWorkspace<PivotedQrSolverPolicy, std::dynamic_extent,
+                  std::dynamic_extent>
+      workspace;
+  const std::vector<double> x0{1.0};
+  SolverContext<PivotedQrSolverPolicy, std::dynamic_extent, std::dynamic_extent,
+                decltype(residual), decltype(jacobian)>
+      context(problem, options, workspace, x0);
+  std::vector<LmTrialTrace> trace;
+  context.trial_trace = &trace;
+
+  const auto solved = solve<PivotedQrSolverPolicy>(context);
+  expect_true(solved.has_value(), "dynamic pivoted lmpar solve should succeed");
+  expect_pivoted_lmpar_band(*solved, trace, "dynamic pivoted lmpar solve");
 }
 
 void test_model_cost_cancellation() {
@@ -2627,6 +2708,8 @@ int main() {
   test_pivoted_householder_qr_factor_lifecycle();
   test_bisection_lambda_selection_static();
   test_bisection_lambda_selection_dynamic();
+  test_pivoted_lmpar_lambda_selection_static();
+  test_pivoted_lmpar_lambda_selection_dynamic();
   test_model_cost_cancellation();
   test_solve_static_user_jacobian();
   test_solve_dynamic_user_jacobian();

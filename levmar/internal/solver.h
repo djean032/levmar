@@ -247,7 +247,7 @@ finish_solver(SolverContext<Policy, M, N, Residual, Jacobian> &context) {
   return std::move(context.result);
 }
 
-[[nodiscard]] bool
+[[nodiscard]] inline bool
 apply_householder_reflector(ConstVectorView<std::dynamic_extent> reflector_tail,
                             double tau,
                             VectorView<std::dynamic_extent> target) {
@@ -419,6 +419,33 @@ prepare_pivoted_householder_qr(ScalingPolicy, const LMWorkspace<M, N> &work,
     }
   }
   qr.factor_valid = true;
+  return true;
+}
+
+template <Index M, Index N>
+[[nodiscard]] bool compute_pivoted_householder_gauss_newton_direction(
+    const LMWorkspace<M, N> &work, PivotedHouseholderQrWorkspace<M, N> &qr) {
+  const Index rank = qr.numerical_rank;
+
+  for (Index k = 0; k < work.n; ++k) {
+    qr.rhs[k] = k < rank ? qr.transformed_rhs[k] : 0.0;
+  }
+  for (Index i = rank; i-- > 0;) {
+    const double diagonal = qr.r_base[i, i];
+    if (!std::isfinite(diagonal) || diagonal == 0.0) {
+      return false;
+    }
+
+    double sum = qr.rhs[i];
+    for (Index j = i + 1; j < rank; ++j) {
+      sum -= qr.r_base[i, j] * qr.rhs[j];
+    }
+
+    qr.rhs[i] = sum / diagonal;
+    if (!std::isfinite(qr.rhs[i])) {
+      return false;
+    }
+  }
   return true;
 }
 
@@ -756,11 +783,9 @@ try_lm_step(SolverContext<Policy, M, N, Residual, Jacobian> &context) {
 
   double selected_lambda = lm_opts.min_lambda;
 
-  if (scaled_step_norm > context.trust_radius) {
-    radius_bound_active = true;
+  const auto select_lambda_by_bisection = [&]() -> bool {
     double lambda_low = lm_opts.min_lambda;
     double lambda_high = std::max(context.selected_lambda, lambda_low);
-
     if (lambda_high <= lambda_low) {
       lambda_high = std::min(2.0 * lambda_low, lm_opts.max_lambda);
     }
@@ -827,6 +852,263 @@ try_lm_step(SolverContext<Policy, M, N, Residual, Jacobian> &context) {
 
     std::tie(raw_step_norm, scaled_step_norm) = step_norms();
     selected_lambda = lambda_high;
+    return true;
+  };
+
+  if (scaled_step_norm > context.trust_radius) {
+    radius_bound_active = true;
+
+    if constexpr (std::same_as<LinearAlgebra, PivotedHouseholderQr>) {
+      const auto damping_diagonal = [&](Index k) {
+        if constexpr (kUsesJacobianColumnScaling<Scaling>) {
+          const Index original_column = linear.permutation[k];
+          return std::sqrt(linear.damping_diagonal[k]) /
+                 work.scale[original_column];
+        } else {
+          return 1.0;
+        }
+      };
+
+      if (!compute_pivoted_householder_gauss_newton_direction(work, linear)) {
+        context.result.termination = TerminationReason::NumericalFailure;
+        context.result.message = "Gauss Newton direction computation failure";
+        record_trace(TrialDecision::LinearSolveFailure);
+        return false;
+      }
+
+      double dxnorm_squared = 0.0;
+      for (Index k = 0; k < work.n; ++k) {
+        dxnorm_squared = std::fma(linear.rhs[k], linear.rhs[k], dxnorm_squared);
+      }
+      const double dxnorm = std::sqrt(dxnorm_squared);
+      const double delta = context.trust_radius;
+      const double fp = dxnorm - context.trust_radius;
+      bool lmpar_bounds_valid = std::isfinite(dxnorm) && std::isfinite(fp);
+
+      double parl = lm_opts.min_lambda;
+
+      if (lmpar_bounds_valid && linear.numerical_rank == work.n &&
+          dxnorm > 0.0) {
+        bool parl_valid = true;
+
+        for (Index k = 0; k < work.n; ++k) {
+          const double damping = damping_diagonal(k);
+          if (!std::isfinite(damping) || damping <= 0.0) {
+            parl_valid = false;
+            break;
+          }
+
+          linear.row[k] = damping * (damping * linear.rhs[k] / dxnorm);
+          if (!std::isfinite(linear.row[k])) {
+            parl_valid = false;
+            break;
+          }
+        }
+
+        if (parl_valid) {
+          for (Index j = 0; j < work.n; ++j) {
+            double sum = linear.row[j];
+
+            for (Index i = 0; i < j; ++i) {
+              sum -= linear.r_base[i, j] * linear.row[i];
+            }
+
+            const double diagonal = linear.r_base[j, j];
+            if (!std::isfinite(sum) || !std::isfinite(diagonal) ||
+                diagonal == 0.0) {
+              parl_valid = false;
+              break;
+            }
+
+            linear.row[j] = sum / diagonal;
+            if (!std::isfinite(linear.row[j])) {
+              parl_valid = false;
+              break;
+            }
+          }
+        }
+
+        if (parl_valid) {
+          double squared_norm = 0.0;
+
+          for (Index k = 0; k < work.n; ++k) {
+            squared_norm = std::fma(linear.row[k], linear.row[k], squared_norm);
+          }
+
+          if (std::isfinite(squared_norm) && squared_norm > 0.0) {
+            parl = std::clamp((fp / delta) / squared_norm, lm_opts.min_lambda,
+                              lm_opts.max_lambda);
+          } else {
+            parl_valid = false;
+          }
+        }
+        lmpar_bounds_valid = parl_valid;
+      }
+
+      double gnorm_squared = 0.0;
+      bool paru_valid = lmpar_bounds_valid;
+
+      if (paru_valid) {
+        for (Index k = 0; k < work.n; ++k) {
+          double sum = 0.0;
+
+          for (Index i = 0; i <= k; ++i) {
+            sum = std::fma(linear.r_base[i, k], linear.transformed_rhs[i], sum);
+          }
+
+          const double damping = damping_diagonal(k);
+          if (!std::isfinite(sum) || !std::isfinite(damping) ||
+              damping <= 0.0) {
+            paru_valid = false;
+            break;
+          }
+
+          linear.row[k] = sum / damping;
+          if (!std::isfinite(linear.row[k])) {
+            paru_valid = false;
+            break;
+          }
+
+          gnorm_squared = std::fma(linear.row[k], linear.row[k], gnorm_squared);
+        }
+      }
+
+      double gnorm = 0.0;
+      double paru = lm_opts.max_lambda;
+
+      if (paru_valid && std::isfinite(gnorm_squared) && gnorm_squared > 0.0) {
+        gnorm = std::sqrt(gnorm_squared);
+
+        if (std::isfinite(gnorm)) {
+          paru = std::clamp(gnorm / delta, parl, lm_opts.max_lambda);
+        } else {
+          paru_valid = false;
+        }
+      } else {
+        paru_valid = false;
+      }
+
+      lmpar_bounds_valid = lmpar_bounds_valid && paru_valid;
+
+      double lambda = lm_opts.min_lambda;
+
+      if (lmpar_bounds_valid) {
+        lambda = std::clamp(context.selected_lambda, parl, paru);
+
+        if (context.selected_lambda <= 0.0) {
+          lambda = std::clamp(gnorm / dxnorm, parl, paru);
+        }
+      }
+
+      bool lambda_selected = false;
+
+      if (lmpar_bounds_valid) {
+        for (Index iteration = 0; iteration < 10; ++iteration) {
+          if (!solve_at_lambda(lambda)) {
+            context.result.termination = TerminationReason::NumericalFailure;
+            context.result.message = "Linear solve failed";
+            record_trace(TrialDecision::LinearSolveFailure);
+            return false;
+          }
+
+          std::tie(raw_step_norm, scaled_step_norm) = step_norms();
+          const double current_fp = scaled_step_norm - delta;
+
+          if (!std::isfinite(current_fp)) {
+            break;
+          }
+
+          if (std::abs(current_fp) <= 0.1 * delta) {
+            lambda_selected = true;
+            break;
+          }
+
+          if (current_fp > 0.0) {
+            parl = std::max(parl, lambda);
+          } else {
+            paru = std::min(paru, lambda);
+          }
+
+          if (!(parl < paru) || scaled_step_norm <= 0.0) {
+            break;
+          }
+
+          bool correction_valid = true;
+          for (Index k = 0; k < work.n; ++k) {
+            const double damping = damping_diagonal(k);
+            linear.row[k] = damping * linear.rhs[k] / scaled_step_norm;
+
+            if (!std::isfinite(linear.row[k])) {
+              correction_valid = false;
+              break;
+            }
+          }
+
+          if (correction_valid) {
+            for (Index j = 0; j < work.n; ++j) {
+              const double diagonal = linear.r_work[j, j];
+              if (!std::isfinite(diagonal) || diagonal == 0.0) {
+                correction_valid = false;
+                break;
+              }
+
+              linear.row[j] /= diagonal;
+              if (!std::isfinite(linear.row[j])) {
+                correction_valid = false;
+                break;
+              }
+
+              for (Index i = j + 1; i < work.n; ++i) {
+                linear.row[i] -= linear.r_work[j, i] * linear.row[j];
+              }
+            }
+          }
+
+          double correction_norm_squared = 0.0;
+          if (correction_valid) {
+            for (Index k = 0; k < work.n; ++k) {
+              if (!std::isfinite(linear.row[k])) {
+                correction_valid = false;
+                break;
+              }
+              correction_norm_squared = std::fma(linear.row[k], linear.row[k],
+                                                 correction_norm_squared);
+            }
+          }
+
+          double candidate = std::numeric_limits<double>::quiet_NaN();
+          if (correction_valid && std::isfinite(correction_norm_squared) &&
+              correction_norm_squared > 0.0) {
+            const double correction =
+                (current_fp / delta) / correction_norm_squared;
+            candidate = lambda + correction;
+          }
+
+          if (!std::isfinite(candidate) || candidate <= parl ||
+              candidate >= paru) {
+            candidate = std::exp(0.5 * (std::log(parl) + std::log(paru)));
+          }
+
+          if (!std::isfinite(candidate) || candidate <= parl ||
+              candidate >= paru) {
+            break;
+          }
+
+          lambda = candidate;
+        }
+        if (lambda_selected) {
+          selected_lambda = lambda;
+        }
+      }
+
+      if (!lambda_selected && !select_lambda_by_bisection()) {
+        return false;
+      }
+    } else {
+      if (!select_lambda_by_bisection()) {
+        return false;
+      }
+    }
   }
 
   context.selected_lambda = selected_lambda;
