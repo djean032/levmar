@@ -90,7 +90,7 @@ struct SolverContext {
   Result result;
   double trust_radius = 0.0;
   double selected_lambda = 0.0; // previous accepted lambda
-  Index lmpar_iteration_limit= 20;
+  Index lmpar_iteration_limit= 10;
   Index lmpar_inner_solve_limit = 30;
   std::vector<LmTrialTrace> *trial_trace = nullptr;
   EvaluationContext evaluation_context;

@@ -1163,6 +1163,7 @@ try_lm_step(SolverContext<Policy, M, N, Residual, Jacobian> &context) {
 
           if (!std::isfinite(candidate) || candidate <= parl ||
               candidate >= paru) {
+            ++lmpar_safeguarded_refinements;
             lambda_path = LambdaPath::MoreSafeguard;
             candidate = std::exp(0.5 * (std::log(parl) + std::log(paru)));
           }
@@ -1202,7 +1203,6 @@ try_lm_step(SolverContext<Policy, M, N, Residual, Jacobian> &context) {
             return false;
           }
 
-          ++lmpar_safeguarded_refinements;
           const double fp = scaled_step_norm - delta;
 
           if (std::abs(fp) <= 0.1 * delta) {
@@ -1438,17 +1438,15 @@ try_lm_step(SolverContext<Policy, M, N, Residual, Jacobian> &context) {
     return false;
   }
 
-  if (rho <= 0.25) {
-    context.trust_radius =
-        std::max(lm_opts.min_trust_region_radius, 0.25 * context.trust_radius);
-  } else {
-    if (rho > 0.75 && scaled_step_norm >= 0.9 * context.trust_radius) {
+  constexpr double acceptance_eta = 1e-4;
+
+  if (rho > acceptance_eta) {
+
+    if (rho > 0.75 && radius_bound_active) {
       context.trust_radius =
           std::min(lm_opts.max_trust_region_radius, 2.0 * context.trust_radius);
     }
-  }
-
-  if (rho <= 0.1) {
+  } else {
     reject_and_shrink_radius(scaled_step_norm);
     record_trace(TrialDecision::LowRho);
     return false;
