@@ -720,10 +720,13 @@ try_lm_step(SolverContext<Policy, M, N, Residual, Jacobian> &context) {
   trace.trust_radius_before = context.trust_radius;
   Index inner_linear_solves = 0;
   Index lmpar_iterations = 0;
+  Index lmpar_safeguarded_refinements = 0;
   Index bisection_bracket_expansions = 0;
   Index bisection_refinements = 0;
   bool radius_bound_active = false;
   bool lmpar_fallback = false;
+  double selected_lambda = lm_opts.min_lambda;
+  double last_evaluated_lambda = std::numeric_limits<double>::quiet_NaN();
 
   const auto record_trace = [&](TrialDecision decision) {
     if (context.trial_trace == nullptr) {
@@ -733,9 +736,11 @@ try_lm_step(SolverContext<Policy, M, N, Residual, Jacobian> &context) {
     trace.decision = decision;
     trace.cost_before = context.result.final_cost;
     trace.trust_radius_after = context.trust_radius;
-    trace.selected_lambda = context.selected_lambda;
+    trace.selected_lambda = selected_lambda;
+    trace.last_evaluated_lambda = last_evaluated_lambda;
     trace.inner_linear_solves = inner_linear_solves;
     trace.lmpar_iterations = lmpar_iterations;
+    trace.lmpar_safeguarded_refinements = lmpar_safeguarded_refinements;
     trace.bisection_bracket_expansions = bisection_bracket_expansions;
     trace.bisection_refinements = bisection_refinements;
     trace.radius_bound_active = radius_bound_active;
@@ -745,6 +750,7 @@ try_lm_step(SolverContext<Policy, M, N, Residual, Jacobian> &context) {
   };
 
   const auto solve_at_lambda = [&](double lambda) -> bool {
+    last_evaluated_lambda = lambda;
     ++context.result.linear_solves;
     ++inner_linear_solves;
     return solve_linear_step(LinearAlgebra{}, Scaling{}, work, linear, lambda);
@@ -788,8 +794,6 @@ try_lm_step(SolverContext<Policy, M, N, Residual, Jacobian> &context) {
   }
 
   auto [raw_step_norm, scaled_step_norm] = step_norms();
-
-  double selected_lambda = lm_opts.min_lambda;
 
   const auto select_lambda_by_bisection = [&]() -> bool {
     double lambda_low = lm_opts.min_lambda;
@@ -998,7 +1002,46 @@ try_lm_step(SolverContext<Policy, M, N, Residual, Jacobian> &context) {
         paru_valid = false;
       }
 
+      double feasible_lambda = std::numeric_limits<double>::quiet_NaN();
+      double feasible_raw_norm = std::numeric_limits<double>::quiet_NaN();
+      double feasible_scaled_norm = std::numeric_limits<double>::quiet_NaN();
+      bool has_feasible_step = false;
+
+      const auto remember_feasible_step = [&](double lambda) {
+        if (scaled_step_norm > delta ||
+            (has_feasible_step && scaled_step_norm <= feasible_scaled_norm)) {
+          return;
+        }
+
+        has_feasible_step = true;
+        feasible_lambda = lambda;
+        feasible_raw_norm = raw_step_norm;
+        feasible_scaled_norm = scaled_step_norm;
+        trace.lmpar_has_feasible_step = true;
+        trace.lmpar_feasible_lambda = feasible_lambda;
+        std::ranges::copy(work.step.view(),
+                          linear.feasible_step.view().begin());
+      };
+
+      const auto solve_pivoted_lambda = [&](double lambda) -> bool {
+        if (!solve_at_lambda(lambda)) {
+          context.result.termination = TerminationReason::NumericalFailure;
+          context.result.message = "Linear solve failed";
+          record_trace(TrialDecision::LinearSolveFailure);
+          return false;
+        }
+
+        std::tie(raw_step_norm, scaled_step_norm) = step_norms();
+        remember_feasible_step(lambda);
+        return true;
+      };
+
       lmpar_bounds_valid = lmpar_bounds_valid && paru_valid;
+      trace.lmpar_bounds_valid = lmpar_bounds_valid;
+      if (lmpar_bounds_valid) {
+        trace.lmpar_parl = parl;
+        trace.lmpar_paru = paru;
+      }
 
       double lambda = lm_opts.min_lambda;
 
@@ -1013,12 +1056,12 @@ try_lm_step(SolverContext<Policy, M, N, Residual, Jacobian> &context) {
       bool lambda_selected = false;
 
       if (lmpar_bounds_valid) {
-        for (Index iteration = 0; iteration < 10; ++iteration) {
+        for (Index iteration = 0;
+             iteration < context.lmpar_iteration_limit &&
+             inner_linear_solves - 1 < context.lmpar_inner_solve_limit;
+             ++iteration) {
           ++lmpar_iterations;
-          if (!solve_at_lambda(lambda)) {
-            context.result.termination = TerminationReason::NumericalFailure;
-            context.result.message = "Linear solve failed";
-            record_trace(TrialDecision::LinearSolveFailure);
+          if (!solve_pivoted_lambda(lambda)) {
             return false;
           }
 
@@ -1039,6 +1082,8 @@ try_lm_step(SolverContext<Policy, M, N, Residual, Jacobian> &context) {
           } else {
             paru = std::min(paru, lambda);
           }
+          trace.lmpar_parl = parl;
+          trace.lmpar_paru = paru;
 
           if (!(parl < paru) || scaled_step_norm <= 0.0) {
             break;
@@ -1111,22 +1156,75 @@ try_lm_step(SolverContext<Policy, M, N, Residual, Jacobian> &context) {
         if (lambda_selected) {
           selected_lambda = lambda;
         }
-      }
 
-      if (!lambda_selected) {
-        lmpar_fallback = true;
-      }
-      if (!lambda_selected && !select_lambda_by_bisection()) {
-        return false;
+        if (!lambda_selected) {
+          lmpar_fallback = true;
+          if (!has_feasible_step && parl < paru) {
+            if (!solve_pivoted_lambda(paru)) {
+              return false;
+            }
+          }
+        }
+
+        while (!lambda_selected &&
+               inner_linear_solves - 1 < context.lmpar_inner_solve_limit &&
+               parl < paru) {
+          const double midpoint =
+              std::exp(0.5 * (std::log(parl) + std::log(paru)));
+
+          if (!std::isfinite(midpoint) || midpoint == parl ||
+              midpoint == paru) {
+            break;
+          }
+
+          if (!solve_pivoted_lambda(midpoint)) {
+            return false;
+          }
+
+          ++lmpar_safeguarded_refinements;
+          const double fp = scaled_step_norm - delta;
+
+          if (std::abs(fp) <= 0.1 * delta) {
+            lambda_selected = true;
+            selected_lambda = midpoint;
+            break;
+          }
+
+          if (fp > 0.0) {
+            parl = midpoint;
+          } else {
+            paru = midpoint;
+          }
+          trace.lmpar_parl = parl;
+          trace.lmpar_paru = paru;
+        }
+
+        if (!lambda_selected && has_feasible_step) {
+          selected_lambda = feasible_lambda;
+          raw_step_norm = feasible_raw_norm;
+          scaled_step_norm = feasible_scaled_norm;
+          std::ranges::copy(linear.feasible_step.view(),
+                            work.step.view().begin());
+          lambda_selected = true;
+        }
+
+        if (!lambda_selected) {
+          context.result.termination = TerminationReason::DampingLimit;
+          record_trace(TrialDecision::DampingLimit);
+          return false;
+        }
       }
     } else {
       if (!select_lambda_by_bisection()) {
         return false;
       }
     }
+  } else {
+    if (!select_lambda_by_bisection()) {
+      return false;
+    }
   }
 
-  context.selected_lambda = selected_lambda;
   context.result.lambda = selected_lambda;
   context.result.step_norm = raw_step_norm;
   trace.raw_step_norm = raw_step_norm;
@@ -1321,6 +1419,7 @@ try_lm_step(SolverContext<Policy, M, N, Residual, Jacobian> &context) {
     return false;
   }
 
+  context.selected_lambda = selected_lambda;
   record_trace(TrialDecision::Accepted);
 
   std::ranges::copy(work.x_trial.view().begin(), work.x_trial.view().end(),

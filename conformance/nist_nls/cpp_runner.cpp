@@ -3859,10 +3859,12 @@ void write_controller_trace_csv(
   }
   file << "problem,start,derivative,extent,attempt,cost_before,trial_cost,"
           "actual_reduction,predicted_reduction,rho,lambda_before,lambda_after,"
-          "trust_radius_before,trust_radius_after,selected_lambda,inner_linear_"
-          "solves,lmpar_iterations,bisection_bracket_expansions,"
+          "trust_radius_before,trust_radius_after,selected_lambda,"
+          "last_evaluated_lambda,inner_linear_solves,lmpar_iterations,"
+          "lmpar_safeguarded_refinements,bisection_bracket_expansions,"
           "bisection_refinements,radius_bound_active,lmpar_fallback,"
-          "gradient_inf_norm,"
+          "lmpar_bounds_valid,lmpar_has_feasible_step,lmpar_parl,lmpar_paru,"
+          "lmpar_feasible_lambda,gradient_inf_norm,"
           "raw_step_norm,scaled_step_norm,current_parameters,trial_parameters,"
           "step,gradient,jacobian_column_norms,parameter_scales,"
           "effective_damping_diagonal,max_abs_column_correlation,"
@@ -3887,12 +3889,16 @@ void write_controller_trace_csv(
            << trial.rho << ',' << trial.lambda_before << ','
            << trial.lambda_after << ',' << trial.trust_radius_before << ','
            << trial.trust_radius_after << ',' << trial.selected_lambda << ','
-           << trial.inner_linear_solves << ',' << trial.lmpar_iterations << ','
+           << trial.last_evaluated_lambda << ',' << trial.inner_linear_solves
+           << ',' << trial.lmpar_iterations << ','
+           << trial.lmpar_safeguarded_refinements << ','
            << trial.bisection_bracket_expansions << ','
            << trial.bisection_refinements << ',' << trial.radius_bound_active
-           << ',' << trial.lmpar_fallback << ',' << trial.gradient_inf_norm
-           << ',' << trial.raw_step_norm << ',' << trial.scaled_step_norm
-           << ',';
+           << ',' << trial.lmpar_fallback << ',' << trial.lmpar_bounds_valid
+           << ',' << trial.lmpar_has_feasible_step << ',' << trial.lmpar_parl
+           << ',' << trial.lmpar_paru << ',' << trial.lmpar_feasible_lambda
+           << ',' << trial.gradient_inf_norm << ',' << trial.raw_step_norm
+           << ',' << trial.scaled_step_norm << ',';
       write_vector(trial.current_parameters);
       file << ',';
       write_vector(trial.trial_parameters);

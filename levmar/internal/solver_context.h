@@ -28,12 +28,15 @@ enum class TrialDecision {
 struct LmTrialTrace {
   Index inner_linear_solves = 0;
   Index lmpar_iterations = 0;
+  Index lmpar_safeguarded_refinements = 0;
   Index bisection_bracket_expansions = 0;
   Index bisection_refinements = 0;
   Index max_correlation_col_i = 0;
   Index max_correlation_col_j = 0;
   bool radius_bound_active = false;
   bool lmpar_fallback = false;
+  bool lmpar_bounds_valid = false;
+  bool lmpar_has_feasible_step = false;
   double cost_before = std::numeric_limits<double>::quiet_NaN();
   double trial_cost = std::numeric_limits<double>::quiet_NaN();
   double actual_reduction = std::numeric_limits<double>::quiet_NaN();
@@ -41,6 +44,10 @@ struct LmTrialTrace {
   double rho = std::numeric_limits<double>::quiet_NaN();
   double lambda_before = std::numeric_limits<double>::quiet_NaN();
   double lambda_after = std::numeric_limits<double>::quiet_NaN();
+  double last_evaluated_lambda = std::numeric_limits<double>::quiet_NaN();
+  double lmpar_parl = std::numeric_limits<double>::quiet_NaN();
+  double lmpar_paru = std::numeric_limits<double>::quiet_NaN();
+  double lmpar_feasible_lambda = std::numeric_limits<double>::quiet_NaN();
   double gradient_inf_norm = std::numeric_limits<double>::quiet_NaN();
   double raw_step_norm = std::numeric_limits<double>::quiet_NaN();
   double scaled_step_norm = std::numeric_limits<double>::quiet_NaN();
@@ -70,7 +77,9 @@ struct SolverContext {
   Workspace &workspace;
   Result result;
   double trust_radius = 0.0;
-  double selected_lambda = 0.0;
+  double selected_lambda = 0.0; // previous accepted lambda
+  Index lmpar_iteration_limit= 20;
+  Index lmpar_inner_solve_limit = 30;
   std::vector<LmTrialTrace> *trial_trace = nullptr;
   EvaluationContext evaluation_context;
 

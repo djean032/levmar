@@ -35,6 +35,7 @@ template <Index M, Index N> struct PivotedHouseholderQrWorkspace {
   VectorStorage<N> rhs;
   VectorStorage<N> row;
   VectorStorage<N> damping_diagonal;
+  VectorStorage<N> feasible_step;
 
   Index numerical_rank = 0;
   double rank_threshold = 0.0;
@@ -80,6 +81,7 @@ template <Index M, Index N> struct PivotedHouseholderQrWorkspace {
       rhs.resize(n);
       row.resize(n);
       damping_diagonal.resize(n);
+      feasible_step.resize(n);
     }
 
     invalidate();

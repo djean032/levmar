@@ -2336,6 +2336,41 @@ void test_pivoted_lmpar_correction_dynamic() {
                                   "dynamic pivoted lmpar correction");
 }
 
+void test_pivoted_lmpar_rejected_trial_preserves_warm_start() {
+  auto residual = [](ConstVectorView<1> x, VectorView<1> r) {
+    r[0] = x[0] - 3.0;
+    return ErrorOrVoid{};
+  };
+  auto jacobian = [](ConstVectorView<1> x, MatrixView<1, 1> J) {
+    J[0, 0] = x[0] < 2.0 ? 1.0 : -1.0;
+    return ErrorOrVoid{};
+  };
+  const auto problem = make_problem<1, 1>(residual, jacobian);
+  Options options;
+  options.max_iterations = 2;
+  options.lm.min_lambda = 0.1;
+  SolverWorkspace<PivotedQrSolverPolicy, 1, 1> workspace;
+  const std::array<double, 1> x0{1.0};
+  SolverContext<PivotedQrSolverPolicy, 1, 1, decltype(residual),
+                decltype(jacobian)>
+      context(problem, options, workspace, x0);
+  std::vector<LmTrialTrace> trace;
+  context.trial_trace = &trace;
+
+  const auto solved = solve<PivotedQrSolverPolicy>(context);
+  expect_true(solved.has_value(), "warm-start rejection solve should succeed");
+  expect_equal(trace.size(), std::size_t{2},
+               "warm-start rejection should record two trials");
+  expect_equal(trace[0].decision, TrialDecision::Accepted,
+               "warm-start rejection first trial should be accepted");
+  expect_equal(trace[1].decision, TrialDecision::LowRho,
+               "warm-start rejection second trial should be rejected");
+  expect_true(trace[0].selected_lambda != trace[1].selected_lambda,
+              "warm-start rejection should select a different rejected lambda");
+  expect_close(context.selected_lambda, trace[0].selected_lambda, 0.0, 0.0,
+               "rejected trial should preserve the accepted warm-start lambda");
+}
+
 void test_model_cost_cancellation() {
   auto residual = [](ConstVectorView<1> x, VectorView<1> r) {
     r[0] = 1e16 + x[0];
@@ -2666,12 +2701,19 @@ void test_solve_termination_paths() {
                 decltype(incorrect_jacobian)>
       damping_context(incorrect_problem, damping_options, damping_workspace,
                       x0);
+  std::vector<LmTrialTrace> damping_trace;
+  damping_context.trial_trace = &damping_trace;
   const auto damping_solved = solve<DefaultSolverPolicy>(damping_context);
   expect_true(damping_solved.has_value(), "damping-limit solve should succeed");
   expect_equal(damping_solved->termination, TerminationReason::DampingLimit,
                "rejected trials should reach damping limit");
   expect_true(damping_solved->linear_solves > 1,
               "rejected trials should grow lambda across multiple solves");
+  expect_true(!damping_trace.empty(),
+              "damping-limit solve should record trials");
+  expect_close(damping_trace.back().last_evaluated_lambda,
+               damping_options.lm.max_lambda, 0.0, 0.0,
+               "damping-limit trace should report the final attempted lambda");
 
   const auto problem = make_problem<1, 1>(residual, jacobian);
   Options step_options;
@@ -2799,6 +2841,7 @@ int main() {
   test_pivoted_lmpar_lambda_selection_dynamic();
   test_pivoted_lmpar_correction_static();
   test_pivoted_lmpar_correction_dynamic();
+  test_pivoted_lmpar_rejected_trial_preserves_warm_start();
   test_model_cost_cancellation();
   test_solve_static_user_jacobian();
   test_solve_dynamic_user_jacobian();
