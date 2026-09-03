@@ -2170,14 +2170,16 @@ void test_bisection_lambda_selection_dynamic() {
 
 void expect_pivoted_lmpar_band(const Result &result,
                                const std::vector<LmTrialTrace> &trace,
-                               const std::string &what) {
+                               const std::string &what,
+                               double trust_radius = 0.5,
+                               double max_step_ratio = 1.0) {
   expect_equal(trace.size(), std::size_t{1}, what + " should record one trial");
   const auto &trial = trace.front();
   expect_true(trial.radius_bound_active,
               what + " should require lambda selection");
-  expect_true(trial.scaled_step_norm <= 0.5,
-              what + " should stay inside the trust radius");
-  expect_true(trial.scaled_step_norm >= 0.45,
+  expect_true(trial.scaled_step_norm <= max_step_ratio * trust_radius,
+              what + " should stay within the lambda-selection band");
+  expect_true(trial.scaled_step_norm >= 0.9 * trust_radius,
               what + " should approach the trust-radius boundary");
   expect_true(trial.selected_lambda > 0.1,
               what + " should select damping above the lower bound");
@@ -2189,6 +2191,21 @@ void expect_pivoted_lmpar_band(const Result &result,
               what + " should reuse the cached factorization across lambdas");
   expect_true(trial.inner_linear_solves < 6,
               what + " should improve on bisection lambda selection");
+}
+
+void expect_pivoted_lmpar_correction(const Result &result,
+                                     const std::vector<LmTrialTrace> &trace,
+                                     const std::string &what) {
+  expect_pivoted_lmpar_band(result, trace, what, 0.25 * std::sqrt(2.0), 1.1);
+  const auto &trial = trace.front();
+  expect_true(trial.lmpar_iterations > 1,
+              what + " should perform a More correction iteration");
+  expect_true(!trial.lmpar_fallback,
+              what + " should not fall back to bisection");
+  expect_equal(trial.bisection_bracket_expansions, Index{0},
+               what + " should not expand a bisection bracket");
+  expect_equal(trial.bisection_refinements, Index{0},
+               what + " should not refine a bisection bracket");
 }
 
 void test_pivoted_lmpar_lambda_selection_static() {
@@ -2247,6 +2264,76 @@ void test_pivoted_lmpar_lambda_selection_dynamic() {
   const auto solved = solve<PivotedQrSolverPolicy>(context);
   expect_true(solved.has_value(), "dynamic pivoted lmpar solve should succeed");
   expect_pivoted_lmpar_band(*solved, trace, "dynamic pivoted lmpar solve");
+}
+
+void test_pivoted_lmpar_correction_static() {
+  auto residual = [](ConstVectorView<2> x, VectorView<2> r) {
+    r[0] = x[0];
+    r[1] = x[1];
+    return ErrorOrVoid{};
+  };
+  auto jacobian = [](ConstVectorView<2>, MatrixView<2, 2> J) {
+    J[0, 0] = 1.0;
+    J[0, 1] = 0.0;
+    J[1, 0] = 0.0;
+    J[1, 1] = 2.0;
+    return ErrorOrVoid{};
+  };
+  const auto problem = make_problem<2, 2>(residual, jacobian);
+  Options options;
+  options.max_iterations = 1;
+  options.lm.min_lambda = 0.1;
+  options.lm.initial_trust_region_factor = 0.25;
+  SolverWorkspace<PivotedQrSolverPolicy, 2, 2> workspace;
+  const std::array<double, 2> x0{1.0, 1.0};
+  SolverContext<PivotedQrSolverPolicy, 2, 2, decltype(residual),
+                decltype(jacobian)>
+      context(problem, options, workspace, x0);
+  std::vector<LmTrialTrace> trace;
+  context.trial_trace = &trace;
+
+  const auto solved = solve<PivotedQrSolverPolicy>(context);
+  expect_true(solved.has_value(),
+              "static pivoted lmpar correction should succeed");
+  expect_pivoted_lmpar_correction(*solved, trace,
+                                  "static pivoted lmpar correction");
+}
+
+void test_pivoted_lmpar_correction_dynamic() {
+  auto residual = [](ConstVectorView<std::dynamic_extent> x,
+                     VectorView<std::dynamic_extent> r) {
+    r[0] = x[0];
+    r[1] = x[1];
+    return ErrorOrVoid{};
+  };
+  auto jacobian = [](ConstVectorView<std::dynamic_extent>,
+                     MatrixView<std::dynamic_extent, std::dynamic_extent> J) {
+    J[0, 0] = 1.0;
+    J[0, 1] = 0.0;
+    J[1, 0] = 0.0;
+    J[1, 1] = 2.0;
+    return ErrorOrVoid{};
+  };
+  const auto problem = make_dynamic_problem(2, 2, residual, jacobian);
+  Options options;
+  options.max_iterations = 1;
+  options.lm.min_lambda = 0.1;
+  options.lm.initial_trust_region_factor = 0.25;
+  SolverWorkspace<PivotedQrSolverPolicy, std::dynamic_extent,
+                  std::dynamic_extent>
+      workspace;
+  const std::vector<double> x0{1.0, 1.0};
+  SolverContext<PivotedQrSolverPolicy, std::dynamic_extent, std::dynamic_extent,
+                decltype(residual), decltype(jacobian)>
+      context(problem, options, workspace, x0);
+  std::vector<LmTrialTrace> trace;
+  context.trial_trace = &trace;
+
+  const auto solved = solve<PivotedQrSolverPolicy>(context);
+  expect_true(solved.has_value(),
+              "dynamic pivoted lmpar correction should succeed");
+  expect_pivoted_lmpar_correction(*solved, trace,
+                                  "dynamic pivoted lmpar correction");
 }
 
 void test_model_cost_cancellation() {
@@ -2710,6 +2797,8 @@ int main() {
   test_bisection_lambda_selection_dynamic();
   test_pivoted_lmpar_lambda_selection_static();
   test_pivoted_lmpar_lambda_selection_dynamic();
+  test_pivoted_lmpar_correction_static();
+  test_pivoted_lmpar_correction_dynamic();
   test_model_cost_cancellation();
   test_solve_static_user_jacobian();
   test_solve_dynamic_user_jacobian();

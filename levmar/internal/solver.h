@@ -719,7 +719,11 @@ try_lm_step(SolverContext<Policy, M, N, Residual, Jacobian> &context) {
   trace.gradient_inf_norm = context.result.gradient_inf_norm;
   trace.trust_radius_before = context.trust_radius;
   Index inner_linear_solves = 0;
+  Index lmpar_iterations = 0;
+  Index bisection_bracket_expansions = 0;
+  Index bisection_refinements = 0;
   bool radius_bound_active = false;
+  bool lmpar_fallback = false;
 
   const auto record_trace = [&](TrialDecision decision) {
     if (context.trial_trace == nullptr) {
@@ -731,7 +735,11 @@ try_lm_step(SolverContext<Policy, M, N, Residual, Jacobian> &context) {
     trace.trust_radius_after = context.trust_radius;
     trace.selected_lambda = context.selected_lambda;
     trace.inner_linear_solves = inner_linear_solves;
+    trace.lmpar_iterations = lmpar_iterations;
+    trace.bisection_bracket_expansions = bisection_bracket_expansions;
+    trace.bisection_refinements = bisection_refinements;
     trace.radius_bound_active = radius_bound_active;
+    trace.lmpar_fallback = lmpar_fallback;
     trace.termination = context.result.termination;
     context.trial_trace->push_back(std::move(trace));
   };
@@ -808,6 +816,7 @@ try_lm_step(SolverContext<Policy, M, N, Residual, Jacobian> &context) {
 
       lambda_low = lambda_high;
       lambda_high = std::min(2.0 * lambda_high, lm_opts.max_lambda);
+      ++bisection_bracket_expansions;
 
       if (!solve_at_lambda(lambda_high)) {
         context.result.termination = TerminationReason::NumericalFailure;
@@ -832,6 +841,7 @@ try_lm_step(SolverContext<Policy, M, N, Residual, Jacobian> &context) {
         record_trace(TrialDecision::LinearSolveFailure);
         return false;
       }
+      ++bisection_refinements;
 
       const auto [raw_mid_norm, scaled_mid_norm] = step_norms();
       if (scaled_mid_norm > context.trust_radius) {
@@ -1004,6 +1014,7 @@ try_lm_step(SolverContext<Policy, M, N, Residual, Jacobian> &context) {
 
       if (lmpar_bounds_valid) {
         for (Index iteration = 0; iteration < 10; ++iteration) {
+          ++lmpar_iterations;
           if (!solve_at_lambda(lambda)) {
             context.result.termination = TerminationReason::NumericalFailure;
             context.result.message = "Linear solve failed";
@@ -1036,7 +1047,8 @@ try_lm_step(SolverContext<Policy, M, N, Residual, Jacobian> &context) {
           bool correction_valid = true;
           for (Index k = 0; k < work.n; ++k) {
             const double damping = damping_diagonal(k);
-            linear.row[k] = damping * linear.rhs[k] / scaled_step_norm;
+            linear.row[k] =
+                std::sqrt(lambda) * damping * linear.rhs[k] / scaled_step_norm;
 
             if (!std::isfinite(linear.row[k])) {
               correction_valid = false;
@@ -1101,6 +1113,9 @@ try_lm_step(SolverContext<Policy, M, N, Residual, Jacobian> &context) {
         }
       }
 
+      if (!lambda_selected) {
+        lmpar_fallback = true;
+      }
       if (!lambda_selected && !select_lambda_by_bisection()) {
         return false;
       }

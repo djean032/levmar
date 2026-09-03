@@ -27,9 +27,13 @@ enum class TrialDecision {
 
 struct LmTrialTrace {
   Index inner_linear_solves = 0;
+  Index lmpar_iterations = 0;
+  Index bisection_bracket_expansions = 0;
+  Index bisection_refinements = 0;
   Index max_correlation_col_i = 0;
   Index max_correlation_col_j = 0;
   bool radius_bound_active = false;
+  bool lmpar_fallback = false;
   double cost_before = std::numeric_limits<double>::quiet_NaN();
   double trial_cost = std::numeric_limits<double>::quiet_NaN();
   double actual_reduction = std::numeric_limits<double>::quiet_NaN();
