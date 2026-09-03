@@ -2208,6 +2208,31 @@ void expect_pivoted_lmpar_correction(const Result &result,
                what + " should not refine a bisection bracket");
 }
 
+void expect_pivoted_interior_gauss_newton_step(
+    const Result &result, const std::vector<LmTrialTrace> &trace,
+    const std::string &what) {
+  expect_equal(trace.size(), std::size_t{1}, what + " should record one trial");
+  const auto &trial = trace.front();
+  expect_true(!trial.radius_bound_active,
+              what + " should keep the trust-region constraint inactive");
+  expect_close(result.lambda, 0.0, 0.0, 0.0,
+               what + " should use the undamped Gauss-Newton step");
+  expect_close(trial.selected_lambda, 0.0, 0.0, 0.0,
+               what + " should trace the undamped selected lambda");
+  expect_close(trial.last_evaluated_lambda, 0.0, 0.0, 0.0,
+               what + " should trace the Gauss-Newton solve");
+  expect_equal(trial.inner_linear_solves, Index{1},
+               what + " should perform only the Gauss-Newton solve");
+  expect_equal(trial.lmpar_iterations, Index{0},
+               what + " should skip Moré iteration");
+  expect_equal(trial.bisection_refinements, Index{0},
+               what + " should skip bisection refinement");
+  expect_close(trial.step[0], -1.0, 1e-12, 1e-12,
+               what + " first Gauss-Newton component");
+  expect_close(trial.step[1], 0.0, 1e-12, 1e-12,
+               what + " rank-deficient Gauss-Newton component");
+}
+
 void test_pivoted_lmpar_lambda_selection_static() {
   auto residual = [](ConstVectorView<1> x, VectorView<1> r) {
     r[0] = x[0];
@@ -2264,6 +2289,74 @@ void test_pivoted_lmpar_lambda_selection_dynamic() {
   const auto solved = solve<PivotedQrSolverPolicy>(context);
   expect_true(solved.has_value(), "dynamic pivoted lmpar solve should succeed");
   expect_pivoted_lmpar_band(*solved, trace, "dynamic pivoted lmpar solve");
+}
+
+void test_pivoted_interior_gauss_newton_step_static() {
+  auto residual = [](ConstVectorView<2> x, VectorView<2> r) {
+    r[0] = x[0];
+    r[1] = 2.0 * x[0];
+    return ErrorOrVoid{};
+  };
+  auto jacobian = [](ConstVectorView<2>, MatrixView<2, 2> J) {
+    J[0, 0] = 1.0;
+    J[0, 1] = 0.0;
+    J[1, 0] = 2.0;
+    J[1, 1] = 0.0;
+    return ErrorOrVoid{};
+  };
+  const auto problem = make_problem<2, 2>(residual, jacobian);
+  Options options;
+  options.max_iterations = 1;
+  options.lm.min_lambda = 0.1;
+  options.lm.initial_trust_region_factor = 1.0;
+  SolverWorkspace<PivotedQrSolverPolicy, 2, 2> workspace;
+  const std::array<double, 2> x0{1.0, 2.0};
+  SolverContext<PivotedQrSolverPolicy, 2, 2, decltype(residual),
+                decltype(jacobian)>
+      context(problem, options, workspace, x0);
+  std::vector<LmTrialTrace> trace;
+  context.trial_trace = &trace;
+
+  const auto solved = solve<PivotedQrSolverPolicy>(context);
+  expect_true(solved.has_value(), "static interior Gauss-Newton solve");
+  expect_pivoted_interior_gauss_newton_step(
+      *solved, trace, "static interior Gauss-Newton solve");
+}
+
+void test_pivoted_interior_gauss_newton_step_dynamic() {
+  auto residual = [](ConstVectorView<std::dynamic_extent> x,
+                     VectorView<std::dynamic_extent> r) {
+    r[0] = x[0];
+    r[1] = 2.0 * x[0];
+    return ErrorOrVoid{};
+  };
+  auto jacobian = [](ConstVectorView<std::dynamic_extent>,
+                     MatrixView<std::dynamic_extent, std::dynamic_extent> J) {
+    J[0, 0] = 1.0;
+    J[0, 1] = 0.0;
+    J[1, 0] = 2.0;
+    J[1, 1] = 0.0;
+    return ErrorOrVoid{};
+  };
+  const auto problem = make_dynamic_problem(2, 2, residual, jacobian);
+  Options options;
+  options.max_iterations = 1;
+  options.lm.min_lambda = 0.1;
+  options.lm.initial_trust_region_factor = 1.0;
+  SolverWorkspace<PivotedQrSolverPolicy, std::dynamic_extent,
+                  std::dynamic_extent>
+      workspace;
+  const std::vector<double> x0{1.0, 2.0};
+  SolverContext<PivotedQrSolverPolicy, std::dynamic_extent, std::dynamic_extent,
+                decltype(residual), decltype(jacobian)>
+      context(problem, options, workspace, x0);
+  std::vector<LmTrialTrace> trace;
+  context.trial_trace = &trace;
+
+  const auto solved = solve<PivotedQrSolverPolicy>(context);
+  expect_true(solved.has_value(), "dynamic interior Gauss-Newton solve");
+  expect_pivoted_interior_gauss_newton_step(
+      *solved, trace, "dynamic interior Gauss-Newton solve");
 }
 
 void test_pivoted_lmpar_correction_static() {
@@ -2839,6 +2932,8 @@ int main() {
   test_bisection_lambda_selection_dynamic();
   test_pivoted_lmpar_lambda_selection_static();
   test_pivoted_lmpar_lambda_selection_dynamic();
+  test_pivoted_interior_gauss_newton_step_static();
+  test_pivoted_interior_gauss_newton_step_dynamic();
   test_pivoted_lmpar_correction_static();
   test_pivoted_lmpar_correction_dynamic();
   test_pivoted_lmpar_rejected_trial_preserves_warm_start();

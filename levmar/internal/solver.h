@@ -786,14 +786,8 @@ try_lm_step(SolverContext<Policy, M, N, Residual, Jacobian> &context) {
     return true;
   };
 
-  if (!solve_at_lambda(lm_opts.min_lambda)) {
-    context.result.termination = TerminationReason::NumericalFailure;
-    context.result.message = "Linear solve failed";
-    record_trace(TrialDecision::LinearSolveFailure);
-    return false;
-  }
-
-  auto [raw_step_norm, scaled_step_norm] = step_norms();
+  double raw_step_norm = 0.0;
+  double scaled_step_norm = 0.0;
 
   const auto select_lambda_by_bisection = [&]() -> bool {
     double lambda_low = lm_opts.min_lambda;
@@ -869,10 +863,40 @@ try_lm_step(SolverContext<Policy, M, N, Residual, Jacobian> &context) {
     return true;
   };
 
-  if (scaled_step_norm > context.trust_radius) {
-    radius_bound_active = true;
+  if constexpr (std::same_as<LinearAlgebra, PivotedHouseholderQr>) {
+    ++context.result.linear_solves;
+    ++inner_linear_solves;
+    last_evaluated_lambda = 0.0;
 
-    if constexpr (std::same_as<LinearAlgebra, PivotedHouseholderQr>) {
+    if (!compute_pivoted_householder_gauss_newton_direction(work, linear)) {
+      context.result.termination = TerminationReason::NumericalFailure;
+      context.result.message = "Gauss-Newton direction computation failure";
+      record_trace(TrialDecision::LinearSolveFailure);
+      return false;
+    }
+
+    for (Index k = 0; k < work.n; ++k) {
+      const Index original_column = linear.permutation[k];
+
+      if constexpr (kUsesJacobianColumnScaling<Scaling>) {
+        work.step[original_column] =
+            linear.rhs[k] / work.scale[original_column];
+      } else {
+        work.step[original_column] = linear.rhs[k];
+      }
+
+      if (!std::isfinite(work.step[original_column])) {
+        context.result.termination = TerminationReason::NumericalFailure;
+        context.result.message = "Non-finite Gauss-Newton step";
+        record_trace(TrialDecision::LinearSolveFailure);
+        return false;
+      }
+    }
+
+    std::tie(raw_step_norm, scaled_step_norm) = step_norms();
+
+    if (scaled_step_norm > context.trust_radius) {
+      radius_bound_active = true;
       const auto damping_diagonal = [&](Index k) {
         if constexpr (kUsesJacobianColumnScaling<Scaling>) {
           const Index original_column = linear.permutation[k];
@@ -882,13 +906,6 @@ try_lm_step(SolverContext<Policy, M, N, Residual, Jacobian> &context) {
           return 1.0;
         }
       };
-
-      if (!compute_pivoted_householder_gauss_newton_direction(work, linear)) {
-        context.result.termination = TerminationReason::NumericalFailure;
-        context.result.message = "Gauss Newton direction computation failure";
-        record_trace(TrialDecision::LinearSolveFailure);
-        return false;
-      }
 
       double dxnorm_squared = 0.0;
       for (Index k = 0; k < work.n; ++k) {
@@ -1092,8 +1109,7 @@ try_lm_step(SolverContext<Policy, M, N, Residual, Jacobian> &context) {
           bool correction_valid = true;
           for (Index k = 0; k < work.n; ++k) {
             const double damping = damping_diagonal(k);
-            linear.row[k] =
-                std::sqrt(lambda) * damping * linear.rhs[k] / scaled_step_norm;
+            linear.row[k] = damping * linear.rhs[k] / scaled_step_norm;
 
             if (!std::isfinite(linear.row[k])) {
               correction_valid = false;
@@ -1213,15 +1229,27 @@ try_lm_step(SolverContext<Policy, M, N, Residual, Jacobian> &context) {
           record_trace(TrialDecision::DampingLimit);
           return false;
         }
+      } else if (!select_lambda_by_bisection()) {
+        return false;
       }
     } else {
+      selected_lambda = 0.0;
+    }
+  } else {
+    if (!solve_at_lambda(lm_opts.min_lambda)) {
+      context.result.termination = TerminationReason::NumericalFailure;
+      context.result.message = "Linear solve failed";
+      record_trace(TrialDecision::LinearSolveFailure);
+      return false;
+    }
+
+    std::tie(raw_step_norm, scaled_step_norm) = step_norms();
+
+    if (scaled_step_norm > context.trust_radius) {
+      radius_bound_active = true;
       if (!select_lambda_by_bisection()) {
         return false;
       }
-    }
-  } else {
-    if (!select_lambda_by_bisection()) {
-      return false;
     }
   }
 
