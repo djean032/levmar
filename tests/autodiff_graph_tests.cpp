@@ -2105,6 +2105,14 @@ void expect_bisection_band(const std::vector<LmTrialTrace> &trace,
               what + " should refine the lambda bracket");
   expect_true(trial.radius_bound_active,
               what + " should require lambda escalation");
+  expect_equal(trial.lambda_path, LambdaPath::LegacyBisection,
+               what + " should trace the legacy bisection path");
+  expect_equal(trial.bisection_calls, Index{1},
+               what + " should enter bisection once");
+  expect_equal(trial.more_calls, Index{0},
+               what + " should not enter More selection");
+  expect_equal(trial.gn_calls, Index{0},
+               what + " should not compute a Householder GN step");
   expect_true(trial.scaled_step_norm <= 0.5,
               what + " should stay inside the trust radius");
   expect_true(trial.scaled_step_norm >= 0.45,
@@ -2200,6 +2208,12 @@ void expect_pivoted_lmpar_correction(const Result &result,
   const auto &trial = trace.front();
   expect_true(trial.lmpar_iterations > 1,
               what + " should perform a More correction iteration");
+  expect_equal(trial.gn_calls, Index{1},
+               what + " should compute one Householder GN step");
+  expect_equal(trial.more_calls, Index{1},
+               what + " should enter More selection once");
+  expect_equal(trial.bisection_calls, Index{0},
+               what + " should not enter legacy bisection");
   expect_true(!trial.lmpar_fallback,
               what + " should not fall back to bisection");
   expect_equal(trial.bisection_bracket_expansions, Index{0},
@@ -2223,6 +2237,14 @@ void expect_pivoted_interior_gauss_newton_step(
                what + " should trace the Gauss-Newton solve");
   expect_equal(trial.inner_linear_solves, Index{1},
                what + " should perform only the Gauss-Newton solve");
+  expect_equal(trial.lambda_path, LambdaPath::HouseholderGn,
+               what + " should trace the Householder GN path");
+  expect_equal(trial.gn_calls, Index{1},
+               what + " should compute one Householder GN step");
+  expect_equal(trial.more_calls, Index{0},
+               what + " should skip More selection");
+  expect_equal(trial.bisection_calls, Index{0},
+               what + " should skip bisection selection");
   expect_equal(trial.lmpar_iterations, Index{0},
                what + " should skip Moré iteration");
   expect_equal(trial.bisection_refinements, Index{0},
@@ -2496,8 +2518,11 @@ void test_model_cost_cancellation() {
                "trial cost should round to the current cost");
   expect_equal(trace.front().predicted_reduction, 0.0,
                "model cost should round to the current cost");
-  expect_equal(trace.front().decision, TrialDecision::SmallCostReduction,
-               "zero model reduction should terminate on small cost change");
+  expect_equal(trace.front().decision,
+               TrialDecision::NonPositivePredictedReduction,
+               "zero model reduction should reject the invalid model step");
+  expect_equal(solved->termination, TerminationReason::MaxIterations,
+               "rejected invalid model step should not report convergence");
 }
 
 void test_solve_static_user_jacobian() {
@@ -2808,9 +2833,25 @@ void test_solve_termination_paths() {
                damping_options.lm.max_lambda, 0.0, 0.0,
                "damping-limit trace should report the final attempted lambda");
 
+  Options rejected_step_options = damping_options;
+  rejected_step_options.step_tolerance = 2.0;
+  SolverWorkspace<DefaultSolverPolicy, 1, 1> rejected_step_workspace;
+  SolverContext<DefaultSolverPolicy, 1, 1, decltype(residual),
+                decltype(incorrect_jacobian)>
+      rejected_step_context(incorrect_problem, rejected_step_options,
+                            rejected_step_workspace, x0);
+  const auto rejected_step_solved =
+      solve<DefaultSolverPolicy>(rejected_step_context);
+  expect_true(rejected_step_solved.has_value(),
+              "rejected small raw step solve should succeed");
+  expect_equal(rejected_step_solved->termination,
+               TerminationReason::DampingLimit,
+               "rejected small raw step must not report SmallStep");
+
   const auto problem = make_problem<1, 1>(residual, jacobian);
   Options step_options;
   step_options.step_tolerance = 2.0;
+  step_options.gradient_tolerance = 0.0;
   SolverWorkspace<DefaultSolverPolicy, 1, 1> step_workspace;
   SolverContext<DefaultSolverPolicy, 1, 1, decltype(residual),
                 decltype(jacobian)>
@@ -2820,8 +2861,46 @@ void test_solve_termination_paths() {
   expect_equal(step_solved->termination, TerminationReason::SmallStep,
                "large step tolerance should terminate with SmallStep");
 
+  using ScaledSolverPolicy =
+      SolverPolicy<UserJacobian, LevenbergMarquardt, DampedQr, SquaredLoss,
+                   JacobianColumnScaling>;
+  auto scaled_residual = [](ConstVectorView<1> x, VectorView<1> r) {
+    r[0] = 10.0 * (x[0] - 101.0);
+    return ErrorOrVoid{};
+  };
+  auto scaled_jacobian = [](ConstVectorView<1>, MatrixView<1, 1> jacobian) {
+    jacobian[0, 0] = 10.0;
+    return ErrorOrVoid{};
+  };
+  const auto scaled_problem =
+      make_problem<1, 1>(scaled_residual, scaled_jacobian);
+  Options scaled_step_options;
+  scaled_step_options.max_iterations = 1;
+  scaled_step_options.step_tolerance = 0.02;
+  scaled_step_options.gradient_tolerance = 0.0;
+  scaled_step_options.cost_tolerance = 0.0;
+  scaled_step_options.lm.min_lambda = 1e-4;
+  scaled_step_options.lm.max_lambda = 1e-4;
+  SolverWorkspace<ScaledSolverPolicy, 1, 1> scaled_step_workspace;
+  const std::array<double, 1> scaled_x0{100.0};
+  SolverContext<ScaledSolverPolicy, 1, 1, decltype(scaled_residual),
+                decltype(scaled_jacobian)>
+      scaled_step_context(scaled_problem, scaled_step_options,
+                          scaled_step_workspace, scaled_x0);
+  const auto scaled_step_solved =
+      solve<ScaledSolverPolicy>(scaled_step_context);
+  expect_true(scaled_step_solved.has_value(),
+              "scaled relative small-step solve should succeed");
+  expect_true(scaled_step_solved->step_norm >
+                  scaled_step_options.step_tolerance,
+              "scaled relative small-step test requires a raw step above "
+              "tolerance");
+  expect_equal(scaled_step_solved->termination, TerminationReason::SmallStep,
+               "scaled relative step should terminate with SmallStep");
+
   Options cost_options;
   cost_options.cost_tolerance = 1.0;
+  cost_options.gradient_tolerance = 0.0;
   SolverWorkspace<DefaultSolverPolicy, 1, 1> cost_workspace;
   SolverContext<DefaultSolverPolicy, 1, 1, decltype(residual),
                 decltype(jacobian)>
@@ -2834,6 +2913,7 @@ void test_solve_termination_paths() {
   Options relative_cost_options;
   relative_cost_options.cost_tolerance = 0.0;
   relative_cost_options.relative_cost_tolerance = 1.0;
+  relative_cost_options.gradient_tolerance = 0.0;
   SolverWorkspace<DefaultSolverPolicy, 1, 1> relative_cost_workspace;
   SolverContext<DefaultSolverPolicy, 1, 1, decltype(residual),
                 decltype(jacobian)>
@@ -2847,6 +2927,40 @@ void test_solve_termination_paths() {
                TerminationReason::SmallCostReduction,
                "large relative cost tolerance should terminate with "
                "SmallCostReduction");
+
+  auto mismatched_reduction_residual = [](ConstVectorView<1> x,
+                                          VectorView<1> r) {
+    r[0] = x[0] - 0.95 * x[0] * x[0] - 1.0;
+    return ErrorOrVoid{};
+  };
+  auto mismatched_reduction_jacobian = [](ConstVectorView<1> x,
+                                          MatrixView<1, 1> jacobian) {
+    jacobian[0, 0] = 1.0 - 1.9 * x[0];
+    return ErrorOrVoid{};
+  };
+  const auto mismatched_reduction_problem = make_problem<1, 1>(
+      mismatched_reduction_residual, mismatched_reduction_jacobian);
+  Options mismatched_reduction_options;
+  mismatched_reduction_options.max_iterations = 1;
+  mismatched_reduction_options.cost_tolerance = 0.1;
+  mismatched_reduction_options.gradient_tolerance = 0.0;
+  SolverWorkspace<DefaultSolverPolicy, 1, 1> mismatched_reduction_workspace;
+  SolverContext<DefaultSolverPolicy, 1, 1,
+                decltype(mismatched_reduction_residual),
+                decltype(mismatched_reduction_jacobian)>
+      mismatched_reduction_context(mismatched_reduction_problem,
+                                   mismatched_reduction_options,
+                                   mismatched_reduction_workspace, x0);
+  const auto mismatched_reduction_solved =
+      solve<DefaultSolverPolicy>(mismatched_reduction_context);
+  expect_true(mismatched_reduction_solved.has_value(),
+              "mismatched reduction solve should succeed");
+  expect_equal(mismatched_reduction_solved->accepted_steps, Index{1},
+               "mismatched reduction trial should be accepted");
+  expect_equal(mismatched_reduction_solved->termination,
+               TerminationReason::MaxIterations,
+               "small actual reduction with substantial predicted reduction "
+               "must not report SmallCostReduction");
 
   auto nonlinear_residual = [](ConstVectorView<1> x, VectorView<1> r) {
     r[0] = x[0] * x[0] - 1.0;

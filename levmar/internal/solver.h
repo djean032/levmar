@@ -414,9 +414,10 @@ prepare_pivoted_householder_qr(ScalingPolicy, const LMWorkspace<M, N> &work,
 
   qr.numerical_rank = 0;
   for (Index k = 0; k < work.n; ++k) {
-    if (std::abs(qr.r_base[k, k]) > qr.rank_threshold) {
-      ++qr.numerical_rank;
+    if (std::abs(qr.r_base[k, k]) <= qr.rank_threshold) {
+      break;
     }
+    ++qr.numerical_rank;
   }
   qr.factor_valid = true;
   return true;
@@ -664,8 +665,8 @@ template <Index M, Index N>
 }
 
 template <Index M, Index N>
-[[nodiscard]] double
-initial_scaled_parameter_norm(NoScaling, const LMWorkspace<M, N> &work) {
+[[nodiscard]] double scaled_parameter_norm(NoScaling,
+                                           const LMWorkspace<M, N> &work) {
   double squared_norm = 0.0;
 
   for (Index j = 0; j < work.n; ++j) {
@@ -676,9 +677,8 @@ initial_scaled_parameter_norm(NoScaling, const LMWorkspace<M, N> &work) {
 }
 
 template <Index M, Index N>
-[[nodiscard]] double
-initial_scaled_parameter_norm(JacobianColumnScaling,
-                              const LMWorkspace<M, N> &work) {
+[[nodiscard]] double scaled_parameter_norm(JacobianColumnScaling,
+                                           const LMWorkspace<M, N> &work) {
   double squared_norm = 0.0;
 
   for (Index j = 0; j < work.n; ++j) {
@@ -723,6 +723,9 @@ try_lm_step(SolverContext<Policy, M, N, Residual, Jacobian> &context) {
   Index lmpar_safeguarded_refinements = 0;
   Index bisection_bracket_expansions = 0;
   Index bisection_refinements = 0;
+  Index bisection_calls = 0;
+  Index more_calls = 0;
+  Index gn_calls = 0;
   bool radius_bound_active = false;
   bool lmpar_fallback = false;
   double selected_lambda = lm_opts.min_lambda;
@@ -744,6 +747,9 @@ try_lm_step(SolverContext<Policy, M, N, Residual, Jacobian> &context) {
     trace.lmpar_safeguarded_refinements = lmpar_safeguarded_refinements;
     trace.bisection_bracket_expansions = bisection_bracket_expansions;
     trace.bisection_refinements = bisection_refinements;
+    trace.bisection_calls = bisection_calls;
+    trace.more_calls = more_calls;
+    trace.gn_calls = gn_calls;
     trace.radius_bound_active = radius_bound_active;
     trace.lmpar_fallback = lmpar_fallback;
     trace.termination = context.result.termination;
@@ -792,6 +798,8 @@ try_lm_step(SolverContext<Policy, M, N, Residual, Jacobian> &context) {
   double scaled_step_norm = 0.0;
 
   const auto select_lambda_by_bisection = [&]() -> bool {
+    ++bisection_calls;
+    lambda_path = LambdaPath::LegacyBisection;
     double lambda_low = lm_opts.min_lambda;
     double lambda_high = std::max(context.selected_lambda, lambda_low);
     if (lambda_high <= lambda_low) {
@@ -835,13 +843,13 @@ try_lm_step(SolverContext<Policy, M, N, Residual, Jacobian> &context) {
         break;
       }
 
+      ++bisection_refinements;
       if (!solve_at_lambda(lambda_mid)) {
         context.result.termination = TerminationReason::NumericalFailure;
         context.result.message = "Linear solve failed";
         record_trace(TrialDecision::LinearSolveFailure);
         return false;
       }
-      ++bisection_refinements;
 
       const auto [raw_mid_norm, scaled_mid_norm] = step_norms();
       if (scaled_mid_norm > context.trust_radius) {
@@ -867,6 +875,7 @@ try_lm_step(SolverContext<Policy, M, N, Residual, Jacobian> &context) {
 
   if constexpr (std::same_as<LinearAlgebra, PivotedHouseholderQr>) {
     lambda_path = LambdaPath::HouseholderGn;
+    ++gn_calls;
     ++context.result.linear_solves;
     ++inner_linear_solves;
     last_evaluated_lambda = 0.0;
@@ -900,7 +909,6 @@ try_lm_step(SolverContext<Policy, M, N, Residual, Jacobian> &context) {
 
     if (scaled_step_norm > context.trust_radius) {
       radius_bound_active = true;
-      lambda_path = LambdaPath::More;
       const auto damping_diagonal = [&](Index k) {
         if constexpr (kUsesJacobianColumnScaling<Scaling>) {
           const Index original_column = linear.permutation[k];
@@ -1067,6 +1075,8 @@ try_lm_step(SolverContext<Policy, M, N, Residual, Jacobian> &context) {
       double lambda = lm_opts.min_lambda;
 
       if (lmpar_bounds_valid) {
+        lambda_path = LambdaPath::More;
+        ++more_calls;
         lambda = std::clamp(context.selected_lambda, parl, paru);
 
         if (context.selected_lambda <= 0.0) {
@@ -1163,7 +1173,6 @@ try_lm_step(SolverContext<Policy, M, N, Residual, Jacobian> &context) {
 
           if (!std::isfinite(candidate) || candidate <= parl ||
               candidate >= paru) {
-            ++lmpar_safeguarded_refinements;
             lambda_path = LambdaPath::MoreSafeguard;
             candidate = std::exp(0.5 * (std::log(parl) + std::log(paru)));
           }
@@ -1199,6 +1208,8 @@ try_lm_step(SolverContext<Policy, M, N, Residual, Jacobian> &context) {
             break;
           }
 
+          ++lmpar_safeguarded_refinements;
+          lambda_path = LambdaPath::MoreSafeguard;
           if (!solve_pivoted_lambda(midpoint)) {
             return false;
           }
@@ -1235,7 +1246,6 @@ try_lm_step(SolverContext<Policy, M, N, Residual, Jacobian> &context) {
           return false;
         }
       } else if (!select_lambda_by_bisection()) {
-        lambda_path = LambdaPath::LegacyBisection;
         return false;
       }
     } else {
@@ -1254,7 +1264,6 @@ try_lm_step(SolverContext<Policy, M, N, Residual, Jacobian> &context) {
     if (scaled_step_norm > context.trust_radius) {
       radius_bound_active = true;
       if (!select_lambda_by_bisection()) {
-        lambda_path = LambdaPath::LegacyBisection;
         return false;
       }
     }
@@ -1344,13 +1353,6 @@ try_lm_step(SolverContext<Policy, M, N, Residual, Jacobian> &context) {
     return false;
   }
 
-  if (context.result.step_norm <=
-      context.evaluation_context.options.step_tolerance) {
-    context.result.termination = TerminationReason::SmallStep;
-    record_trace(TrialDecision::SmallStep);
-    return false;
-  }
-
   if (context.result.function_evaluations >=
       context.evaluation_context.options.max_function_evaluations) {
     context.result.termination = TerminationReason::MaxFunctionEvaluations;
@@ -1409,21 +1411,6 @@ try_lm_step(SolverContext<Policy, M, N, Residual, Jacobian> &context) {
   }
 
   if (predicted_reduction <= 0.0) {
-    const auto &options = context.evaluation_context.options;
-    const double cost_change = std::abs(actual_reduction);
-    const bool small_abs_change = cost_change <= options.cost_tolerance;
-    const bool small_rel_change =
-        options.relative_cost_tolerance > 0.0 &&
-        context.result.final_cost > 0.0 &&
-        cost_change <=
-            options.relative_cost_tolerance * context.result.final_cost;
-
-    if (small_abs_change || small_rel_change) {
-      context.result.termination = TerminationReason::SmallCostReduction;
-      record_trace(TrialDecision::SmallCostReduction);
-      return false;
-    }
-
     reject_and_shrink_radius(scaled_step_norm);
     record_trace(TrialDecision::NonPositivePredictedReduction);
     return false;
@@ -1446,6 +1433,8 @@ try_lm_step(SolverContext<Policy, M, N, Residual, Jacobian> &context) {
       context.trust_radius =
           std::min(lm_opts.max_trust_region_radius, 2.0 * context.trust_radius);
     }
+    context.accepted_predicted_reduction = predicted_reduction;
+    context.accepted_scaled_step_norm = scaled_step_norm;
   } else {
     reject_and_shrink_radius(scaled_step_norm);
     record_trace(TrialDecision::LowRho);
@@ -1459,6 +1448,8 @@ try_lm_step(SolverContext<Policy, M, N, Residual, Jacobian> &context) {
                     work.x_current.view().begin());
   std::ranges::copy(work.r_trial.view().begin(), work.r_trial.view().end(),
                     work.r.view().begin());
+  context.accepted_scaled_parameter_norm =
+      scaled_parameter_norm(Scaling{}, work);
   return true;
 }
 
@@ -1500,7 +1491,7 @@ solve(detail::SolverContext<Policy, M, N, Residual, Jacobian> &context) {
     return detail::finish_solver(context);
   }
 
-  const double scaled_x_norm = detail::initial_scaled_parameter_norm(
+  const double scaled_x_norm = detail::scaled_parameter_norm(
       typename Policy::ScalingPolicy{}, context.workspace.work);
   const double factor =
       context.evaluation_context.options.lm.initial_trust_region_factor;
@@ -1601,14 +1592,35 @@ solve(detail::SolverContext<Policy, M, N, Residual, Jacobian> &context) {
             context.evaluation_context.options.relative_cost_tolerance *
                 previous_cost;
 
-    if (small_abs_reduction || small_rel_reduction) {
-      context.result.termination = TerminationReason::SmallCostReduction;
-      return detail::finish_solver(context);
-    }
+    const double predicted_reduction = context.accepted_predicted_reduction;
+
+    const bool predicted_small =
+        predicted_reduction <=
+            context.evaluation_context.options.cost_tolerance ||
+        (context.evaluation_context.options.relative_cost_tolerance > 0.0 &&
+         previous_cost > 0.0 &&
+         predicted_reduction <=
+             context.evaluation_context.options.relative_cost_tolerance *
+                 previous_cost);
 
     if (context.result.gradient_inf_norm <=
         context.evaluation_context.options.gradient_tolerance) {
       context.result.termination = TerminationReason::SmallGradient;
+      return detail::finish_solver(context);
+    }
+
+    const double step_limit =
+        context.evaluation_context.options.step_tolerance *
+        (context.accepted_scaled_parameter_norm +
+         context.evaluation_context.options.step_tolerance);
+
+    if (context.accepted_scaled_step_norm <= step_limit) {
+      context.result.termination = TerminationReason::SmallStep;
+      return detail::finish_solver(context);
+    }
+
+    if ((small_abs_reduction || small_rel_reduction) && predicted_small) {
+      context.result.termination = TerminationReason::SmallCostReduction;
       return detail::finish_solver(context);
     }
   }

@@ -3880,7 +3880,8 @@ void write_controller_trace_csv(
           "trust_radius_before,trust_radius_after,selected_lambda,"
           "last_evaluated_lambda,inner_linear_solves,lmpar_iterations,"
           "lmpar_safeguarded_refinements,bisection_bracket_expansions,"
-          "bisection_refinements,radius_bound_active,lmpar_fallback,"
+          "bisection_refinements,bisection_calls,more_calls,gn_calls,"
+          "radius_bound_active,lmpar_fallback,"
           "lmpar_bounds_valid,lmpar_has_feasible_step,lmpar_parl,lmpar_paru,"
           "lmpar_feasible_lambda,lambda_path,gradient_inf_norm,"
           "raw_step_norm,scaled_step_norm,current_parameters,trial_parameters,"
@@ -3911,13 +3912,14 @@ void write_controller_trace_csv(
            << ',' << trial.lmpar_iterations << ','
            << trial.lmpar_safeguarded_refinements << ','
            << trial.bisection_bracket_expansions << ','
-           << trial.bisection_refinements << ',' << trial.radius_bound_active
-           << ',' << trial.lmpar_fallback << ',' << trial.lmpar_bounds_valid
-           << ',' << trial.lmpar_has_feasible_step << ',' << trial.lmpar_parl
-           << ',' << trial.lmpar_paru << ',' << trial.lmpar_feasible_lambda
-           << ',' << to_string(trial.lambda_path) << ','
-           << trial.gradient_inf_norm << ',' << trial.raw_step_norm << ','
-           << trial.scaled_step_norm << ',';
+           << trial.bisection_refinements << ',' << trial.bisection_calls << ','
+           << trial.more_calls << ',' << trial.gn_calls << ','
+           << trial.radius_bound_active << ',' << trial.lmpar_fallback << ','
+           << trial.lmpar_bounds_valid << ',' << trial.lmpar_has_feasible_step
+           << ',' << trial.lmpar_parl << ',' << trial.lmpar_paru << ','
+           << trial.lmpar_feasible_lambda << ',' << to_string(trial.lambda_path)
+           << ',' << trial.gradient_inf_norm << ',' << trial.raw_step_norm
+           << ',' << trial.scaled_step_norm << ',';
       write_vector(trial.current_parameters);
       file << ',';
       write_vector(trial.trial_parameters);
