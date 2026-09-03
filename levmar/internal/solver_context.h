@@ -25,6 +25,14 @@ enum class TrialDecision {
   LowRho,
 };
 
+enum class LambdaPath {
+  None,
+  HouseholderGn,
+  More,
+  MoreSafeguard,
+  LegacyBisection
+};
+
 struct LmTrialTrace {
   Index inner_linear_solves = 0;
   Index lmpar_iterations = 0;
@@ -33,6 +41,9 @@ struct LmTrialTrace {
   Index bisection_refinements = 0;
   Index max_correlation_col_i = 0;
   Index max_correlation_col_j = 0;
+  Index bisection_calls = 0;
+  Index more_calls = 0;
+  Index gn_calls = 0;
   bool radius_bound_active = false;
   bool lmpar_fallback = false;
   bool lmpar_bounds_valid = false;
@@ -64,6 +75,7 @@ struct LmTrialTrace {
   std::vector<double> effective_damping_diagonal;
   TrialDecision decision = TrialDecision::LinearSolveFailure;
   TerminationReason termination = TerminationReason::NotTerminated;
+  LambdaPath lambda_path = LambdaPath::None;
 };
 
 template <class Policy, Index M, Index N, ResidualCallable<M, N> Residual,

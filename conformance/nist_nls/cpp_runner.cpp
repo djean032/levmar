@@ -1,3 +1,4 @@
+#include "levmar/internal/solver_context.h"
 #include <levmar/internal/solver.h>
 #include <levmar/lm.h>
 
@@ -3849,6 +3850,23 @@ std::string_view trial_decision_name(TrialDecision decision) {
   return "unknown";
 }
 
+constexpr const char *to_string(LambdaPath path) noexcept {
+  switch (path) {
+  case LambdaPath::None:
+    return "none";
+  case LambdaPath::HouseholderGn:
+    return "householder_gn";
+  case LambdaPath::More:
+    return "more";
+  case LambdaPath::MoreSafeguard:
+    return "more_safeguard";
+  case LambdaPath::LegacyBisection:
+    return "legacy_bisection";
+  }
+
+  return "unknown";
+};
+
 void write_controller_trace_csv(
     const std::filesystem::path &path,
     const std::vector<ControllerTraceRecord> &records) {
@@ -3864,7 +3882,7 @@ void write_controller_trace_csv(
           "lmpar_safeguarded_refinements,bisection_bracket_expansions,"
           "bisection_refinements,radius_bound_active,lmpar_fallback,"
           "lmpar_bounds_valid,lmpar_has_feasible_step,lmpar_parl,lmpar_paru,"
-          "lmpar_feasible_lambda,gradient_inf_norm,"
+          "lmpar_feasible_lambda,lambda_path,gradient_inf_norm,"
           "raw_step_norm,scaled_step_norm,current_parameters,trial_parameters,"
           "step,gradient,jacobian_column_norms,parameter_scales,"
           "effective_damping_diagonal,max_abs_column_correlation,"
@@ -3897,8 +3915,9 @@ void write_controller_trace_csv(
            << ',' << trial.lmpar_fallback << ',' << trial.lmpar_bounds_valid
            << ',' << trial.lmpar_has_feasible_step << ',' << trial.lmpar_parl
            << ',' << trial.lmpar_paru << ',' << trial.lmpar_feasible_lambda
-           << ',' << trial.gradient_inf_norm << ',' << trial.raw_step_norm
-           << ',' << trial.scaled_step_norm << ',';
+           << ',' << to_string(trial.lambda_path) << ','
+           << trial.gradient_inf_norm << ',' << trial.raw_step_norm << ','
+           << trial.scaled_step_norm << ',';
       write_vector(trial.current_parameters);
       file << ',';
       write_vector(trial.trial_parameters);

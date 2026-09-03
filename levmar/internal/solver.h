@@ -727,6 +727,7 @@ try_lm_step(SolverContext<Policy, M, N, Residual, Jacobian> &context) {
   bool lmpar_fallback = false;
   double selected_lambda = lm_opts.min_lambda;
   double last_evaluated_lambda = std::numeric_limits<double>::quiet_NaN();
+  LambdaPath lambda_path = LambdaPath::None;
 
   const auto record_trace = [&](TrialDecision decision) {
     if (context.trial_trace == nullptr) {
@@ -746,6 +747,7 @@ try_lm_step(SolverContext<Policy, M, N, Residual, Jacobian> &context) {
     trace.radius_bound_active = radius_bound_active;
     trace.lmpar_fallback = lmpar_fallback;
     trace.termination = context.result.termination;
+    trace.lambda_path = lambda_path;
     context.trial_trace->push_back(std::move(trace));
   };
 
@@ -864,6 +866,7 @@ try_lm_step(SolverContext<Policy, M, N, Residual, Jacobian> &context) {
   };
 
   if constexpr (std::same_as<LinearAlgebra, PivotedHouseholderQr>) {
+    lambda_path = LambdaPath::HouseholderGn;
     ++context.result.linear_solves;
     ++inner_linear_solves;
     last_evaluated_lambda = 0.0;
@@ -897,6 +900,7 @@ try_lm_step(SolverContext<Policy, M, N, Residual, Jacobian> &context) {
 
     if (scaled_step_norm > context.trust_radius) {
       radius_bound_active = true;
+      lambda_path = LambdaPath::More;
       const auto damping_diagonal = [&](Index k) {
         if constexpr (kUsesJacobianColumnScaling<Scaling>) {
           const Index original_column = linear.permutation[k];
@@ -1159,6 +1163,7 @@ try_lm_step(SolverContext<Policy, M, N, Residual, Jacobian> &context) {
 
           if (!std::isfinite(candidate) || candidate <= parl ||
               candidate >= paru) {
+            lambda_path = LambdaPath::MoreSafeguard;
             candidate = std::exp(0.5 * (std::log(parl) + std::log(paru)));
           }
 
@@ -1230,6 +1235,7 @@ try_lm_step(SolverContext<Policy, M, N, Residual, Jacobian> &context) {
           return false;
         }
       } else if (!select_lambda_by_bisection()) {
+        lambda_path = LambdaPath::LegacyBisection;
         return false;
       }
     } else {
@@ -1248,6 +1254,7 @@ try_lm_step(SolverContext<Policy, M, N, Residual, Jacobian> &context) {
     if (scaled_step_norm > context.trust_radius) {
       radius_bound_active = true;
       if (!select_lambda_by_bisection()) {
+        lambda_path = LambdaPath::LegacyBisection;
         return false;
       }
     }
