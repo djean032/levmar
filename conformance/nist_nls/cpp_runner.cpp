@@ -233,6 +233,8 @@ struct ExternalSolverBenchmark {
 
 struct ExternalSolverResult {
   std::string solver;
+  std::string native_termination_code;
+  std::string native_termination_detail;
   std::string start_label;
   Index m = 0;
   Index n = 0;
@@ -425,6 +427,8 @@ std::string_view termination_reason_name(TerminationReason termination) {
     return "max_function_evaluations";
   case TerminationReason::NumericalFailure:
     return "numerical_failure";
+  case TerminationReason::TrustRegionTooSmall:
+    return "trust_region_too_small";
   case TerminationReason::DampingLimit:
     return "damping_limit";
   }
@@ -1085,6 +1089,7 @@ Result solve_nist_variant(const CorpusProblem &corpus, ResidualFn residual,
       (solved->termination == TerminationReason::MaxIterations ||
        solved->termination == TerminationReason::MaxFunctionEvaluations ||
        solved->termination == TerminationReason::NumericalFailure ||
+       solved->termination == TerminationReason::TrustRegionTooSmall ||
        solved->termination == TerminationReason::DampingLimit)) {
     throw std::runtime_error(what + ": solver did not converge (" +
                              solver_diagnostics(*solved) +
@@ -1210,6 +1215,8 @@ run_problem(const std::filesystem::path &problem_dir,
           } catch (const std::exception &error) {
             ExternalSolverResult failed;
             failed.solver = std::string(solver_name);
+            failed.native_termination_code = "exception";
+            failed.native_termination_detail = error.what();
             failed.start_label = label;
             failed.m = corpus.m;
             failed.n = corpus.n;
@@ -1330,6 +1337,8 @@ run_problem(const std::filesystem::path &problem_dir,
               } catch (const std::exception &error) {
                 ExternalSolverResult failed;
                 failed.solver = std::string(solver_name);
+                failed.native_termination_code = "exception";
+                failed.native_termination_detail = error.what();
                 failed.start_label = label;
                 failed.m = corpus.m;
                 failed.n = corpus.n;
@@ -3747,7 +3756,7 @@ void write_solver_work_csv(const std::filesystem::path &path,
                              path.string());
   }
   file << "solver,linear_algebra,derivative,problem,start,extent,m,n,elapsed_"
-          "ms,termination,"
+          "ms,termination,native_termination_code,native_termination_detail,"
           "lre,"
           "final_cost,lambda,gradient_inf_norm,step_norm,iterations,"
           "function_evaluations,jacobian_evaluations,linear_solves,"
@@ -3765,7 +3774,7 @@ void write_solver_work_csv(const std::filesystem::path &path,
                  << report.name << ',' << row.start_label << ',' << row.extent
                  << ',' << row.m << ',' << row.n << ',' << std::setprecision(17)
                  << milliseconds(row.elapsed_seconds) << ','
-                 << termination_reason_name(result.termination) << ','
+                 << termination_reason_name(result.termination) << ",,,"
                  << row.lre << ',' << result.final_cost << ',' << result.lambda
                  << ',' << result.gradient_inf_norm << ',' << result.step_norm
                  << ',' << result.iterations << ','
@@ -3780,6 +3789,16 @@ void write_solver_work_csv(const std::filesystem::path &path,
     write_levmar_reports("analytic", analytic_reports);
     write_levmar_reports("autodiff", autodiff_reports);
   }
+  const auto write_csv_field = [&](std::string_view value) {
+    file << '"';
+    for (const char character : value) {
+      if (character == '"') {
+        file << '"';
+      }
+      file << character;
+    }
+    file << '"';
+  };
   const auto write_external_reports =
       [&](const std::vector<ProblemReport> &reports) {
         for (const auto &report : reports) {
@@ -3794,9 +3813,13 @@ void write_solver_work_csv(const std::filesystem::path &path,
                  << (autodiff ? "static" : "dynamic") << ',' << result.m << ','
                  << result.n << ',' << std::setprecision(17)
                  << milliseconds(result.seconds) << ','
-                 << (result.usable ? "converged" : "failed") << ','
-                 << result.lre << ",nan,nan,nan,nan," << result.iterations
-                 << ',' << result.function_evaluations << ','
+                 << (result.usable ? "converged" : "failed") << ',';
+            write_csv_field(result.native_termination_code);
+            file << ',';
+            write_csv_field(result.native_termination_detail);
+            file << ',' << result.lre << ",nan,nan,nan,nan,"
+                 << result.iterations << ',' << result.function_evaluations
+                 << ','
                  << (result.has_jacobian_evaluations
                          ? std::to_string(result.jacobian_evaluations)
                          : "nan")

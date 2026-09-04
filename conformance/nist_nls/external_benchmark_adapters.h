@@ -1,6 +1,31 @@
 #pragma once
 
 #ifdef LEVMAR_HAVE_CMINPACK
+inline std::string_view minpack_termination_detail(int status) {
+  switch (status) {
+  case 0:
+    return "improper_input_parameters";
+  case 1:
+    return "small_actual_and_predicted_reduction";
+  case 2:
+    return "small_trust_region_step";
+  case 3:
+    return "small_reduction_and_step";
+  case 4:
+    return "gradient_orthogonality";
+  case 5:
+    return "max_function_evaluations";
+  case 6:
+    return "ftol_too_small";
+  case 7:
+    return "xtol_too_small";
+  case 8:
+    return "gtol_too_small";
+  default:
+    return status < 0 ? "user_abort" : "unknown";
+  }
+}
+
 template <class ResidualFn, class JacobianFn> struct MinpackCallbackContext {
   const CorpusProblem &corpus;
   ResidualFn &residual;
@@ -81,6 +106,8 @@ run_minpack_solver(const std::string &name, const CorpusProblem &corpus,
                   wa1.data(), wa2.data(), wa3.data(), wa4.data());
   ExternalSolverResult result;
   result.solver = name;
+  result.native_termination_code = std::to_string(status);
+  result.native_termination_detail = minpack_termination_detail(status);
   result.seconds = elapsed_seconds(start_time, Clock::now());
   result.lre = log_relative_error(x, certified);
   result.function_evaluations = nfev;
@@ -184,6 +211,9 @@ run_ceres_analytic_solver(const CorpusProblem &corpus, ResidualFn residual,
   ceres::Solve(ceres_options(), &problem, &summary);
   ExternalSolverResult result;
   result.solver = "ceres_analytic";
+  result.native_termination_code =
+      ceres::TerminationTypeToString(summary.termination_type);
+  result.native_termination_detail = summary.message;
   result.seconds = elapsed_seconds(start_time, Clock::now());
   result.lre = log_relative_error(x, certified);
   result.iterations = summary.iterations.size();
@@ -216,6 +246,9 @@ run_ceres_autodiff_solver(ResidualFn residual, const std::vector<double> &start,
   ceres::Solve(ceres_options(), &problem, &summary);
   ExternalSolverResult result;
   result.solver = "ceres_autodiff";
+  result.native_termination_code =
+      ceres::TerminationTypeToString(summary.termination_type);
+  result.native_termination_detail = summary.message;
   result.seconds = elapsed_seconds(start_time, Clock::now());
   result.lre = log_relative_error(x, certified);
   result.iterations = summary.iterations.size();

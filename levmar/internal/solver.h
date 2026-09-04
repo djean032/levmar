@@ -785,7 +785,7 @@ try_lm_step(SolverContext<Policy, M, N, Residual, Jacobian> &context) {
       [&](double trial_scaled_step_norm) -> bool {
     const double next_radius = 0.25 * trial_scaled_step_norm;
     if (next_radius < lm_opts.min_trust_region_radius) {
-      context.result.termination = TerminationReason::DampingLimit;
+      context.result.termination = TerminationReason::TrustRegionTooSmall;
       return false;
     }
 

@@ -31,6 +31,7 @@ enum class TerminationReason {
   MaxIterations,
   MaxFunctionEvaluations,
   NumericalFailure,
+  TrustRegionTooSmall,
   DampingLimit
 };
 

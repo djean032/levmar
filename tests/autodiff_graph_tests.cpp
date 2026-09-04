@@ -2833,6 +2833,31 @@ void test_solve_termination_paths() {
                damping_options.lm.max_lambda, 0.0, 0.0,
                "damping-limit trace should report the final attempted lambda");
 
+  Options trust_region_options;
+  trust_region_options.max_iterations = 20;
+  trust_region_options.lm.min_trust_region_radius = 0.5;
+  SolverWorkspace<DefaultSolverPolicy, 1, 1> trust_region_workspace;
+  SolverContext<DefaultSolverPolicy, 1, 1, decltype(residual),
+                decltype(incorrect_jacobian)>
+      trust_region_context(incorrect_problem, trust_region_options,
+                           trust_region_workspace, x0);
+  std::vector<LmTrialTrace> trust_region_trace;
+  trust_region_context.trial_trace = &trust_region_trace;
+  const auto trust_region_solved =
+      solve<DefaultSolverPolicy>(trust_region_context);
+  expect_true(trust_region_solved.has_value(),
+              "trust-region limit solve should succeed");
+  expect_equal(trust_region_solved->termination,
+               TerminationReason::TrustRegionTooSmall,
+               "rejected trial should report trust-region exhaustion");
+  expect_equal(trust_region_trace.size(), std::size_t{1},
+               "trust-region exhaustion should record one trial");
+  expect_equal(trust_region_trace.front().decision, TrialDecision::LowRho,
+               "trust-region trace should preserve the rejected-trial cause");
+  expect_equal(trust_region_trace.front().termination,
+               TerminationReason::TrustRegionTooSmall,
+               "trust-region trace should report the exhausted limit");
+
   Options rejected_step_options = damping_options;
   rejected_step_options.step_tolerance = 2.0;
   SolverWorkspace<DefaultSolverPolicy, 1, 1> rejected_step_workspace;
